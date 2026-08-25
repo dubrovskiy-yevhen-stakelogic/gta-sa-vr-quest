@@ -429,11 +429,15 @@ function Resolve-RequiredInputPath {
 function Confirm-ExactText {
     param(
         [Parameter(Mandatory = $true)][string]$Message,
-        [Parameter(Mandatory = $true)][string]$RequiredText
+        [Parameter(Mandatory = $true)][string]$RequiredText,
+        [switch]$IgnoreCase
     )
     if ($NonInteractive.IsPresent) { return $false }
     Write-Warning $Message
     $answer = Read-Host "Type $RequiredText to continue"
+    if ($IgnoreCase.IsPresent) {
+        return $answer.Trim() -ieq $RequiredText
+    }
     return $answer -ceq $RequiredText
 }
 
@@ -640,7 +644,8 @@ function Resolve-AndroidSdk {
             -not (Test-Path -LiteralPath $licenseMarker -PathType Leaf)) {
             $accepted = Confirm-ExactText `
                 -Message 'Android components require the Google Android SDK licenses. Type ACCEPT only if you agree to those licenses; the master will answer the repetitive sdkmanager prompts for you.' `
-                -RequiredText 'ACCEPT'
+                -RequiredText 'ACCEPT' `
+                -IgnoreCase
             if (-not $accepted) {
                 throw 'Android SDK licenses were not accepted. No Android components were installed.'
             }
