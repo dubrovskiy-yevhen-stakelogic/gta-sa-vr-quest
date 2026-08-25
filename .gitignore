@@ -1,0 +1,62 @@
+# Build outputs and caches
+/build/
+/build-*/
+/deps/
+/dist/
+/out/
+/.cache/
+/.gradle/
+/.idea/
+/.vscode/
+**/__pycache__/
+*.py[cod]
+*.o
+*.obj
+*.a
+*.lib
+
+# Never commit original or assembled Android/game artifacts
+/recon/
+*.apk
+*.apks
+*.xapk
+*.apkm
+*.aab
+*.aar
+*.obb
+*.so
+*.dex
+*.idsig
+*.osw
+*.idx
+
+# Signing material and secrets
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+release-signing.properties
+
+# User inputs, archives and diagnostics
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+*.log
+*.csv
+*.trace
+*.perfetto-trace
+*.tombstone
+scratchpad*
+local.properties
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+*~
+*.swp
+
