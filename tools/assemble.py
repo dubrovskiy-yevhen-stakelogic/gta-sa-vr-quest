@@ -614,11 +614,17 @@ def classify_game_package(
     signer = next(iter(signers))
     if signer != OFFICIAL_SIGNER_SHA256:
         message = (
-            "selected APK certificate is not Rockstar's official Play certificate: "
-            f"{signer}"
+            "selected APK certificate does not match the verified Google Play "
+            f"GTA SA {VERSION_NAME} retail certificate. "
+            f"Found: {signer}; required: {OFFICIAL_SIGNER_SHA256}"
         )
         if not allow_unofficial:
-            raise KitError(message + ". Export your legally installed Play split set.")
+            raise KitError(
+                message
+                + ". Do not use an APK downloaded from a third-party site or a merged/re-signed APK. "
+                "Export every split from your own legally installed Google Play copy and select "
+                "the complete export directory. See README.md, 'Exporting your own Google Play APK set'."
+            )
         say("WARNING: " + message)
 
     engine_hash = hash_zip_entry(arm64.path, LIBGAME_ENTRY)

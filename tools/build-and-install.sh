@@ -1098,6 +1098,16 @@ echo "Android SDK: $ANDROID_SDK"
 echo "Python: $PYTHON_EXE"
 echo "Persistent signing key: $KEYSTORE (keep it for future updates)"
 
+echo "==> Validating the selected GTA SA package and audio before compilation"
+"$PYTHON_EXE" "$ROOT/tools/assemble.py" \
+  --game-package "$GAME_PACKAGE" \
+  --audio-source "$AUDIO_SOURCE" \
+  --build-dir "$BUILD_ROOT" \
+  --sdk "$ANDROID_SDK" \
+  --java-home "$JAVA_HOME_ARG" \
+  --apktool "$APKTOOL" \
+  --validate-only
+
 bash "$ROOT/tools/build.sh" \
   --configuration RelWithDebInfo \
   --android-sdk "$ANDROID_SDK" \

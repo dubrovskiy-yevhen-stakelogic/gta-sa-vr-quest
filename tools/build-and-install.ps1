@@ -1269,6 +1269,18 @@ function Invoke-Main {
     $keystore = Get-PersistentKeystorePath -ProjectRoot $projectRoot -ResolvedWorkDir $resolvedWorkDir
     Write-Host "Persistent personal signing key: $keystore"
 
+    Write-Step 'Validating the selected GTA SA package and audio before compilation'
+    Invoke-NativeLive -FilePath $python -Arguments @(
+        $assembleScript,
+        '--game-package', $resolvedGamePackage,
+        '--audio-source', $resolvedAudioSource,
+        '--build-dir', $buildRoot,
+        '--sdk', $resolvedSdk,
+        '--java-home', $resolvedJavaHome,
+        '--apktool', $apktool,
+        '--validate-only'
+    )
+
     Write-Step 'Building and assembling the verified personal APK set'
     & $buildScript `
         -Configuration RelWithDebInfo `
