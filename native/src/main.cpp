@@ -2083,6 +2083,7 @@ Java_com_savr_SavrApplication_nativeOnApplicationCreate(JNIEnv* env, jclass,
             env->ReleaseStringUTFChars(externalFilesPath, utf);
         }
     }
+    savr::xr::SetExternalFilesDir(savr::g_externalFilesDir.c_str());
     LOGI("application created; external files=%s",
          savr::g_externalFilesDir.empty() ? "(fallback)" : savr::g_externalFilesDir.c_str());
 }

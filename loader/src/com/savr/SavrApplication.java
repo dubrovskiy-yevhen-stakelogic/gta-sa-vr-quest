@@ -59,9 +59,18 @@ public final class SavrApplication extends Application {
         String externalFilesPath = externalFiles == null ? "" : externalFiles.getAbsolutePath();
         File bankLookup = externalFiles == null ? null
                 : new File(externalFiles, "audio/CONFIG/BankLkup.dat");
+        File leftHandMesh = externalFiles == null ? null
+                : new File(externalFiles, "vrhands/BigHandLeft.uxrh");
+        File handTexture = externalFiles == null ? null
+                : new File(externalFiles, "vrhands/BigHandsAlbedo.rgba");
         android.util.Log.i(TAG, "audio preflight externalFiles=" + externalFilesPath
                 + " bankExists=" + (bankLookup != null && bankLookup.isFile())
                 + " bankReadable=" + (bankLookup != null && bankLookup.canRead()));
+        android.util.Log.i(TAG, "hands preflight meshExists="
+                + (leftHandMesh != null && leftHandMesh.isFile())
+                + " meshReadable=" + (leftHandMesh != null && leftHandMesh.canRead())
+                + " textureExists=" + (handTexture != null && handTexture.isFile())
+                + " textureReadable=" + (handTexture != null && handTexture.canRead()));
         nativeOnApplicationCreate(SavrApplication.class.getClassLoader(), externalFilesPath);
 
         registerActivityLifecycleCallbacks(new ActivityLifecycleCallbacks() {

@@ -10,6 +10,10 @@ namespace savr::xr {
 // and the game Activity are known; no GL context is required yet.
 bool Initialize(JavaVM* vm, jobject activity);
 
+// Use Android's app-resolved external-files directory for optional payloads.
+// Set during Application.onCreate, before the OpenXR activity starts.
+void SetExternalFilesDir(const char* path);
+
 // Create the session on top of the EGL context that is current on the calling
 // thread. Must be called from the game's render thread, after the game has made
 // its own context current, because the runtime binds to exactly that context.

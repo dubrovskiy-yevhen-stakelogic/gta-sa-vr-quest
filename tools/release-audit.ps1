@@ -116,13 +116,20 @@ if ($windowsInstallerText -notmatch [regex]::Escape("@('shell', 'chmod', '-R', '
 }
 $loaderText = Get-Content -LiteralPath (Join-Path $Root 'loader\src\com\savr\SavrApplication.java') -Raw
 if ($loaderText -notmatch [regex]::Escape('getExternalFilesDir(null)') -or
-    $loaderText -notmatch [regex]::Escape('bankReadable=')) {
-    throw 'The Java loader no longer performs the app-context audio preflight.'
+    $loaderText -notmatch [regex]::Escape('bankReadable=') -or
+    $loaderText -notmatch [regex]::Escape('meshReadable=')) {
+    throw 'The Java loader no longer performs the app-context payload preflight.'
 }
 $mainText = Get-Content -LiteralPath (Join-Path $Root 'native\src\main.cpp') -Raw
 if ($mainText -notmatch [regex]::Escape('audio preflight: data=') -or
-    $mainText -notmatch [regex]::Escape('externalFilesPath')) {
+    $mainText -notmatch [regex]::Escape('externalFilesPath') -or
+    $mainText -notmatch [regex]::Escape('xr::SetExternalFilesDir')) {
     throw 'The native loader no longer uses or reports the app-resolved external files path.'
+}
+$xrText = Get-Content -LiteralPath (Join-Path $Root 'native\src\Xr.cpp') -Raw
+if ($xrText -notmatch [regex]::Escape('[hands] asset directory') -or
+    $xrText -notmatch [regex]::Escape('g_externalFilesDir')) {
+    throw 'The hand renderer no longer uses or reports the app-resolved asset path.'
 }
 
 $nativeRoot = Join-Path $Root 'native'

@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -54,6 +55,7 @@ constexpr char kModVersion[] = "0.1.0";
 JavaVM*   g_hudTextVm{};
 jobject   g_hudTextApplication{};
 jmethodID g_renderVrTextMethod{};
+std::string g_externalFilesDir;
 
 struct HudTextState {
     std::u16string brief;
@@ -3216,6 +3218,12 @@ void SetGameFrame(unsigned int texture, const float* transform) {
     }
 }
 
+void SetExternalFilesDir(const char* path) {
+    g_externalFilesDir = path == nullptr ? "" : path;
+    LOGI("XR external files=%s",
+         g_externalFilesDir.empty() ? "(fallback)" : g_externalFilesDir.c_str());
+}
+
 bool Initialize(JavaVM* vm, jobject activity) {
     if (s.instance != XR_NULL_HANDLE) {
         return true;
@@ -4908,7 +4916,12 @@ bool     g_handAssetsTried = false;
 
 bool LoadUxrh(const char* path, HandMesh& m) {
     FILE* f = std::fopen(path, "rb");
-    if (!f) { LOGE("[hands] cannot open %s", path); return false; }
+    if (!f) {
+        const int openErrno = errno;
+        LOGE("[hands] cannot open %s: errno=%d(%s)",
+             path, openErrno, std::strerror(openErrno));
+        return false;
+    }
     char magic[4]; uint32_t ver = 0, vc = 0, ic = 0;
     if (std::fread(magic, 1, 4, f) != 4 || std::fread(&ver, 4, 1, f) != 1 ||
         std::fread(&vc, 4, 1, f) != 1 || std::fread(&ic, 4, 1, f) != 1 ||
@@ -4924,7 +4937,12 @@ bool LoadUxrh(const char* path, HandMesh& m) {
 
 GLuint LoadRgbaTexture(const char* path, int w, int h) {
     FILE* f = std::fopen(path, "rb");
-    if (!f) { LOGE("[hands] cannot open tex %s", path); return 0; }
+    if (!f) {
+        const int openErrno = errno;
+        LOGE("[hands] cannot open tex %s: errno=%d(%s)",
+             path, openErrno, std::strerror(openErrno));
+        return 0;
+    }
     std::vector<unsigned char> px(static_cast<size_t>(w) * h * 4);
     const size_t n = std::fread(px.data(), 1, px.size(), f);
     std::fclose(f);
@@ -4943,11 +4961,14 @@ GLuint LoadRgbaTexture(const char* path, int w, int h) {
 void EnsureHandAssets() {
     if (g_handAssetsTried) return;
     g_handAssetsTried = true;
-    const char* dir = "/sdcard/Android/data/com.rockstargames.gtasa/files/vrhands/";
-    char path[256];
-    std::snprintf(path, sizeof(path), "%sBigHandLeft.uxrh", dir);  LoadUxrh(path, g_handMesh[0]);
-    std::snprintf(path, sizeof(path), "%sBigHandRight.uxrh", dir); LoadUxrh(path, g_handMesh[1]);
-    std::snprintf(path, sizeof(path), "%sBigHandsAlbedo.rgba", dir); g_handTex = LoadRgbaTexture(path, 1024, 1024);
+    const std::string dir = (g_externalFilesDir.empty()
+        ? "/sdcard/Android/data/com.rockstargames.gtasa/files"
+        : g_externalFilesDir) + "/vrhands/";
+    LOGI("[hands] asset directory %s", dir.c_str());
+    char path[512];
+    std::snprintf(path, sizeof(path), "%sBigHandLeft.uxrh", dir.c_str());  LoadUxrh(path, g_handMesh[0]);
+    std::snprintf(path, sizeof(path), "%sBigHandRight.uxrh", dir.c_str()); LoadUxrh(path, g_handMesh[1]);
+    std::snprintf(path, sizeof(path), "%sBigHandsAlbedo.rgba", dir.c_str()); g_handTex = LoadRgbaTexture(path, 1024, 1024);
 }
 
 constexpr int  kHandMaxV = 5000, kHandMaxI = 27000;
