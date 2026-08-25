@@ -38,6 +38,23 @@ GTA San Andreas `2.11.311` is currently installed. Do not download an APK from a
 third-party APK site: the build wizard accepts only the original Google Play
 certificate and rejects modified, merged, or re-signed packages.
 
+### One-click Windows export
+
+The easiest Windows method does not require installing ADB or typing commands:
+
+1. Enable USB debugging on the phone/tablet containing the Google Play game.
+2. Connect it by USB, unlock it, and approve the debugging prompt.
+3. Double-click `EXPORT_PLAY_APKS.bat`.
+4. Keep the device unlocked until the export completes.
+5. Disconnect the phone/tablet, run `BUILD_AND_INSTALL.bat`, and select the
+   exported `base.apk`. The builder automatically includes its sibling splits.
+
+The exporter downloads Google's pinned Platform Tools itself, verifies their
+SHA-256, checks GTA SA version `2.11.311` (`4234641`), exports every installed
+split, verifies the resulting files, and opens the finished folder.
+
+### Manual export
+
 Download and extract Google's official [SDK Platform Tools for
 Windows](https://developer.android.com/tools/releases/platform-tools). Enable
 Developer Options and USB debugging on the Android device, connect it by USB,
