@@ -923,9 +923,9 @@ function Assert-RemotePayloadHashes {
         throw "Refusing to hash an unexpected remote root: $RemoteRoot"
     }
     $command = "cd '$RemoteRoot' && toybox sha256sum -c SHA256SUMS >/dev/null"
-    # adb shell concatenates its remaining arguments into a remote command, so
-    # preserve the complete sh -c payload with explicit remote-shell quotes.
-    $result = Invoke-AdbCapture -Arguments @('shell', 'sh', '-c', ('"' + $command + '"')) -AllowFailure
+    # `adb shell` already invokes the remote shell. Passing this as its single
+    # command avoids a nested `sh -c` whose argument boundary ADB can discard.
+    $result = Invoke-AdbCapture -Arguments @('shell', $command) -AllowFailure
     if ($result.ExitCode -ne 0) {
         throw "Quest payload hash verification failed at $RemoteRoot`n$($result.Text)"
     }
@@ -960,7 +960,10 @@ function Publish-PayloadTree {
 
     Invoke-AdbCapture -Arguments @('shell', 'mkdir', '-p', $RemoteParent) | Out-Null
     if (Test-RemotePath -RemotePath $stageContainer) { Remove-GeneratedRemotePath -RemotePath $stageContainer }
-    Invoke-AdbCapture -Arguments @('shell', 'mkdir', '-p', $stageContainer) | Out-Null
+    # Pre-create the leaf as well. Android 14 lets shell mkdir inside the app's
+    # external-files directory but can reject ADB's own secure_mkdirs when a
+    # directory push tries to create that leaf implicitly.
+    Invoke-AdbCapture -Arguments @('shell', 'mkdir', '-p', $stage) | Out-Null
     Write-Host "Staging $LocalRoot -> $stage"
     try {
         # Pushing a directory into an existing remote directory creates
