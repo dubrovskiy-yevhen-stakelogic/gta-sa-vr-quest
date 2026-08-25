@@ -55,6 +55,10 @@ The easiest Windows method does not require installing ADB or typing commands:
 `split_*.apk` in the same folder. Seeing the phone in Windows File Explorer only
 confirms an MTP file connection; the exporter waits up to two minutes for the
 separate USB-debugging authorization and continues automatically once approved.
+The complete export must include both `split_config.arm64_v8a.apk` and
+`split_data_main.apk`. If Google Play installed a different CPU variant, export
+from a real 64-bit ARM Android phone/tablet rather than an emulator or Windows
+Android subsystem.
 
 The exporter downloads Google's pinned Platform Tools itself, verifies their
 SHA-256, checks GTA SA version `2.11.311` (`4234641`), exports every installed

@@ -1014,6 +1014,10 @@ function Publish-PayloadTree {
         }
         Invoke-AdbCapture -Arguments @('shell', 'mv', $stage, $RemoteFinal) | Out-Null
         $newPublished = $true
+        # Files written by the ADB shell can retain shell ownership after the
+        # move into Android/data. Grant traversal/read bits so the app UID can
+        # consume its own verified payload on scoped-storage firmware.
+        Invoke-AdbCapture -Arguments @('shell', 'chmod', '-R', 'a+rX', $RemoteFinal) | Out-Null
         Assert-RemotePayloadHashes -RemoteRoot $RemoteFinal
         if (Test-RemotePath -RemotePath $stageContainer) {
             try { Remove-GeneratedRemotePath -RemotePath $stageContainer }

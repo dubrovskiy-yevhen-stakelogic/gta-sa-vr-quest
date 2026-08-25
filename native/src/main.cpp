@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 
 #include <atomic>
@@ -38,6 +39,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <iterator>
+#include <string>
 
 namespace savr {
 namespace {
@@ -45,6 +47,7 @@ namespace {
 JavaVM* g_vm = nullptr;
 jobject g_classLoader = nullptr;   // global ref
 jobject g_activity = nullptr;      // global ref
+std::string g_externalFilesDir;
 
 bool g_sessionAttempted = false;
 
@@ -2001,10 +2004,25 @@ void* WaitForGameLibrary(void*) {
     // through CFileMgr, which prepends the data dir.) The fix is to point cwd at
     // the game's data dir so the relative fopen lands on the deployed packs; the
     // case-insensitive /sdcard FUSE maps AUDIO/ -> audio/. Fixes SFX and radio.
-    const char* kDataDir = "/sdcard/Android/data/com.rockstargames.gtasa/files";
-    const bool audioPacksPresent =
-        access("/sdcard/Android/data/com.rockstargames.gtasa/files/audio/CONFIG/BankLkup.dat", F_OK) == 0;
-    if (audioPacksPresent && chdir(kDataDir) == 0) {
+    const std::string dataDir = g_externalFilesDir.empty()
+        ? "/sdcard/Android/data/com.rockstargames.gtasa/files"
+        : g_externalFilesDir;
+    const std::string bankLookup = dataDir + "/audio/CONFIG/BankLkup.dat";
+    errno = 0;
+    const int bankAccess = access(bankLookup.c_str(), R_OK);
+    const int bankErrno = errno;
+    int cwdResult = -1;
+    int cwdErrno = 0;
+    if (bankAccess == 0) {
+        errno = 0;
+        cwdResult = chdir(dataDir.c_str());
+        cwdErrno = errno;
+    }
+    const bool audioPacksPresent = bankAccess == 0;
+    LOGI("audio preflight: data=%s bankAccess=%d errno=%d(%s) chdir=%d errno=%d(%s)",
+         dataDir.c_str(), bankAccess, bankErrno, std::strerror(bankErrno),
+         cwdResult, cwdErrno, std::strerror(cwdErrno));
+    if (audioPacksPresent && cwdResult == 0) {
         // Packs will now open through the real loaders — do NOT stub them, or the
         // stub's return-null keeps radio silent.
         LOGI("audio: cwd -> data dir; real SFX + streams enabled (loaders not stubbed)");
@@ -2054,9 +2072,19 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 }
 
 JNIEXPORT void JNICALL
-Java_com_savr_SavrApplication_nativeOnApplicationCreate(JNIEnv* env, jclass, jobject classLoader) {
+Java_com_savr_SavrApplication_nativeOnApplicationCreate(JNIEnv* env, jclass,
+                                                         jobject classLoader,
+                                                         jstring externalFilesPath) {
     savr::g_classLoader = env->NewGlobalRef(classLoader);
-    LOGI("application created");
+    if (externalFilesPath != nullptr) {
+        const char* utf = env->GetStringUTFChars(externalFilesPath, nullptr);
+        if (utf != nullptr) {
+            savr::g_externalFilesDir.assign(utf);
+            env->ReleaseStringUTFChars(externalFilesPath, utf);
+        }
+    }
+    LOGI("application created; external files=%s",
+         savr::g_externalFilesDir.empty() ? "(fallback)" : savr::g_externalFilesDir.c_str());
 }
 
 JNIEXPORT void JNICALL

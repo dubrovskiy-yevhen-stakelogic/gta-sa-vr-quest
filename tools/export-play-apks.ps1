@@ -233,8 +233,24 @@ function Read-InstalledPackage {
     if ($paths.Count -lt 3) {
         throw "The installed game did not expose a complete Google Play split set. Found $($paths.Count) APK path(s). Reinstall GTA SA $($script:ExpectedVersionName) from Google Play on this phone/tablet and retry.`nRaw output:`n$($pathResult.Text)"
     }
+    $remoteNames = @($paths | ForEach-Object { ($_ -split '/')[-1] })
+    if ($remoteNames -notcontains 'split_config.arm64_v8a.apk') {
+        throw 'Google Play did not install the required ARM64 split_config.arm64_v8a.apk on this device. Quest needs the ARM64 game library. Use a real 64-bit ARM Android phone/tablet, not an emulator or Windows Android subsystem, install GTA SA 2.11.311 there, and export again.'
+    }
+    if ($remoteNames -notcontains 'split_data_main.apk') {
+        throw 'Google Play did not expose split_data_main.apk on this device. Reinstall GTA SA 2.11.311 from Google Play and export again.'
+    }
     Write-Host "Verified GTA SA $versionName ($versionCode), $($paths.Count) installed APK splits." -ForegroundColor Green
     return $paths
+}
+
+function Get-ApkEntryNames {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try { $archive = [System.IO.Compression.ZipFile]::OpenRead($Path) }
+    catch { throw "Exported file is not a readable APK: $Path`n$($_.Exception.Message)" }
+    try { return @($archive.Entries | Where-Object { -not [string]::IsNullOrEmpty($_.Name) } | ForEach-Object FullName) }
+    finally { $archive.Dispose() }
 }
 
 function Export-Apks {
@@ -264,6 +280,20 @@ function Export-Apks {
     }
     $base = @($localApks | Where-Object Name -eq 'base.apk')
     if ($base.Count -ne 1) { throw 'Exported split set does not contain exactly one base.apk.' }
+    $arm64Apks = @()
+    $dataApks = @()
+    $dataEntries = @('assets/data/gta.dat', 'assets/anim/anim.img', 'assets/texdb/gta3.img')
+    foreach ($apk in $localApks) {
+        $entries = @(Get-ApkEntryNames -Path $apk.FullName)
+        if ($entries -contains 'lib/arm64-v8a/libGame.so') { $arm64Apks += $apk }
+        if (@($dataEntries | Where-Object { $entries -notcontains $_ }).Count -eq 0) { $dataApks += $apk }
+    }
+    if ($arm64Apks.Count -ne 1) {
+        throw "Exported split set is not Quest-compatible: expected exactly one APK containing lib/arm64-v8a/libGame.so, found $($arm64Apks.Count). Use a real 64-bit ARM Android phone/tablet and export its complete Google Play installation."
+    }
+    if ($dataApks.Count -ne 1) {
+        throw "Exported split set is incomplete: expected exactly one split_data_main APK containing the GTA assets, found $($dataApks.Count)."
+    }
     Write-Host ''
     Write-Host 'APK EXPORT COMPLETED.' -ForegroundColor Green
     Write-Host "Folder: $resolvedDestination"

@@ -14,6 +14,8 @@ import android.text.TextPaint;
 import android.text.TextUtils;
 import android.view.Surface;
 
+import java.io.File;
+
 /**
  * Loads the VR layer before anything of the game runs.
  *
@@ -53,7 +55,14 @@ public final class SavrApplication extends Application {
             return;
         }
 
-        nativeOnApplicationCreate(SavrApplication.class.getClassLoader());
+        File externalFiles = getExternalFilesDir(null);
+        String externalFilesPath = externalFiles == null ? "" : externalFiles.getAbsolutePath();
+        File bankLookup = externalFiles == null ? null
+                : new File(externalFiles, "audio/CONFIG/BankLkup.dat");
+        android.util.Log.i(TAG, "audio preflight externalFiles=" + externalFilesPath
+                + " bankExists=" + (bankLookup != null && bankLookup.isFile())
+                + " bankReadable=" + (bankLookup != null && bankLookup.canRead()));
+        nativeOnApplicationCreate(SavrApplication.class.getClassLoader(), externalFilesPath);
 
         registerActivityLifecycleCallbacks(new ActivityLifecycleCallbacks() {
             @Override
@@ -276,7 +285,8 @@ public final class SavrApplication extends Application {
         android.util.Log.i(TAG, "supplied data pack path " + DATA_PACK_PATH);
     }
 
-    private static native void nativeOnApplicationCreate(ClassLoader loader);
+    private static native void nativeOnApplicationCreate(
+            ClassLoader loader, String externalFilesPath);
 
     private static native void nativeOnActivityCreated(Object activity);
 }

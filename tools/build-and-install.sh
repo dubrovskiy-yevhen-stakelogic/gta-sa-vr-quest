@@ -910,6 +910,8 @@ install_payload_tree() {
   if ! adb_cmd shell mv "$stage" "$target"; then
     die "could not activate $label; rollback will be attempted"
   fi
+  adb_cmd shell chmod -R a+rX "$target" ||
+    die "could not make the verified $label payload readable by the game"
   if ! verify_remote_tree "$target"; then
     die "final Quest checksum verification failed for $label; rollback will be attempted"
   fi

@@ -600,7 +600,22 @@ def classify_game_package(
     if len(base_candidates) != 1:
         raise KitError(f"expected one base APK, found {len(base_candidates)}")
     if len(arm_candidates) != 1:
-        raise KitError(f"expected one arm64 APK with libGame.so, found {len(arm_candidates)}")
+        available_game_abis = sorted(
+            {
+                name.split("/")[1]
+                for names in contents.values()
+                for name in names
+                if re.fullmatch(r"lib/[^/]+/libgame\.so", name)
+            }
+        )
+        available_text = ", ".join(available_game_abis) if available_game_abis else "none"
+        raise KitError(
+            "Quest requires exactly one APK containing lib/arm64-v8a/libGame.so; "
+            f"found {len(arm_candidates)} (available game ABIs: {available_text}). "
+            "The complete Google Play export must include split_config.arm64_v8a.apk. "
+            "Export GTA SA 2.11.311 from a real 64-bit ARM Android phone/tablet, "
+            "not an emulator or Windows Android subsystem."
+        )
     if len(data_candidates) != 1:
         raise KitError(f"expected one data_main APK with GTA assets, found {len(data_candidates)}")
 

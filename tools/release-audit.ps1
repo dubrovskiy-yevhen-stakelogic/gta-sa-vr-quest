@@ -102,6 +102,28 @@ foreach ($relative in $exportToolFiles) {
 if ($readmeText -notmatch [regex]::Escape('EXPORT_PLAY_APKS.bat')) {
     throw 'README does not document the one-click Play APK exporter.'
 }
+$exporterText = Get-Content -LiteralPath (Join-Path $Root 'tools\export-play-apks.ps1') -Raw
+if ($exporterText -notmatch [regex]::Escape('split_config.arm64_v8a.apk') -or
+    $exporterText -notmatch [regex]::Escape('lib/arm64-v8a/libGame.so') -or
+    $exporterText -notmatch [regex]::Escape('split_data_main.apk')) {
+    throw 'The one-click exporter no longer verifies the Quest-required Play splits.'
+}
+$windowsInstallerText = Get-Content -LiteralPath (Join-Path $Root 'tools\build-and-install.ps1') -Raw
+$linuxInstallerText = Get-Content -LiteralPath (Join-Path $Root 'tools\build-and-install.sh') -Raw
+if ($windowsInstallerText -notmatch [regex]::Escape("@('shell', 'chmod', '-R', 'a+rX', `$RemoteFinal)") -or
+    $linuxInstallerText -notmatch [regex]::Escape('adb_cmd shell chmod -R a+rX "$target"')) {
+    throw 'An installer no longer makes shell-published Quest payloads readable by the game UID.'
+}
+$loaderText = Get-Content -LiteralPath (Join-Path $Root 'loader\src\com\savr\SavrApplication.java') -Raw
+if ($loaderText -notmatch [regex]::Escape('getExternalFilesDir(null)') -or
+    $loaderText -notmatch [regex]::Escape('bankReadable=')) {
+    throw 'The Java loader no longer performs the app-context audio preflight.'
+}
+$mainText = Get-Content -LiteralPath (Join-Path $Root 'native\src\main.cpp') -Raw
+if ($mainText -notmatch [regex]::Escape('audio preflight: data=') -or
+    $mainText -notmatch [regex]::Escape('externalFilesPath')) {
+    throw 'The native loader no longer uses or reports the app-resolved external files path.'
+}
 
 $nativeRoot = Join-Path $Root 'native'
 $nativeSourceRoot = Join-Path $nativeRoot 'src'
