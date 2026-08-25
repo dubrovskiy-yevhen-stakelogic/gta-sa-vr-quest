@@ -132,10 +132,18 @@ reject_scratch_overlap() {
 }
 
 find_python() {
-  local candidate
+  local candidate resolved
   if [ -n "$PYTHON_EXE" ]; then
-    command -v "$PYTHON_EXE" 2>/dev/null || [ -x "$PYTHON_EXE" ] || return 1
-    printf '%s\n' "$PYTHON_EXE"
+    if command -v "$PYTHON_EXE" >/dev/null 2>&1; then
+      resolved="$(command -v "$PYTHON_EXE")"
+    elif [ -x "$PYTHON_EXE" ]; then
+      resolved="$PYTHON_EXE"
+    else
+      return 1
+    fi
+    "$resolved" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1 ||
+      return 1
+    printf '%s\n' "$resolved"
     return 0
   fi
   for candidate in python3 python python.exe; do

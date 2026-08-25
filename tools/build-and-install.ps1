@@ -214,7 +214,7 @@ function Invoke-DownloadWithProgress {
         $averageRate = if ($timer.Elapsed.TotalSeconds -gt 0) {
             Format-DownloadSize ([long]($written / $timer.Elapsed.TotalSeconds))
         } else { Format-DownloadSize $written }
-        Write-Host "Downloaded $DisplayName: $(Format-DownloadSize $written) at $averageRate/s."
+        Write-Host "Downloaded ${DisplayName}: $(Format-DownloadSize $written) at $averageRate/s."
     }
     finally {
         Write-Progress -Id $progressId -Activity "Downloading $DisplayName" -Completed
