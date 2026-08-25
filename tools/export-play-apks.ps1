@@ -166,6 +166,12 @@ function Select-SourceDevice {
     $model = Invoke-NativeCapture -FilePath $script:Adb -Arguments @(
         '-s', $script:SelectedSerial, 'shell', 'getprop', 'ro.product.model'
     )
+    $manufacturer = Invoke-NativeCapture -FilePath $script:Adb -Arguments @(
+        '-s', $script:SelectedSerial, 'shell', 'getprop', 'ro.product.manufacturer'
+    )
+    if (("$($manufacturer.Text) $($model.Text)") -match '(?i)\b(?:oculus|quest)\b') {
+        throw 'The selected device is a Quest headset. Disconnect it and connect the Android phone/tablet containing your official Google Play copy.'
+    }
     Write-Host "Selected source device: $($script:SelectedSerial) ($($model.Text.Trim()))" -ForegroundColor Green
 }
 

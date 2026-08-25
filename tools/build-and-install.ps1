@@ -931,6 +931,25 @@ function Assert-RemotePayloadHashes {
     }
 }
 
+function New-RemotePayloadDirectoryTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][string]$RemoteRoot
+    )
+    $localFull = (Get-FullPath $LocalRoot).TrimEnd('\', '/')
+    $localPrefix = $localFull + [System.IO.Path]::DirectorySeparatorChar
+    foreach ($directory in Get-ChildItem -LiteralPath $localFull -Directory -Recurse) {
+        if (-not $directory.FullName.StartsWith($localPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Payload directory escaped its local root: $($directory.FullName)"
+        }
+        $relative = $directory.FullName.Substring($localPrefix.Length).Replace('\', '/')
+        if ($relative -notmatch '^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$') {
+            throw "Payload contains a directory name that is unsafe for ADB: $relative"
+        }
+        Invoke-AdbCapture -Arguments @('shell', 'mkdir', '-p', "$RemoteRoot/$relative") | Out-Null
+    }
+}
+
 function Publish-PayloadTree {
     param(
         [Parameter(Mandatory = $true)][string]$LocalRoot,
@@ -960,10 +979,11 @@ function Publish-PayloadTree {
 
     Invoke-AdbCapture -Arguments @('shell', 'mkdir', '-p', $RemoteParent) | Out-Null
     if (Test-RemotePath -RemotePath $stageContainer) { Remove-GeneratedRemotePath -RemotePath $stageContainer }
-    # Pre-create the leaf as well. Android 14 lets shell mkdir inside the app's
-    # external-files directory but can reject ADB's own secure_mkdirs when a
-    # directory push tries to create that leaf implicitly.
+    # Android 14 can reject ADB's secure_mkdirs anywhere below Android/data,
+    # even though the shell may create the same directories. Create the whole
+    # local directory shape first so `adb push` only has to write files.
     Invoke-AdbCapture -Arguments @('shell', 'mkdir', '-p', $stage) | Out-Null
+    New-RemotePayloadDirectoryTree -LocalRoot $LocalRoot -RemoteRoot $stage
     Write-Host "Staging $LocalRoot -> $stage"
     try {
         # Pushing a directory into an existing remote directory creates

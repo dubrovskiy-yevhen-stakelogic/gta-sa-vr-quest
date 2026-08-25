@@ -881,7 +881,14 @@ install_payload_tree() {
   echo "==> Uploading $label"
   adb_cmd shell mkdir -p "$parent" || die "could not create $parent"
   adb_cmd shell rm -rf "$stage_container" "$backup" || die "could not prepare $label staging paths"
-  adb_cmd shell mkdir -p "$stage_container" || die "could not create $label staging container"
+  adb_cmd shell mkdir -p "$stage" || die "could not create $label staging directory"
+  while IFS= read -r -d '' local_dir; do
+    relative_dir="${local_dir#"$local_tree"/}"
+    [[ "$relative_dir" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]] ||
+      die "payload contains a directory name that is unsafe for ADB: $relative_dir"
+    adb_cmd shell mkdir -p "$stage/$relative_dir" ||
+      die "could not create staged $label directory: $relative_dir"
+  done < <(find "$local_tree" -mindepth 1 -type d -print0)
   adb_cmd push "$local_tree" "$stage_container" || die "$label transfer failed"
   adb_cmd shell test -f "$stage/SHA256SUMS" || die "$label transfer created an unexpected directory layout"
   verify_remote_tree "$stage" || die "Quest checksum verification failed for staged $label"

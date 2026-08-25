@@ -14,6 +14,7 @@
 *.obj
 *.a
 *.lib
+*.codex
 
 # Never commit original or assembled Android/game artifacts
 /recon/

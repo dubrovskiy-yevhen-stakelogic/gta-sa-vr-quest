@@ -93,6 +93,15 @@ $discordChannel = 'https://discord.com/channels/747967102895390741/1540234546182
 if ($readmeText -notmatch [regex]::Escape($discordChannel)) {
     throw 'The public Discord channel is missing from README.'
 }
+$exportToolFiles = @('EXPORT_PLAY_APKS.bat', 'tools\export-play-apks.ps1')
+foreach ($relative in $exportToolFiles) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Root $relative) -PathType Leaf)) {
+        throw "The one-click Play APK exporter is incomplete: $relative"
+    }
+}
+if ($readmeText -notmatch [regex]::Escape('EXPORT_PLAY_APKS.bat')) {
+    throw 'README does not document the one-click Play APK exporter.'
+}
 
 $nativeRoot = Join-Path $Root 'native'
 $nativeSourceRoot = Join-Path $nativeRoot 'src'
