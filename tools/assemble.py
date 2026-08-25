@@ -95,6 +95,7 @@ class Toolchain:
     sdk: Path
     java_home: Path
     build_tools: Path
+    android_jar: Path
     aapt2: Path
     zipalign: Path
     apksigner: Path
@@ -910,23 +911,44 @@ def create_manifest_stub(base: Path, destination: Path) -> None:
 
 def build_manifest(base: Path, build: Path, tools: Toolchain) -> bytes:
     decoded = build / "manifest-decoded"
+    framework = build / "apktool-framework"
     stub = build / "manifest-source.apk"
     rebuilt = build / "manifest-rebuilt.apk"
     if decoded.exists():
         shutil.rmtree(decoded)
+    clean_directory(framework, build)
     stub.unlink(missing_ok=True)
     rebuilt.unlink(missing_ok=True)
     create_manifest_stub(base, stub)
 
     say("==> decoding and patching AndroidManifest.xml")
+    # Never use Apktool's user-global/default framework cache. An older cached
+    # framework cannot compile attributes used by the current retail manifest.
     run(
-        [tools.java, "-jar", tools.apktool, "d", "-s", "--no-assets", "-f", "-o", decoded, stub],
+        [tools.java, "-jar", tools.apktool, "if", "-p", framework, tools.android_jar],
+        failure="apktool Android framework setup failed",
+    )
+    run(
+        [
+            tools.java,
+            "-jar",
+            tools.apktool,
+            "d",
+            "-s",
+            "--no-assets",
+            "-f",
+            "-p",
+            framework,
+            "-o",
+            decoded,
+            stub,
+        ],
         failure="apktool manifest decode failed",
     )
     manifest = decoded / "AndroidManifest.xml"
     manifest.write_text(patch_manifest(manifest.read_text(encoding="utf-8")), encoding="utf-8")
     run(
-        [tools.java, "-jar", tools.apktool, "b", decoded, "-o", rebuilt],
+        [tools.java, "-jar", tools.apktool, "b", "-p", framework, decoded, "-o", rebuilt],
         failure="apktool manifest rebuild failed",
     )
     with zipfile.ZipFile(rebuilt) as archive:
@@ -1297,6 +1319,7 @@ def resolve_tools(args) -> Toolchain:
         sdk=sdk,
         java_home=java_home,
         build_tools=build_tools,
+        android_jar=sdk / "platforms" / "android-35" / "android.jar",
         aapt2=build_tools / f"aapt2{exe}",
         zipalign=build_tools / f"zipalign{exe}",
         apksigner=build_tools / "lib" / "apksigner.jar",
@@ -1304,7 +1327,14 @@ def resolve_tools(args) -> Toolchain:
         java=java_home / "bin" / f"java{exe}",
         apktool=Path(args.apktool).expanduser().resolve() if args.apktool else ROOT / "tools" / "vendor" / "apktool_3.0.3.jar",
     )
-    for required in (tools.aapt2, tools.zipalign, tools.apksigner, tools.keytool, tools.java):
+    for required in (
+        tools.android_jar,
+        tools.aapt2,
+        tools.zipalign,
+        tools.apksigner,
+        tools.keytool,
+        tools.java,
+    ):
         if not required.exists():
             raise KitError(f"required tool not found: {required}")
     return tools
@@ -1358,6 +1388,7 @@ def main() -> int:
         build / "input-apks",
         build / "input-audio",
         build / "manifest-decoded",
+        build / "apktool-framework",
         build / "manifest-source.apk",
         build / "manifest-rebuilt.apk",
         build / "native",
@@ -1383,6 +1414,7 @@ def main() -> int:
         build / "input-apks",
         build / "input-audio",
         build / "manifest-decoded",
+        build / "apktool-framework",
         build / "manifest-source.apk",
         build / "manifest-rebuilt.apk",
         build / "build-manifest.json",
@@ -1391,6 +1423,7 @@ def main() -> int:
         ("native library", native_lib),
         ("loader DEX", loader_dex),
         ("Apktool", tools.apktool),
+        ("Android framework", tools.android_jar),
         ("aapt2", tools.aapt2),
         ("zipalign", tools.zipalign),
         ("apksigner", tools.apksigner),
