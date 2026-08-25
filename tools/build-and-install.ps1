@@ -102,6 +102,131 @@ function Move-AsideIfPresent {
     Write-Warning "Preserved an invalid managed item at: $aside"
 }
 
+function Format-DownloadSize {
+    param([Parameter(Mandatory = $true)][long]$Bytes)
+    if ($Bytes -ge 1GB) { return ('{0:N2} GiB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MiB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N1} KiB' -f ($Bytes / 1KB)) }
+    return "$Bytes bytes"
+}
+
+function Invoke-DownloadWithProgress {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [Parameter(Mandatory = $true)][string]$DisplayName,
+        [ValidateRange(15, 600)][int]$StallTimeoutSeconds = 90
+    )
+
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $true
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('GTASAVR-SourceKit/0.1.0')
+
+    $response = $null
+    $source = $null
+    $target = $null
+    $headerTimeout = [System.Threading.CancellationTokenSource]::new()
+    $headerTimeout.CancelAfter([TimeSpan]::FromSeconds(60))
+    $progressId = 1701
+    try {
+        Write-Host "Downloading $DisplayName"
+        Write-Host "  Source: $Uri"
+        Write-Host "  If no bytes arrive for $StallTimeoutSeconds seconds, the download fails instead of hanging forever."
+
+        try {
+            $response = $client.GetAsync(
+                $Uri,
+                [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+                $headerTimeout.Token).GetAwaiter().GetResult()
+        }
+        catch [System.OperationCanceledException] {
+            throw "Timed out while connecting to $Uri"
+        }
+        $response.EnsureSuccessStatusCode() | Out-Null
+        $source = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $target = [System.IO.File]::Open(
+            $OutFile,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None)
+
+        $total = $response.Content.Headers.ContentLength
+        $buffer = New-Object byte[] (1MB)
+        [long]$written = 0
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        $nextTextReport = 5.0
+
+        while ($true) {
+            $readTimeout = [System.Threading.CancellationTokenSource]::new()
+            $readTimeout.CancelAfter([TimeSpan]::FromSeconds($StallTimeoutSeconds))
+            try {
+                try {
+                    $read = $source.ReadAsync(
+                        $buffer, 0, $buffer.Length,
+                        $readTimeout.Token).GetAwaiter().GetResult()
+                }
+                catch [System.OperationCanceledException] {
+                    throw "Download stalled: no data received for $StallTimeoutSeconds seconds while downloading $DisplayName. Run the master again to retry."
+                }
+            }
+            finally {
+                $readTimeout.Dispose()
+            }
+            if ($read -eq 0) { break }
+
+            $target.Write($buffer, 0, $read)
+            $written += $read
+            $seconds = [Math]::Max($timer.Elapsed.TotalSeconds, 0.001)
+            $bytesPerSecond = $written / $seconds
+            $rateText = "$(Format-DownloadSize ([long]$bytesPerSecond))/s"
+            $writtenText = Format-DownloadSize $written
+
+            if ($null -ne $total -and $total -gt 0) {
+                $percent = [Math]::Min(100, [int](100.0 * $written / $total))
+                $remainingSeconds = if ($bytesPerSecond -gt 0) {
+                    [Math]::Max(0, [int](($total - $written) / $bytesPerSecond))
+                } else { 0 }
+                $status = "$writtenText / $(Format-DownloadSize $total) - $percent% - $rateText - ETA $([TimeSpan]::FromSeconds($remainingSeconds).ToString('mm\:ss'))"
+                Write-Progress -Id $progressId -Activity "Downloading $DisplayName" `
+                    -Status $status -PercentComplete $percent
+            }
+            else {
+                $status = "$writtenText received - $rateText"
+                Write-Progress -Id $progressId -Activity "Downloading $DisplayName" `
+                    -Status $status
+            }
+
+            if ($timer.Elapsed.TotalSeconds -ge $nextTextReport) {
+                Write-Host "  $status"
+                $nextTextReport = $timer.Elapsed.TotalSeconds + 5.0
+            }
+        }
+
+        $target.Flush()
+        if ($null -ne $total -and $total -ge 0 -and $written -ne $total) {
+            throw "Incomplete download for $DisplayName. Expected $total bytes, received $written."
+        }
+        $timer.Stop()
+        $averageRate = if ($timer.Elapsed.TotalSeconds -gt 0) {
+            Format-DownloadSize ([long]($written / $timer.Elapsed.TotalSeconds))
+        } else { Format-DownloadSize $written }
+        Write-Host "Downloaded $DisplayName: $(Format-DownloadSize $written) at $averageRate/s."
+    }
+    finally {
+        Write-Progress -Id $progressId -Activity "Downloading $DisplayName" -Completed
+        if ($null -ne $target) { $target.Dispose() }
+        if ($null -ne $source) { $source.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        $headerTimeout.Dispose()
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
 function Get-VerifiedDownload {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Definition,
@@ -119,9 +244,9 @@ function Get-VerifiedDownload {
     }
 
     $temporary = "$destination.download-$([Guid]::NewGuid().ToString('N'))"
-    Write-Host "Downloading $($Definition.Uri)"
     try {
-        Invoke-WebRequest -UseBasicParsing -Uri $Definition.Uri -OutFile $temporary
+        Invoke-DownloadWithProgress -Uri $Definition.Uri -OutFile $temporary `
+            -DisplayName $Definition.FileName
         $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $temporary).Hash
         if ($actualHash -ne $Definition.Sha256) {
             throw "SHA256 mismatch for $($Definition.FileName). Expected $($Definition.Sha256), got $actualHash"
@@ -182,6 +307,20 @@ function Invoke-NativeCapture {
     }
 }
 
+function Write-NativeOutputLine {
+    param([Parameter(Mandatory = $true)]$Item)
+    $line = if ($Item -is [System.Management.Automation.ErrorRecord]) {
+        $Item.Exception.Message
+    } else {
+        $Item.ToString()
+    }
+    if ([string]::IsNullOrWhiteSpace($line) -or
+        $line -eq 'System.Management.Automation.RemoteException') {
+        return
+    }
+    Write-Host $line
+}
+
 function Invoke-NativeLive {
     [CmdletBinding()]
     param(
@@ -191,7 +330,32 @@ function Invoke-NativeLive {
     $oldPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $FilePath @Arguments 2>&1 | ForEach-Object { Write-Host $_.ToString() }
+        & $FilePath @Arguments 2>&1 | ForEach-Object {
+            Write-NativeOutputLine -Item $_
+        }
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldPreference
+    }
+    if ($exitCode -ne 0) {
+        throw "Command failed ($exitCode): $FilePath $($Arguments -join ' ')"
+    }
+}
+
+function Invoke-NativeWithInput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string[]]$InputLines
+    )
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $InputLines | & $FilePath @Arguments 2>&1 | ForEach-Object {
+            Write-NativeOutputLine -Item $_
+        }
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -468,14 +632,26 @@ function Resolve-AndroidSdk {
     try {
         $env:JAVA_HOME = $ResolvedJavaHome
         $env:ANDROID_SDK_ROOT = $sdkRoot
-        if ($NonInteractive.IsPresent -and -not (Test-Path -LiteralPath (Join-Path $sdkRoot 'licenses\android-sdk-license') -PathType Leaf)) {
+        $licenseMarker = Join-Path $sdkRoot 'licenses\android-sdk-license'
+        if ($NonInteractive.IsPresent -and -not (Test-Path -LiteralPath $licenseMarker -PathType Leaf)) {
             throw "Android SDK licenses have not been accepted in $sdkRoot. Run this master once without -NonInteractive."
         }
-        if (-not $NonInteractive.IsPresent) {
-            Write-Host 'Android components are missing. Review and accept the Google Android SDK licenses.' -ForegroundColor Yellow
-            Invoke-NativeLive -FilePath $javaExe -Arguments @(
+        if (-not $NonInteractive.IsPresent -and
+            -not (Test-Path -LiteralPath $licenseMarker -PathType Leaf)) {
+            $accepted = Confirm-ExactText `
+                -Message 'Android components require the Google Android SDK licenses. Type ACCEPT only if you agree to those licenses; the master will answer the repetitive sdkmanager prompts for you.' `
+                -RequiredText 'ACCEPT'
+            if (-not $accepted) {
+                throw 'Android SDK licenses were not accepted. No Android components were installed.'
+            }
+            Write-Host 'Recording Android SDK license acceptance...' -ForegroundColor Yellow
+            Invoke-NativeWithInput -FilePath $javaExe -Arguments @(
                 '-cp', $sdkManagerClasspath, $sdkManagerMain, "--sdk_root=$sdkRoot", '--licenses'
-            )
+            ) -InputLines (@('y') * 32)
+            if (-not (Test-Path -LiteralPath $licenseMarker -PathType Leaf)) {
+                throw "sdkmanager finished without recording license acceptance in $sdkRoot."
+            }
+            Write-Host 'Android SDK licenses accepted.' -ForegroundColor Green
         }
         $packages = @(
             'platforms;android-35',

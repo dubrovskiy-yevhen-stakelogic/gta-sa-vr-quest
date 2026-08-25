@@ -102,6 +102,12 @@ certificate and content checks still apply.
 4. Connect the Quest and approve USB debugging inside the headset.
 5. Review the installation summary.
 
+On the first run, type `ACCEPT` when asked only if you agree to the Google
+Android SDK licenses. The wizard then handles sdkmanager's repetitive `y/N`
+prompts. Dependency downloads report transferred size, total size, speed, and
+ETA every five seconds; a connection that receives no data for 90 seconds fails
+with a retry message instead of appearing to hang indefinitely.
+
 The wizard validates both inputs and completes the build on the computer before
 changing anything on Quest. It installs the APK set, deploys `data_main`, audio,
 and VR hands, verifies the resulting hashes, and leaves the game stopped. It

@@ -50,7 +50,12 @@ The Windows master can download and verify:
 
 Downloaded archives are SHA-256 checked before extraction. The OpenXR loader
 shared object is also checked after extraction. Nothing downloaded by the
-master is committed to this repository.
+master is committed to this repository. Windows downloads show byte progress,
+speed, and ETA and stop with an explicit error after 90 seconds without data.
+When SDK packages are first required, the interactive master asks the user to
+type `ACCEPT` before it supplies the repetitive affirmative responses to
+Google's `sdkmanager --licenses`; non-interactive mode never grants that
+acceptance.
 
 The Linux/macOS master additionally downloads pinned 7-Zip `26.02` when an
 input requires it. Both the official 7-Zip archive and the extracted `7zz`
