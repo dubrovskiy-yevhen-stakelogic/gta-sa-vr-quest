@@ -874,7 +874,10 @@ install_payload_tree() {
   case "$tree_name" in data_main|audio|vrhands) ;; *) die "refusing unexpected local payload tree: $local_tree" ;; esac
   [ "${target##*/}" = "$tree_name" ] || die "payload tree does not match its Quest destination: $tree_name"
   id="$("$PYTHON_EXE" -c 'import uuid; print(uuid.uuid4().hex)')"
-  stage_container="$parent/.savr-stage-$id"
+  # Do not let adb push touch Android/data: scoped-storage secure_mkdirs fails
+  # on some Quest firmware even for shell-created directories. Upload and
+  # verify under ordinary shared storage, then move with the device shell.
+  stage_container="/sdcard/savr/.savr-stage-$id"
   stage="$stage_container/$tree_name"
   backup="$parent/.savr-backup-$id"
   REMOTE_STAGING+=("$stage_container")

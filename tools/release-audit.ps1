@@ -204,6 +204,17 @@ if ($normalizedScriptText -match '(?i)\bam\s+start(?:service)?\b|\bmonkey\b') {
     throw 'A shipped script contains an application launch command.'
 }
 
+$windowsInstallerText = Get-Content -LiteralPath (Join-Path $Root 'tools\build-and-install.ps1') -Raw
+$posixInstallerText = Get-Content -LiteralPath (Join-Path $Root 'tools\build-and-install.sh') -Raw
+if ($windowsInstallerText -notmatch '\$stageContainer\s*=\s*"/sdcard/savr/\.savr-stage-\$id"' -or
+    $posixInstallerText -notmatch 'stage_container="/sdcard/savr/\.savr-stage-\$id"') {
+    throw 'Payload upload staging must remain outside Android/data to avoid scoped-storage ADB failures.'
+}
+if ($windowsInstallerText -match '\$stageContainer\s*=\s*"\$RemoteParent/\.savr-stage-' -or
+    $posixInstallerText -match 'stage_container="\$parent/\.savr-stage-') {
+    throw 'A payload installer stages adb push directly below its final Android/data parent.'
+}
+
 $resetFiles = @(
     'RESET_VR_SETTINGS.bat', 'RESET_VR_SETTINGS.sh',
     'tools\reset-vr-settings.ps1', 'tools\reset-vr-settings.sh'

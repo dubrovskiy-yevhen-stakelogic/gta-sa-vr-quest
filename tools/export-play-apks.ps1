@@ -120,34 +120,64 @@ function Get-VerifiedPlatformTools {
 
 function Select-SourceDevice {
     Invoke-NativeCapture -FilePath $script:Adb -Arguments @('start-server') -AllowFailure | Out-Null
-    $result = Invoke-NativeCapture -FilePath $script:Adb -Arguments @('devices', '-l')
+    $deadline = [DateTime]::UtcNow.AddMinutes(2)
+    $guidanceShown = $false
     $devices = @()
-    foreach ($line in $result.Lines) {
-        if ($line -match '^([^\s]+)\s+(device|unauthorized|offline|no permissions)\b\s*(.*)$') {
-            $devices += [pscustomobject]@{
-                Serial = $Matches[1]
-                State = $Matches[2]
-                Detail = $Matches[3]
+    $ready = @()
+    while ($true) {
+        $result = Invoke-NativeCapture -FilePath $script:Adb -Arguments @('devices', '-l')
+        $devices = @()
+        foreach ($line in $result.Lines) {
+            if ($line -match '^([^\s]+)\s+(device|unauthorized|offline|no permissions)\b\s*(.*)$') {
+                $devices += [pscustomobject]@{
+                    Serial = $Matches[1]
+                    State = $Matches[2]
+                    Detail = $Matches[3]
+                }
             }
         }
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Serial)) {
-        $match = @($devices | Where-Object Serial -eq $Serial)
-        if ($match.Count -ne 1) { throw "Requested Android device was not found: $Serial" }
-        if ($match[0].State -ne 'device') { throw "Requested Android device is $($match[0].State): $Serial" }
-        $script:SelectedSerial = $Serial
-    }
-    else {
         $ready = @($devices | Where-Object State -eq 'device')
-        if ($ready.Count -eq 0) {
+        if (-not [string]::IsNullOrWhiteSpace($Serial)) {
+            $requested = @($ready | Where-Object Serial -eq $Serial)
+            if ($requested.Count -eq 1) {
+                $script:SelectedSerial = $Serial
+                break
+            }
+        }
+        elseif ($ready.Count -gt 0) { break }
+
+        if (-not $guidanceShown) {
+            Write-Host ''
+            Write-Host 'WAITING FOR USB DEBUGGING...' -ForegroundColor Yellow
+            Write-Host 'Seeing the phone in Windows File Explorer is not enough; that is only the MTP file connection.' -ForegroundColor Yellow
+            Write-Host 'On the phone: Settings > About phone > Software information > tap Build number 7 times.'
+            Write-Host 'Then: Settings > System > Developer options > enable USB debugging.'
+            Write-Host 'Keep the phone unlocked and tap Always allow from this computer, then Allow.'
+            Write-Host 'The exporter will continue automatically when ADB becomes available.' -ForegroundColor Cyan
+            $guidanceShown = $true
+        }
+        $remaining = [math]::Max(0, [int][math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
+        if ($remaining -le 0) {
+            Write-Progress -Id 7 -Activity 'Waiting for the Android phone/tablet' -Completed
             if (@($devices | Where-Object State -eq 'unauthorized').Count -gt 0) {
-                throw 'The Android device is unauthorized. Unlock it, approve the USB debugging prompt, and run EXPORT_PLAY_APKS.bat again.'
+                throw 'USB debugging is still unauthorized. Unlock the phone and approve the Allow USB debugging prompt.'
             }
             if (@($devices | Where-Object State -eq 'offline').Count -gt 0) {
-                throw 'The Android device is offline. Unlock it, reconnect the USB cable, and run EXPORT_PLAY_APKS.bat again.'
+                throw 'The Android ADB connection is offline. Reconnect the USB cable, unlock the phone, and retry.'
             }
-            throw 'No Android device is connected. Use a data-capable USB cable, unlock the phone/tablet, enable USB debugging, and approve the prompt.'
+            throw 'Windows may see the phone for file transfer, but ADB still cannot see it. Enable USB debugging, approve this computer on the phone, and retry. If no prompt appears, use another data-capable USB cable or install the phone manufacturer ADB driver.'
         }
+        $stateText = if (@($devices | Where-Object State -eq 'unauthorized').Count -gt 0) {
+            'Phone found; approve the USB debugging prompt on it'
+        } else { 'No ADB device yet; enable USB debugging on the unlocked phone' }
+        Write-Progress -Id 7 -Activity 'Waiting for the Android phone/tablet' `
+            -Status "$stateText ($remaining seconds remaining)" `
+            -PercentComplete ([math]::Min(100, [math]::Max(0, (120 - $remaining) * 100 / 120)))
+        Start-Sleep -Seconds 2
+    }
+    Write-Progress -Id 7 -Activity 'Waiting for the Android phone/tablet' -Completed
+
+    if ([string]::IsNullOrWhiteSpace([string]$script:SelectedSerial)) {
         if ($ready.Count -eq 1) { $script:SelectedSerial = $ready[0].Serial }
         else {
             Write-Host 'Connected Android devices:'
@@ -237,6 +267,7 @@ function Export-Apks {
     Write-Host ''
     Write-Host 'APK EXPORT COMPLETED.' -ForegroundColor Green
     Write-Host "Folder: $resolvedDestination"
+    Write-Host 'Correct APK filename: base.apk. Do not rename it, and keep every split_*.apk beside it.' -ForegroundColor Green
     Write-Host 'Next: disconnect the phone/tablet, run BUILD_AND_INSTALL.bat, and select base.apk from this folder.' -ForegroundColor Cyan
     Start-Process -FilePath 'explorer.exe' -ArgumentList @($resolvedDestination)
     return $resolvedDestination

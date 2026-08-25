@@ -42,12 +42,19 @@ certificate and rejects modified, merged, or re-signed packages.
 
 The easiest Windows method does not require installing ADB or typing commands:
 
-1. Enable USB debugging on the phone/tablet containing the Google Play game.
+1. On the phone/tablet containing the Google Play game, open **Settings > About
+   phone > Software information** and tap **Build number** seven times. Then
+   open **Settings > System > Developer options** and enable **USB debugging**.
 2. Connect it by USB, unlock it, and approve the debugging prompt.
 3. Double-click `EXPORT_PLAY_APKS.bat`.
 4. Keep the device unlocked until the export completes.
 5. Disconnect the phone/tablet, run `BUILD_AND_INSTALL.bat`, and select the
    exported `base.apk`. The builder automatically includes its sibling splits.
+
+`base.apk` is the correct filename. Do not rename it, and keep every exported
+`split_*.apk` in the same folder. Seeing the phone in Windows File Explorer only
+confirms an MTP file connection; the exporter waits up to two minutes for the
+separate USB-debugging authorization and continues automatically once approved.
 
 The exporter downloads Google's pinned Platform Tools itself, verifies their
 SHA-256, checks GTA SA version `2.11.311` (`4234641`), exports every installed

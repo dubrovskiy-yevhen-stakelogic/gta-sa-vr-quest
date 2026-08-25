@@ -919,7 +919,7 @@ function Remove-GeneratedRemotePath {
 function Assert-RemotePayloadHashes {
     param([Parameter(Mandatory = $true)][string]$RemoteRoot)
     if ($RemoteRoot -match "['`r`n]" -or
-        $RemoteRoot -notmatch '^/sdcard/(savr/data_main|Android/data/com\.rockstargames\.gtasa/files/(audio|vrhands)|savr/\.savr-stage-[a-f0-9]{32}/data_main|Android/data/com\.rockstargames\.gtasa/files/\.savr-stage-[a-f0-9]{32}/(audio|vrhands))$') {
+        $RemoteRoot -notmatch '^/sdcard/(savr/data_main|Android/data/com\.rockstargames\.gtasa/files/(audio|vrhands)|savr/\.savr-stage-[a-f0-9]{32}/(data_main|audio|vrhands))$') {
         throw "Refusing to hash an unexpected remote root: $RemoteRoot"
     }
     $command = "cd '$RemoteRoot' && toybox sha256sum -c SHA256SUMS >/dev/null"
@@ -961,7 +961,11 @@ function Publish-PayloadTree {
     if ($treeName -notin @('data_main', 'audio', 'vrhands')) {
         throw "Refusing an unexpected local payload tree: $LocalRoot"
     }
-    $stageContainer = "$RemoteParent/.savr-stage-$id"
+    # Never use `adb push` below Android/data. On some Quest firmware, adbd's
+    # scoped-storage secure_mkdirs fails even when shell-created directories
+    # already exist. Upload and verify on ordinary shared storage, then let the
+    # device shell atomically move the verified tree to its final location.
+    $stageContainer = "/sdcard/savr/.savr-stage-$id"
     $stage = "$stageContainer/$treeName"
     $backup = "$RemoteParent/.savr-backup-$id"
     Assert-SafeGeneratedRemotePath -RemotePath $stageContainer
@@ -979,9 +983,8 @@ function Publish-PayloadTree {
 
     Invoke-AdbCapture -Arguments @('shell', 'mkdir', '-p', $RemoteParent) | Out-Null
     if (Test-RemotePath -RemotePath $stageContainer) { Remove-GeneratedRemotePath -RemotePath $stageContainer }
-    # Android 14 can reject ADB's secure_mkdirs anywhere below Android/data,
-    # even though the shell may create the same directories. Create the whole
-    # local directory shape first so `adb push` only has to write files.
+    # Pre-create the directory shape so transfer behavior is deterministic on
+    # both old and new adbd versions. This staging root is outside Android/data.
     Invoke-AdbCapture -Arguments @('shell', 'mkdir', '-p', $stage) | Out-Null
     New-RemotePayloadDirectoryTree -LocalRoot $LocalRoot -RemoteRoot $stage
     Write-Host "Staging $LocalRoot -> $stage"

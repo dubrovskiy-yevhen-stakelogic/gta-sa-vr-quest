@@ -9,6 +9,7 @@ echo ================================================================
 echo.
 echo Connect the Android phone or tablet where your Google Play copy of
 echo GTA San Andreas 2.11.311 is installed, then approve USB debugging.
+echo Seeing the phone in Windows File Explorer is not enough by itself.
 echo.
 
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\export-play-apks.ps1"
