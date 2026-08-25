@@ -856,13 +856,13 @@ function Stop-GameAndVerify {
     if ([string]::IsNullOrWhiteSpace([string]$script:SelectedSerial) -or
         [string]::IsNullOrWhiteSpace([string]$script:AdbExe)) { return }
     $stop = Invoke-AdbCapture -Arguments @('shell', 'am', 'force-stop', $script:PackageName) -AllowFailure
-    $pid = Invoke-AdbCapture -Arguments @('shell', 'pidof', $script:PackageName) -AllowFailure
-    if (-not [string]::IsNullOrWhiteSpace($pid.Text)) {
+    $pidResult = Invoke-AdbCapture -Arguments @('shell', 'pidof', $script:PackageName) -AllowFailure
+    if (-not [string]::IsNullOrWhiteSpace($pidResult.Text)) {
         if ($BestEffort.IsPresent) {
-            Write-Warning "Could not confirm that $($script:PackageName) is stopped. PID: $($pid.Text.Trim())"
+            Write-Warning "Could not confirm that $($script:PackageName) is stopped. PID: $($pidResult.Text.Trim())"
             return
         }
-        throw "$($script:PackageName) is still running after force-stop. PID: $($pid.Text.Trim())"
+        throw "$($script:PackageName) is still running after force-stop. PID: $($pidResult.Text.Trim())"
     }
     if ($stop.ExitCode -ne 0 -and -not $BestEffort.IsPresent) {
         throw "Failed to force-stop $($script:PackageName): $($stop.Text)"
@@ -898,8 +898,8 @@ function Assert-QuestFreeSpace {
 function Test-RemotePath {
     param([Parameter(Mandatory = $true)][string]$RemotePath)
     if ($RemotePath -match "['`r`n]") { throw "Unsafe remote path: $RemotePath" }
-    $result = Invoke-AdbCapture -Arguments @('shell', 'sh', '-c', "if [ -e '$RemotePath' ]; then echo yes; fi")
-    return $result.Text.Trim() -eq 'yes'
+    $result = Invoke-AdbCapture -Arguments @('shell', 'test', '-e', $RemotePath) -AllowFailure
+    return $result.ExitCode -eq 0
 }
 
 function Assert-SafeGeneratedRemotePath {
@@ -923,7 +923,9 @@ function Assert-RemotePayloadHashes {
         throw "Refusing to hash an unexpected remote root: $RemoteRoot"
     }
     $command = "cd '$RemoteRoot' && toybox sha256sum -c SHA256SUMS >/dev/null"
-    $result = Invoke-AdbCapture -Arguments @('shell', 'sh', '-c', $command) -AllowFailure
+    # adb shell concatenates its remaining arguments into a remote command, so
+    # preserve the complete sh -c payload with explicit remote-shell quotes.
+    $result = Invoke-AdbCapture -Arguments @('shell', 'sh', '-c', ('"' + $command + '"')) -AllowFailure
     if ($result.ExitCode -ne 0) {
         throw "Quest payload hash verification failed at $RemoteRoot`n$($result.Text)"
     }
@@ -1044,7 +1046,7 @@ function Backup-QuestSavesAndSettings {
             $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash
             $remoteFile = "$remoteRoot/$relative"
             $remoteResult = Invoke-AdbCapture -Arguments @(
-                'shell', 'sh', '-c', "toybox sha256sum '$remoteFile'"
+                'shell', 'toybox', 'sha256sum', $remoteFile
             ) -AllowFailure
             if ($remoteResult.ExitCode -ne 0) {
                 throw "Could not hash the remote save/settings file before uninstall: $remoteFile`n$($remoteResult.Text)"
@@ -1096,7 +1098,7 @@ function Restore-QuestSavesAndSettings {
     foreach ($record in @($Backup.Manifest.files)) {
         $remoteFile = "$remoteRoot/$($record.path)"
         if ($remoteFile -match "['`r`n]") { throw "Cannot verify restored path: $remoteFile" }
-        $result = Invoke-AdbCapture -Arguments @('shell', 'sh', '-c', "toybox sha256sum '$remoteFile'")
+        $result = Invoke-AdbCapture -Arguments @('shell', 'toybox', 'sha256sum', $remoteFile)
         $remoteHash = (($result.Text.Trim() -split '\s+')[0]).ToUpperInvariant()
         if ($remoteHash -ne ([string]$record.sha256).ToUpperInvariant()) {
             throw "Restored save/settings hash mismatch: $($record.path)"

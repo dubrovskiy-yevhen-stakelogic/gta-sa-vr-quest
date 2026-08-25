@@ -38,13 +38,25 @@ GTA San Andreas `2.11.311` is currently installed. Do not download an APK from a
 third-party APK site: the build wizard accepts only the original Google Play
 certificate and rejects modified, merged, or re-signed packages.
 
-Install Google's Android SDK Platform Tools on the computer, enable Developer
-Options and USB debugging on the Android device, connect it by USB, and approve
-the authorization prompt. Confirm the device and installed game version:
+Download and extract Google's official [SDK Platform Tools for
+Windows](https://developer.android.com/tools/releases/platform-tools). Enable
+Developer Options and USB debugging on the Android device, connect it by USB,
+and approve the authorization prompt.
+
+If PowerShell says `adb is not recognized`, do not continue with a bare `adb`
+command. Point PowerShell directly at the extracted executable instead (change
+the path if you extracted it elsewhere):
 
 ```powershell
-adb devices
-adb shell dumpsys package com.rockstargames.gtasa |
+$adb = (Resolve-Path "$HOME\Downloads\platform-tools\adb.exe").Path
+& $adb version
+```
+
+Confirm the device and installed game version:
+
+```powershell
+& $adb devices
+& $adb shell dumpsys package com.rockstargames.gtasa |
   Select-String 'versionName=|versionCode='
 ```
 
@@ -56,7 +68,7 @@ On Windows PowerShell, export every installed split into one directory:
 $destination = Join-Path $PWD 'GTA-SA-Play-export'
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
 $apkPaths = @(
-  adb shell pm path com.rockstargames.gtasa |
+  & $adb shell pm path com.rockstargames.gtasa |
     ForEach-Object { ($_ -replace '^package:', '').Trim() } |
     Where-Object { $_ }
 )
@@ -64,7 +76,7 @@ if ($apkPaths.Count -lt 3) {
   throw 'A complete split APK installation was not found.'
 }
 foreach ($remotePath in $apkPaths) {
-  adb pull $remotePath $destination
+  & $adb pull $remotePath $destination
   if ($LASTEXITCODE -ne 0) { throw "Failed to export $remotePath" }
 }
 ```
