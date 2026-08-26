@@ -55,6 +55,11 @@ $script:PinnedFiles = @{
         Uri = 'https://repo1.maven.org/maven2/org/khronos/openxr/openxr_loader_for_android/1.1.43/openxr_loader_for_android-1.1.43.aar'
         Sha256 = '7E1B36141F9A4F1FA4A7E061936344FD9FCD36BCE6C47EAE2AD09812736167B6'
     }
+    SevenZip = @{
+        FileName = '7zr-26.02.exe'
+        Uri = 'https://github.com/ip7z/7zip/releases/download/26.02/7zr.exe'
+        Sha256 = '56B8CC9F4971CEF253644FAFE54063ED7FDCA551D4DEE0F8C6BAA81B855ACD72'
+    }
 }
 
 function Write-Step {
@@ -510,6 +515,22 @@ function Resolve-Python {
 function Resolve-Apktool {
     param([Parameter(Mandatory = $true)][string]$DownloadRoot)
     return Get-VerifiedDownload -Definition $script:PinnedFiles.Apktool -DownloadRoot $DownloadRoot
+}
+
+function Test-IsSevenZipArchive {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return (Test-Path -LiteralPath $Path -PathType Leaf) -and
+        [System.IO.Path]::GetExtension($Path).Equals('.7z', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Resolve-SevenZip {
+    param([Parameter(Mandatory = $true)][string]$DownloadRoot)
+    $sevenZip = Get-VerifiedDownload -Definition $script:PinnedFiles.SevenZip -DownloadRoot $DownloadRoot
+    $version = Invoke-NativeCapture -FilePath $sevenZip -Arguments @('i') -AllowFailure
+    if ($version.ExitCode -ne 0 -or $version.Text -notmatch '7-Zip.*26\.02') {
+        throw "Pinned 7-Zip validation failed: $($version.Text)"
+    }
+    return $sevenZip
 }
 
 function Resolve-PlatformTools {
@@ -1304,6 +1325,12 @@ function Invoke-Main {
     $resolvedJavaHome = Resolve-JavaHome -Requested $JavaHome -DownloadRoot $downloads -ToolsRoot $toolsRoot
     $python = Resolve-Python -DownloadRoot $downloads -ToolsRoot $toolsRoot
     $apktool = Resolve-Apktool -DownloadRoot $downloads
+    if ((Test-IsSevenZipArchive -Path $resolvedGamePackage) -or
+        (Test-IsSevenZipArchive -Path $resolvedAudioSource)) {
+        $archiveTool = Resolve-SevenZip -DownloadRoot $downloads
+        $env:SAVR_ARCHIVE_TOOL = $archiveTool
+        Write-Host "Pinned 7-Zip archive tool: $archiveTool"
+    }
     $openXrLoader = Resolve-OpenXrLoader -DownloadRoot $downloads -ToolsRoot $toolsRoot
     $resolvedSdk = Resolve-AndroidSdk -Requested $AndroidSdk -DefaultRoot $defaultSdk -DownloadRoot $downloads `
         -ToolsRoot $toolsRoot -ResolvedJavaHome $resolvedJavaHome
