@@ -22,7 +22,7 @@ HolsterCalib     g_holsterCalib[kMaxWeapons];
 bool             g_supportConfigured[kMaxWeapons]{};
 std::atomic<int> g_active{0};
 std::mutex       g_calibMutex;
-std::atomic<bool> g_laserEnabled{false};
+std::atomic<bool> g_laserEnabled{true};
 std::atomic<bool> g_laserLocked[kMaxWeapons]{};
 // Per-weapon visible-laser override: 0 = follow the global toggle,
 // 1 = always on for this weapon, 2 = always off for this weapon.
@@ -90,101 +90,14 @@ constexpr int kFieldOrder[F_COUNT] = {
     F_SUP_STYLE,
 };
 
-struct WeaponDefaultRow {
-    int type;
-    WeaponCalib calibration;
-    bool laserLocked;
-    bool supportConfigured;
-};
-
-// Author calibration captured from the release Quest on 2026-08-26. Values
-// retain the native v6 field order documented in Calib.h.
-constexpr WeaponDefaultRow kWeaponDefaults[] = {
-    {2,  {0, 0, 0, 0, 0, 1, -16, -4, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {3,  {0, 0, 0, 0, 0, 0, 24, -8, -8, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {4,  {0, 0, 0, 0, 0, 0, 2, -8, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {5,  {0, 0, 0, 0, 0, 0, -6, -4, -9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {6,  {0, 0, 0, 0, 0, 0, 3, -5, -9, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {7,  {0, 0, 0, 0, 0, 0, 0, -5, -10, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {8,  {0, 0, 0, 0, 0, 0, 15, -7, -9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {9,  {0, 0, 0, 0, 0, 0, 0, -9, -14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {10, {0, 0, 0, 0, 0, 0, -2, -8, -10, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {11, {0, 0, 0, 0, 0, 0, 10, -8, -11, 0, 51, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {12, {0, 0, 0, 0, 0, 0, -11, -9, -11, 0, 37, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {13, {0, 0, 0, 0, 0, 0, 1, -6, -11, 0, 39, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {14, {0, 0, 0, 0, 0, 0, -2, -4, -13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {15, {0, 0, 0, 0, 0, 0, 3, -6, -6, 0, 41, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {16, {0, 0, 0, 0, 0, 0, 2, -2, -14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {17, {0, 0, 0, 0, 0, 0, 0, 0, -15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {18, {0, 0, 0, 0, 0, 0, 28, -6, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {22, {17, 6, -12, 7, 20, 0, -3, -3, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, true, false},
-    {23, {21, 7, 0, 6, 18, 0, 0, 0, -10, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0}, true, false},
-    {24, {16, 4, 1, -5, 0, 0, 0, -7, -9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {25, {26, 2, 10, -12, 15, 0, 0, -2, -10, 0, 0, -7, -16, 85, -8, 0, -360, -360, 1}, true, true},
-    {26, {27, 3, 67, -4, 3, 0, 0, -1, -9, 0, 0, 0, -15, 70, -4, 0, 360, -320, 1}, false, true},
-    {27, {28, 5, 0, -13, 17, 0, -1, -1, -10, 0, 0, 0, -15, 74, -9, 0, 360, -298, 1}, false, true},
-    {28, {17, 2, -8, -12, 8, 0, 2, 1, -6, 0, 0, 0, 0, 60, -10, 0, 360, 0, 0}, false, true},
-    {29, {30, 1, 0, -14, 15, 0, -10, -10, -8, 0, 0, 0, -26, 60, -9, 0, 360, -334, 1}, false, true},
-    {30, {21, -2, 39, -10, 6, 0, 0, 0, -9, 0, 0, 0, -11, 79, -9, 0, 360, -329, 1}, false, true},
-    {31, {22, 0, 21, -11, 1, 1, 0, 0, -6, 0, 1, 1, -11, 82, -9, -5, 360, 332, 1}, true, true},
-    {32, {21, 6, 0, -5, 3, 0, -1, -7, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, true, false},
-    {33, {21, 5, -8, -13, 17, 0, -3, 0, -11, 0, 0, 0, -19, 76, -10, -19, 360, -169, 0}, true, true},
-    {34, {21, 3, 0, -11, 11, 0, -2, -3, -9, 0, 0, 0, -16, 60, -10, 0, 360, -337, 1}, false, true},
-    {35, {0, 0, 0, 0, 0, 0, -2, 25, -12, 0, 0, 0, 0, 17, -1, 0, 360, 0, 0}, false, true},
-    {36, {0, 0, 0, 0, 0, 0, 1, 29, -12, -1, 0, 0, 9, 23, 0, 0, 360, 0, 0}, false, true},
-    {37, {0, 0, 0, 0, 0, 0, 11, -5, -12, 0, 65, 0, -22, 58, -10, 0, 360, 0, 0}, false, true},
-    {38, {-30, 15, 0, -11, 58, 0, 11, -3, -12, 1, 76, 0, -36, 44, -3, -31, 209, 33, 1}, true, true},
-    {39, {0, 0, 0, 0, 0, 0, 45, -20, 0, 0, 0, 0, 0, 60, -10, 0, 360, 0, 0}, false, true},
-    {41, {0, 0, 0, 0, 0, 0, 15, 0, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {42, {0, 0, 0, 0, 0, 0, 80, 18, -18, -2, 141, -5, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {43, {0, 0, 0, 0, 0, 0, 3, 0, -33, 0, 69, 0, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {44, {0, 0, 0, 0, 0, 0, 0, -3, -13, -171, -3, -134, 0, 0, 0, 0, 0, 0, 0}, false, false},
-    {45, {0, 0, 0, 0, 0, 0, -9, 0, -9, -160, 0, -132, 0, 0, 0, 0, 0, 0, 0}, false, false},
-};
-
-struct HolsterDefaultRow {
-    int type;
-    HolsterCalib calibration;
-};
-
-constexpr HolsterDefaultRow kHolsterDefaults[] = {
-    {5,  {-15, -9, 0, 0, 180, 0}},
-    {18, {-14, -13, 18, 0, -180, 0}},
-    {22, {-13, -5, 0, 180, 0, 0}},
-};
-
-WeaponCalib DefaultWeaponCalibration(int type) {
-    for (const WeaponDefaultRow& row : kWeaponDefaults)
-        if (row.type == type) return row.calibration;
-    return WeaponCalib{};
-}
-
-HolsterCalib DefaultHolsterCalibration(int type) {
-    for (const HolsterDefaultRow& row : kHolsterDefaults)
-        if (row.type == type) return row.calibration;
-    return HolsterCalib{};
-}
-
-bool DefaultLaserLocked(int type) {
-    for (const WeaponDefaultRow& row : kWeaponDefaults)
-        if (row.type == type) return row.laserLocked;
-    return false;
-}
-
-bool DefaultSupportConfigured(int type) {
-    for (const WeaponDefaultRow& row : kWeaponDefaults)
-        if (row.type == type) return row.supportConfigured;
-    return false;
-}
-
-bool IsDefault(const WeaponCalib& c, int type) {
-    const WeaponCalib d = DefaultWeaponCalibration(type);
+bool IsDefault(const WeaponCalib& c) {
+    const WeaponCalib d{};
     return std::memcmp(&c, &d, sizeof(WeaponCalib)) == 0;
 }
 
 void ApplyEffectiveSupportDefaults(WeaponCalib& c, bool configured) {
     // Profiles written before two-hand support contain explicit zeroes in all
-    // SUPPORT columns. Present the Vice City Quest port's generic SA-safe socket until the user
+    // SUPPORT columns. Present qbuild's generic SA-safe socket until the user
     // touches those rows, then seed the same values into storage so the first
     // adjustment cannot make the foregrip jump back to the weapon origin.
     if (configured) return;
@@ -196,8 +109,8 @@ void ApplyEffectiveSupportDefaults(WeaponCalib& c, bool configured) {
         c.supRotY = 360;  // 180 degrees in half-degree storage units
 }
 
-bool IsDefault(const HolsterCalib& c, int type) {
-    const HolsterCalib d = DefaultHolsterCalibration(type);
+bool IsDefault(const HolsterCalib& c) {
+    const HolsterCalib d{};
     return std::memcmp(&c, &d, sizeof(HolsterCalib)) == 0;
 }
 
@@ -227,15 +140,14 @@ void Init() {
     std::lock_guard<std::mutex> guard(g_calibMutex);
     for (int h = 0; h < kHands; ++h)
         for (int t = 0; t < kMaxWeapons; ++t)
-            g_calib[h][t] = DefaultWeaponCalibration(t);
+            g_calib[h][t] = WeaponCalib{};
     for (int t = 0; t < kMaxWeapons; ++t)
-        g_holsterCalib[t] = DefaultHolsterCalibration(t);
+        g_holsterCalib[t] = HolsterCalib{};
     for (int t = 0; t < kMaxWeapons; ++t) {
-        g_laserLocked[t].store(DefaultLaserLocked(t),
-                               std::memory_order_relaxed);
-        g_supportConfigured[t] = DefaultSupportConfigured(t);
+        g_laserLocked[t].store(false, std::memory_order_relaxed);
     }
-    g_laserEnabled.store(false, std::memory_order_relaxed);
+    std::memset(g_supportConfigured, 0, sizeof(g_supportConfigured));
+    g_laserEnabled.store(true, std::memory_order_relaxed);
 
     FILE* f = std::fopen(kPath, "r");
     if (!f) { LOGI("[calib] no profile file, defaults"); return; }
@@ -365,11 +277,8 @@ void Save() {
         const int laserMode = g_laserMode[t].load(std::memory_order_relaxed);
         if (laserMode != 0)
             std::fprintf(f, "laser_mode_type %d %d\n", t, laserMode);
-        const bool laserLocked =
-            g_laserLocked[t].load(std::memory_order_relaxed);
-        if (laserLocked || DefaultLaserLocked(t))
-            std::fprintf(f, "laser_locked_type %d %d\n", t,
-                         laserLocked ? 1 : 0);
+        if (g_laserLocked[t].load(std::memory_order_relaxed))
+            std::fprintf(f, "laser_locked_type %d 1\n", t);
         // AIM edits are live and AdjustField already persists every real
         // change.  Never replace them with the previous committed snapshot
         // merely because the optional SAVE LASER action was missed: on Quest
@@ -379,7 +288,7 @@ void Save() {
         WeaponCalib c = g_calib[kMasterHand][t];
         if (g_supportConfigured[t])
             std::fprintf(f, "support_configured %d 1\n", t);
-        if (IsDefault(c, t)) continue;                       // only overrides
+        if (IsDefault(c)) continue;                          // only touched slots
         std::fprintf(f, "w %d %d", t, kMasterHand);
         for (int i = 0; i < F_COUNT; ++i)
             std::fprintf(f, " %d", static_cast<int>(*FieldPtr(c, kFieldOrder[i])));
@@ -389,7 +298,7 @@ void Save() {
     int holsterSaved = 0;
     for (int t = 0; t < kMaxWeapons; ++t) {
         const HolsterCalib& c = g_holsterCalib[t];
-        if (IsDefault(c, t)) continue;
+        if (IsDefault(c)) continue;
         std::fprintf(f, "holster %d", t);
         for (int field = 0; field < H_COUNT; ++field)
             std::fprintf(f, " %d", static_cast<int>(*HolsterFieldPtr(c, field)));
@@ -612,10 +521,8 @@ void ResetActive(int hand) {
     WeaponCalib& c = g_calib[kMasterHand][type];
     if (c.aimOffX || c.aimOffY || c.aimOffZ || c.aimRotX || c.aimRotY || c.aimRotZ)
         g_laserLocked[type].store(false, std::memory_order_relaxed);
-    c = DefaultWeaponCalibration(type);
-    g_laserLocked[type].store(DefaultLaserLocked(type),
-                              std::memory_order_relaxed);
-    g_supportConfigured[type] = DefaultSupportConfigured(type);
+    c = WeaponCalib{};
+    g_supportConfigured[type] = false;
 }
 
 const char* WeaponName(int type) {

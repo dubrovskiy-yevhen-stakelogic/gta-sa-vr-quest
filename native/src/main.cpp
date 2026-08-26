@@ -15,6 +15,7 @@
 #include "Throwable.h"
 #include "VrCamera.h"
 #include "VrFire.h"
+#include "Weapon.h"
 #include "Xr.h"
 
 #include <jni.h>
@@ -30,7 +31,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdint>
 
 #include <atomic>
@@ -39,7 +39,6 @@
 #include <cstdlib>
 #include <ctime>
 #include <iterator>
-#include <string>
 
 namespace savr {
 namespace {
@@ -47,7 +46,6 @@ namespace {
 JavaVM* g_vm = nullptr;
 jobject g_classLoader = nullptr;   // global ref
 jobject g_activity = nullptr;      // global ref
-std::string g_externalFilesDir;
 
 bool g_sessionAttempted = false;
 
@@ -901,7 +899,8 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
     // walks the player or drops/switches the weapon in hand.
     enum { PG_NONE = 0, PG_MAIN, PG_CALIB, PG_HOLSTER_CALIB, PG_HOLSTERS,
            PG_DRIVING, PG_DRIVING_CALIB, PG_LOCOMOTION, PG_HUD, PG_HUD_CROP,
-           PG_HUD_WRIST, PG_CHEATS, PG_GRAPHICS, PG_GRAPHICS_DISTANCES };
+           PG_HUD_WRIST, PG_CHEATS, PG_GRAPHICS, PG_GRAPHICS_DISTANCES,
+           PG_CONTROLS };
     static int  menuPage = PG_NONE;
     static int  mainSel = 0, cheatSel = 0, cheatCategory = -1, calibSel = 0;
     static int  calibWeaponType = 0;
@@ -910,7 +909,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
     static int  drivingCalibSel = 0, drivingCalibHand = 0;
     static int  hudWristMode = 0;   // 0 auto (hand/dash), 4 weapon, 5 two-hand
     static int  locomotionSel = 0, hudSel = 0, hudCropSel = 0, hudWristSel = 0,
-                gfxSel = 0, gfxDistanceSel = 0;
+                gfxSel = 0, gfxDistanceSel = 0, controlsSel = 0;
     static bool openPrev = false, enterPrev = false, backPrev = false;
     static int  tUp = 0, tDown = 0, tMinus = 0, tPlus = 0;
     // One RIGHT/master calibration drives both hands. Frame counts provide the
@@ -990,7 +989,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         case PG_MAIN: {
             // Laser, weapon/holster setup, driving, HUD, hand appearance,
             // cheats, graphics and close.
-            const int N = 12;
+            const int N = 13;
             if (navUp)   mainSel = (mainSel - 1 + N) % N;
             if (navDown) mainSel = (mainSel + 1) % N;
             if (mainSel == 0) {
@@ -1030,7 +1029,8 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                     menuPage = PG_CHEATS; cheatCategory = -1; cheatSel = 0;
                 }
                 else if (mainSel == 10) { menuPage = PG_GRAPHICS; gfxSel = 0; }
-                else if (mainSel == 11)  menuPage = PG_NONE;
+                else if (mainSel == 11) { menuPage = PG_CONTROLS; controlsSel = 0; }
+                else if (mainSel == 12)  menuPage = PG_NONE;
             }
             if (back) menuPage = PG_NONE;
             break;
@@ -1410,6 +1410,24 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             if (back) menuPage = PG_MAIN;
             break;
         }
+        case PG_CONTROLS: {
+            const int NC = 6; // layout, A, B, X, Y, back
+            if (navUp)   controlsSel = (controlsSel - 1 + NC) % NC;
+            if (navDown) controlsSel = (controlsSel + 1) % NC;
+            const int step = minus ? -1 : (plus ? 1 : 0);
+            if (controlsSel == 0 && (step || enter)) {
+                const int layout = savr::locomotion::ControlsLayout();
+                savr::locomotion::ApplyControlsLayout(
+                    layout == savr::locomotion::CONTROLS_LAYOUT_DEFAULT
+                        ? savr::locomotion::CONTROLS_LAYOUT_SWAPPED_HANDS
+                        : savr::locomotion::CONTROLS_LAYOUT_DEFAULT);
+            } else if (controlsSel >= 1 && controlsSel <= 4 && step) {
+                savr::locomotion::CycleButtonBinding(controlsSel - 1, step);
+            }
+            if (enter && controlsSel == 5) menuPage = PG_MAIN;
+            if (back) menuPage = PG_MAIN;
+            break;
+        }
         case PG_GRAPHICS_DISTANCES: {
             const int settings = vrcam::GetGraphicsDistanceSettingCount();
             const int rows = settings + 1; // explicit BACK
@@ -1459,6 +1477,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             : savr::cheats::CategoryCount(cheatCategory)) + 1;
         xr::SetMenuState(menuPage == PG_CHEATS,cheatSel,cheatRows,cheatCategory);
         xr::SetGraphicsMenu(menuPage == PG_GRAPHICS, gfxSel);
+        xr::SetControlsMenu(menuPage == PG_CONTROLS, controlsSel);
         xr::SetGraphicsDistanceMenu(
             menuPage == PG_GRAPHICS_DISTANCES, gfxDistanceSel);
     }
@@ -1660,7 +1679,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         // A tap must read as a tap, not a nudge. Pointing a controller at a
         // screen a few metres away wobbles by a couple of percent just from hand
         // tremor, so a tight move threshold turned every tap into a scroll swipe
-        // (small unintended jitter). Only a deliberate, larger move counts as a drag, and
+        // ("поддёргивание"). Only a deliberate, larger move counts as a drag, and
         // a tap releases exactly where it went down so the menu sees one point.
         static bool  touching = false, dragging = false;
         static float downU = 0.0f, downV = 0.0f;
@@ -1979,7 +1998,7 @@ void* WaitForGameLibrary(void*) {
     savr::driving::Init();        // load DEFAULT vehicle seat offsets
     savr::locomotion::Init();     // load movement/turning comfort settings
     savr::holster::Init();        // load the persistent Vice City-style loadout
-    savr::physicalweapon::Init(); // dual-hand grab/drop/transfer/catch ownership
+    savr::physicalweapon::Init(); // qbuild grab/drop/transfer/catch ownership
 
     // StartUserPause is only four instructions in the exact 2.11 binary. Verify
     // all of them before replacing it; OnStartUserPause reproduces its one-byte
@@ -2019,25 +2038,10 @@ void* WaitForGameLibrary(void*) {
     // through CFileMgr, which prepends the data dir.) The fix is to point cwd at
     // the game's data dir so the relative fopen lands on the deployed packs; the
     // case-insensitive /sdcard FUSE maps AUDIO/ -> audio/. Fixes SFX and radio.
-    const std::string dataDir = g_externalFilesDir.empty()
-        ? "/sdcard/Android/data/com.rockstargames.gtasa/files"
-        : g_externalFilesDir;
-    const std::string bankLookup = dataDir + "/audio/CONFIG/BankLkup.dat";
-    errno = 0;
-    const int bankAccess = access(bankLookup.c_str(), R_OK);
-    const int bankErrno = errno;
-    int cwdResult = -1;
-    int cwdErrno = 0;
-    if (bankAccess == 0) {
-        errno = 0;
-        cwdResult = chdir(dataDir.c_str());
-        cwdErrno = errno;
-    }
-    const bool audioPacksPresent = bankAccess == 0;
-    LOGI("audio preflight: data=%s bankAccess=%d errno=%d(%s) chdir=%d errno=%d(%s)",
-         dataDir.c_str(), bankAccess, bankErrno, std::strerror(bankErrno),
-         cwdResult, cwdErrno, std::strerror(cwdErrno));
-    if (audioPacksPresent && cwdResult == 0) {
+    const char* kDataDir = "/sdcard/Android/data/com.rockstargames.gtasa/files";
+    const bool audioPacksPresent =
+        access("/sdcard/Android/data/com.rockstargames.gtasa/files/audio/CONFIG/BankLkup.dat", F_OK) == 0;
+    if (audioPacksPresent && chdir(kDataDir) == 0) {
         // Packs will now open through the real loaders — do NOT stub them, or the
         // stub's return-null keeps radio silent.
         LOGI("audio: cwd -> data dir; real SFX + streams enabled (loaders not stubbed)");
@@ -2087,20 +2091,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 }
 
 JNIEXPORT void JNICALL
-Java_com_savr_SavrApplication_nativeOnApplicationCreate(JNIEnv* env, jclass,
-                                                         jobject classLoader,
-                                                         jstring externalFilesPath) {
+Java_com_savr_SavrApplication_nativeOnApplicationCreate(JNIEnv* env, jclass, jobject classLoader) {
     savr::g_classLoader = env->NewGlobalRef(classLoader);
-    if (externalFilesPath != nullptr) {
-        const char* utf = env->GetStringUTFChars(externalFilesPath, nullptr);
-        if (utf != nullptr) {
-            savr::g_externalFilesDir.assign(utf);
-            env->ReleaseStringUTFChars(externalFilesPath, utf);
-        }
-    }
-    savr::xr::SetExternalFilesDir(savr::g_externalFilesDir.c_str());
-    LOGI("application created; external files=%s",
-         savr::g_externalFilesDir.empty() ? "(fallback)" : savr::g_externalFilesDir.c_str());
+    LOGI("application created");
 }
 
 JNIEXPORT void JNICALL

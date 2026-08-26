@@ -114,7 +114,7 @@ void SetGameplayHudEnabled(bool enabled); // persists immediately
 void ToggleGameplayHud();                  // persists immediately
 
 // Single predicate for the renderer.  Keeping the master switch separate from
-// the preset matches the Vice City Quest port and allows CLASSIC placement to stay selected while
+// the preset matches qbuild and allows CLASSIC placement to stay selected while
 // the player temporarily hides the HUD.
 bool ShouldRenderClassicHud();
 

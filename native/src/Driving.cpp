@@ -1,5 +1,7 @@
 #include "Driving.h"
 
+#include "Locomotion.h"
+
 #include "Log.h"
 #include "PhysicalWeapon.h"
 #include "Symbols.h"
@@ -88,14 +90,14 @@ void MultiplyQuaternion(const float a[4],const float b[4],float output[4]) {
 }
 
 constexpr int kDefaults[F_COUNT] = {
-    0, 6, 9, -23, 1,
-    24, 9, -23, 0,
-    -47, 37, 15, 17, 31, 30, 82,
-    0, 0, 0, 0, 0, 0
+    0, 0, 15, 0, 15,
+    0, 15, 0, 15,
+    0, 48, 43, 18, 30, 30, 82
 };
-// Compile-time rollback gate for diagnosing vehicle-control regressions. The
-// public build enables the immersive solver; setting this false keeps DEFAULT
-// driving available without removing the guarded hooks.
+// Temporary known-good baseline.  The vehicle camera and basic R2/L2/stick
+// controls must be proven independently before the physical wheel is allowed
+// to own hands/steering again.  Keep the hooks installed so DEFAULT driving is
+// usable, but make the immersive solver and wheel renderer completely inert.
 constexpr bool kImmersiveDrivingEnabled = true;
 constexpr int kDrivingConfigVersion = 3;
 const char* const kPath =
@@ -103,14 +105,14 @@ const char* const kPath =
 
 std::once_flag g_initOnce;
 std::mutex g_saveMutex;
-std::atomic<int> g_carMode{MODE_IMMERSIVE};
+std::atomic<int> g_carMode{MODE_DEFAULT};
 std::atomic<int> g_bikeMode{MODE_IMMERSIVE};
 // Boats support the full VC set: DEFAULT sticks, IMMERSIVE helm wheel.
 // Planes/helicopters are DEFAULT-only (no immersive flight controls yet).
 std::atomic<int> g_boatMode{MODE_DEFAULT};
 // Planes get a physical yoke in IMMERSIVE: rotate for roll, pull/push along
 // its axis for pitch. Helicopters stay DEFAULT regardless of this mode.
-std::atomic<int> g_planeMode{MODE_IMMERSIVE};
+std::atomic<int> g_planeMode{MODE_DEFAULT};
 std::atomic<float> g_planePitch{0.0f};
 std::atomic<int> g_yokeSensitivity{100}; // percent, 25..200
 // HANDLEBAR+TRIGGER by default: it is the only bicycle mode with visible bar
@@ -128,13 +130,14 @@ std::atomic<int> g_boatView{VIEW_FIRST_PERSON};
 std::atomic<int> g_activeVehicleAppearance{0};
 constexpr int kRhinoModelId = 432;
 std::atomic<int> g_value[F_COUNT] = {
-    0, 6, 9, -23, 1,
-    24, 9, -23, 0,
-    -47, 37, 15, 17, 31, 30, 82,
-    0, 0, 0, 0, 0, 0
+    0, 0, 15, 0, 15,
+    0, 15, 0, 15,
+    0, 48, 43, 18, 30, 30, 82,
+    // plane seat D/H, boat seat D/H, immersive boat seat D/H
+    0, 15, 0, 15, 0, 15
 };
 std::atomic<bool> g_wheelVisible{true};
-std::atomic<bool> g_highlights{false};
+std::atomic<bool> g_highlights{true};
 std::atomic<bool> g_bikeHandsFollowTilt{true};
 std::atomic<bool> g_bikeHorizonLocked{true};
 std::atomic<int> g_bikeVisualLeanPercent{50};
@@ -217,71 +220,6 @@ struct ModelCalibration {
     int wheel[WHEEL_CAL_FIELD_COUNT]{};
     int acceleratorMode{BIKE_ACCEL_HOLD_TRIGGER};
 };
-
-struct ModelDefaultRow {
-    int model;
-    ModelCalibration calibration;
-};
-
-// Per-model author calibration captured from the release Quest. A settings
-// file overrides individual fields, while a missing file starts from these
-// exact values.
-constexpr ModelDefaultRow kModelDefaults[] = {
-    {411, {{0, -14}, {0, 0},
-           {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {444, {{0, -35}, {0, 0},
-           {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}},
-           {47, 4, 26, -2, -22, 0, 0}, 1}},
-    {451, {{0, -16}, {0, 0},
-           {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}},
-           {-6, -21, -6, 0, -18, 2, 0}, 1}},
-    {461, {{0, 0}, {0, 0},
-           {{-3, -37, 86, 0, 0, 0}, {2, -35, 86, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {463, {{0, 27}, {0, 14},
-           {{0, -86, 86, 0, 0, 0}, {0, -94, 89, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {468, {{0, 0}, {0, -16},
-           {{-2, -31, 49, 0, 34, -1}, {3, -29, 49, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {481, {{18, 0}, {2, -30},
-           {{7, -9, 44, -42, 0, 0}, {-6, -9, 43, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {486, {{0, -43}, {0, 0},
-           {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}},
-           {44, -7, 29, 0, 0, 0, 0}, 1}},
-    {509, {{0, 16}, {0, -29},
-           {{13, 57, 169, 0, 0, 0}, {-13, 55, 170, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {510, {{0, -16}, {0, -35},
-           {{9, 88, 160, 0, 0, 0}, {-10, 88, 160, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {514, {{0, -53}, {0, 0},
-           {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}},
-           {39, -13, 28, 0, 0, 0, 0}, 1}},
-    {520, {{0, 1}, {0, 0},
-           {{0, 0, 0, 0, 1, 0}, {0, 0, 0, 0, 0, 0}},
-           {47, -2, 14, 0, 0, 0, 0}, 1}},
-    {521, {{0, 0}, {0, 0},
-           {{-4, -34, 84, 0, 0, 0}, {2, -34, 85, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {522, {{0, 0}, {0, 0},
-           {{-4, -36, 85, 0, 0, 0}, {0, -39, 86, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {523, {{9, 0}, {18, 0},
-           {{-3, -36, 85, 0, 0, 0}, {4, -35, 84, 0, 0, 0}},
-           {0, 0, 0, 0, 0, 0, 0}, 1}},
-    {541, {{0, -22}, {0, 0},
-           {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}},
-           {0, -21, 2, -3, 0, 0, 0}, 1}},
-};
-
-ModelCalibration DefaultModelCalibration(int model) {
-    for (const ModelDefaultRow& row : kModelDefaults)
-        if (row.model == model) return row.calibration;
-    return ModelCalibration{};
-}
 
 int ClampWheelCalibration(int field, int value) {
     switch (field) {
@@ -442,27 +380,18 @@ void Save() {
 }
 
 void Load() {
-    int configVersion=kDrivingConfigVersion;
-    bool hadFile=false;
-    int legacyMode=MODE_IMMERSIVE,carMode=MODE_IMMERSIVE,bikeMode=MODE_IMMERSIVE;
+    int configVersion=0;
+    int legacyMode=MODE_DEFAULT,carMode=MODE_DEFAULT,bikeMode=MODE_IMMERSIVE;
     int bicycleMode=BICYCLE_HANDLEBAR_TRIGGER;
     bool carModeSeen=false,bikeModeSeen=false;
     bool immersiveCarSeatSeen=false, immersiveBikeSeatSeen=false;
     int values[F_COUNT];
     std::copy(std::begin(kDefaults), std::end(kDefaults), values);
-    int visible = 1, highlights = 0, bikeHandsFollowTilt = 1;
+    int visible = 1, highlights = 1, bikeHandsFollowTilt = 1;
     int bikeLockHorizon = 1, bikeVisualLeanPercent = 50;
     int keepRiderOnFlips = 0;
     int hideInteriorGlass = 1;
-    {
-        std::lock_guard<std::mutex> lock(g_modelMutex);
-        g_modelCalibration.clear();
-        for (const ModelDefaultRow& row : kModelDefaults)
-            g_modelCalibration.emplace(row.model, row.calibration);
-    }
     if (FILE* file = std::fopen(kPath, "r")) {
-        hadFile=true;
-        configVersion=0;
         char line[128];
         while (std::fgets(line, sizeof(line), file)) {
             int value = 0;
@@ -593,7 +522,7 @@ void Load() {
     // broken because the solver keeps waiting for a physical wrist rotation.
     // Migrate old files once to the requested ordinary held-R2 default. The
     // version marker preserves any later per-model switch back to TWIST GRIP.
-    if (hadFile && configVersion < kDrivingConfigVersion) {
+    if (configVersion < kDrivingConfigVersion) {
         int migrated=0;
         for (auto& entry : g_modelCalibration) {
             if (!IsBicycleModel(entry.first) &&
@@ -605,19 +534,19 @@ void Load() {
         LOGI("[driving] config v%d -> v%d: %d motorcycles default to HOLD R2",
              configVersion,kDrivingConfigVersion,migrated);
     }
-    if (hadFile && !carModeSeen) carMode=legacyMode;
-    if (hadFile && !immersiveCarSeatSeen) {
+    if (!carModeSeen) carMode=legacyMode;
+    if (!immersiveCarSeatSeen) {
         values[F_IMMERSIVE_CAR_SEAT_DISTANCE]=values[F_DISTANCE];
         values[F_IMMERSIVE_CAR_SEAT_HEIGHT]=values[F_HEIGHT];
     }
-    if (hadFile && !immersiveBikeSeatSeen) {
+    if (!immersiveBikeSeatSeen) {
         values[F_IMMERSIVE_BIKE_SEAT_DISTANCE]=values[F_BIKE_SEAT_DISTANCE];
         values[F_IMMERSIVE_BIKE_SEAT_HEIGHT]=values[F_BIKE_SEAT_HEIGHT];
     }
     // The legacy global DEFAULT is precisely what made a newly-added bike
     // cockpit invisible in 0.8.0. A file without BikeDrivingType migrates to
     // the useful VC default, while an explicitly saved bike choice is retained.
-    if (hadFile && !bikeModeSeen) {
+    if (!bikeModeSeen) {
         bikeMode=MODE_IMMERSIVE;
         // 0.8.0 had one global mode and the test device also retained
         // HandleHighlights=0, making a valid bike cockpit look completely
@@ -647,8 +576,8 @@ void Load() {
          g_value[F_SIDE].load(), g_value[F_DISTANCE].load(), g_value[F_HEIGHT].load(),
          g_value[F_WHEEL_SIDE].load(), g_value[F_WHEEL_DISTANCE].load(),
          g_value[F_WHEEL_HEIGHT].load(), g_value[F_WHEEL_RADIUS].load());
-    if (hadFile && (configVersion < kDrivingConfigVersion || !bikeModeSeen ||
-        !immersiveCarSeatSeen || !immersiveBikeSeatSeen)) Save();
+    if (configVersion < kDrivingConfigVersion || !bikeModeSeen ||
+        !immersiveCarSeatSeen || !immersiveBikeSeatSeen) Save();
     if (!kImmersiveDrivingEnabled &&
         (loadedCarMode==MODE_IMMERSIVE||loadedBikeMode==MODE_IMMERSIVE))
         LOGW("[driving] IMMERSIVE temporarily disabled; using DEFAULT baseline");
@@ -888,14 +817,33 @@ bool ReadScaledBikeLeanFrame(void* bike,V3* right,V3* forward,V3* up,V3* pos) {
     auto* leanAngle=reinterpret_cast<float*>(bytes+kLeanAngleOffset);
     if (!std::isfinite(*leanAngle)) return false;
 
+    const int frameModelId=*reinterpret_cast<const std::uint16_t*>(
+        reinterpret_cast<const char*>(bike)+0x32);
+    if (IsBicycleModel(frameModelId)) {
+        // Bicycles: PASSIVE READ ONLY. Every write/restore variant tried here
+        // (lean 0%, flatten) left the matrix in different states at different
+        // points of the deferred frame and the model/hands visibly SHOOK.
+        // Read back exactly what the retail code last computed — perfectly
+        // consistent with what is drawn — and never touch the bytes.
+        *right={matrix[0],matrix[1],matrix[2]};
+        *forward={matrix[4],matrix[5],matrix[6]};
+        *up={matrix[8],matrix[9],matrix[10]};
+        *pos={matrix[12],matrix[13],matrix[14]};
+        *right=Normalized(*right);
+        *forward=Normalized(*forward);
+        *up=Normalized(*up);
+        if (Length(*right)>0.5f&&Length(*forward)>0.5f&&
+            Length(*up)>0.5f&&std::isfinite(pos->x)&&
+            std::isfinite(pos->y)&&std::isfinite(pos->z))
+            return true;
+        // Matrix not initialised yet (first frames): entity matrix fallback.
+        return ReadEntityMatrix(bike,right,forward,up,pos);
+    }
+
     // Calculate a temporary render-only frame. Restore every game-owned byte
     // afterwards: steering, tyre forces and the physical bike simulation keep
     // their stock lean, while the model/camera/hands can use a gentler roll.
-    // Bicycles ride fully upright in immersive mode (0%): their model lean is
-    // zeroed in the PreRender hook, so the hand frame must match.
-    const int frameModelId=*reinterpret_cast<const std::uint16_t*>(
-        reinterpret_cast<const char*>(bike)+0x32);
-    const float leanPercent=IsBicycleModel(frameModelId)?0.0f:
+    const float leanPercent=
         static_cast<float>(g_bikeVisualLeanPercent.load(
             std::memory_order_acquire));
     const std::uint8_t savedCalculated=*calculated;
@@ -1060,7 +1008,7 @@ bool BuildWheelTracking(WheelVisualState* visual) {
         reinterpret_cast<const char*>(vehicle)+0x32);
     V3 vr,vf,vu,vp;
     if (!ReadEntityMatrix(vehicle,&vr,&vf,&vu,&vp)) return false;
-    // CPed::m_matrix is commonly null while seated on Android. The VR path needs the
+    // CPed::m_matrix is commonly null while seated on Android. qbuild needs the
     // player's world position only, so use the exported FindPlayerCoors HFA
     // instead of making the entire wheel depend on that optional ped matrix.
     V3 pp = vp + vu * 0.65f;
@@ -1554,18 +1502,17 @@ void BikePreRenderCommon(void* bike, BikePreRenderFn origPreRender) {
         if (activePlayerBike&&std::isfinite(*angle)) {
             const int leanModel=*reinterpret_cast<const std::uint16_t*>(
                 reinterpret_cast<const char*>(bike)+0x32);
-            // Bicycles: the pinned hands stand on the bar, so the rendered
-            // frame must not roll underneath them — visual lean 0% (the
-            // physical lean and steering are untouched).
-            const float leanPercent=IsBicycleModel(leanModel)?0.0f:
-                static_cast<float>(g_bikeVisualLeanPercent.load(
-                    std::memory_order_acquire));
             savedAngle=*angle;
             savedCalculated=*calculated;
             std::memcpy(savedMatrix,matrix,sizeof(savedMatrix));
-            *angle=savedAngle*(leanPercent/100.0f);
-            *calculated=0;
-            scaled=true;
+            if (!IsBicycleModel(leanModel)) {
+                *angle=savedAngle*(static_cast<float>(
+                    g_bikeVisualLeanPercent.load(
+                        std::memory_order_acquire))/100.0f);
+                *calculated=0;
+                scaled=true;
+            }
+            // Bicycles: hands follow the retail frame verbatim; no writes.
         }
         origPreRender(bike);
         if (scaled) {
@@ -1584,6 +1531,22 @@ void BikePreRenderCommon(void* bike, BikePreRenderFn origPreRender) {
             reinterpret_cast<const char*>(bike)+0x32);
         if (!g_visual.active||!g_visual.bike||g_visual.modelId!=model) return;
         angle=g_visual.physicalAngle;
+        // Bicycles in MOTION control mode steer through g_bicycleSteering and
+        // never touch the physical bar solver — the visual bar sat straight.
+        // Derive the render angle from the same value the game steers with.
+        if (IsBicycleModel(model)&&std::abs(angle)<1.0e-4f&&
+            g_bicycleMode.load(std::memory_order_acquire)==BICYCLE_MOTION)
+            angle=-std::clamp(g_bicycleSteering,-1.0f,1.0f)*0.55f;
+        if (IsBicycleModel(model)) {
+            static double lastBarLog=0.0;
+            const double nowBar=MonotonicSeconds();
+            if (nowBar-lastBarLog>2.0) {
+                lastBarLog=nowBar;
+                LOGI("[driving] bmx bar angle=%.3f solver=%.3f mode=%d",
+                     angle,g_visual.physicalAngle,
+                     g_bicycleMode.load(std::memory_order_acquire));
+            }
+        }
     }
     if (!std::isfinite(angle)||std::abs(angle)<1.0e-5f) return;
     constexpr std::size_t kBikeNodesOffset=0x758;
@@ -1610,6 +1573,18 @@ void BikePreRenderCommon(void* bike, BikePreRenderFn origPreRender) {
     if (!frame) return;
     float* matrix=reinterpret_cast<float*>(
         reinterpret_cast<char*>(frame)+0x20); // RwFrame local matrix
+    // Decisive probe: does our rotation persist into the next PreRender, and
+    // does anything rewrite the local matrix between frames?
+    if (IsBicycleModel(model)) {
+        static double lastProbe=0.0;
+        const double nowProbe=MonotonicSeconds();
+        if (nowProbe-lastProbe>2.0) {
+            lastProbe=nowProbe;
+            LOGI("[driving] bar frame entry right=(%.3f,%.3f,%.3f) pos=(%.2f,%.2f,%.2f)",
+                 matrix[0],matrix[1],matrix[2],
+                 matrix[12],matrix[13],matrix[14]);
+        }
+    }
     V3 right{matrix[0],matrix[1],matrix[2]};
     V3 forward{matrix[4],matrix[5],matrix[6]};
     V3 up{matrix[8],matrix[9],matrix[10]};
@@ -1690,7 +1665,7 @@ void UpdateInteriorGlassMaterials() {
 // earlier by writing Touch R2/L2 directly to Cross/Square.  These hooks are the
 // equivalent SA boundary: while the local player is in any vehicle, return the
 // VR value without first entering the game's touch-widget query/trampoline.
-// Besides matching the Vice City Quest behavior, that keeps vehicle entry independent of several
+// Besides matching qbuild, that keeps vehicle entry independent of several
 // mobile-only UI calls in the original queries.
 bool HasPlayerVehicle() {
     return g.FindPlayerVehicle&&g.FindPlayerVehicle(-1,false)!=nullptr;
@@ -1720,7 +1695,7 @@ int OnGetAccelerate(void* pad) {
                     std::clamp(input.triggers[1],0.0f,1.0f)*255.0f);
             return static_cast<int>(std::clamp(g_bikeThrottle,0.0f,1.0f)*255.0f);
         }
-        // The Vice City Quest port replaces Cross completely while driving: A is the handbrake
+        // qbuild replaces Cross completely while driving: A is the handbrake
         // and R2 alone is the authoritative accelerator.
         return static_cast<int>(std::clamp(input.triggers[1],0.0f,1.0f)*255.0f);
     }
@@ -1815,9 +1790,11 @@ bool OnGetSprint(void* pad,int sprintType) {
         if (g_inputBlocked.load(std::memory_order_acquire)||HasPlayerVehicle())
             return false;
         xr::InputState input{}; xr::GetInput(input);
-        // Exact Quest Vice City Cross mapping: both physical A and R2 feed
-        // Cross, and CPad::GetSprint reads Cross in the default control mode.
-        return input.a||input.triggers[1]>=0.50f;
+        // Vice City Cross mapping through the remappable bindings: any face
+        // button assigned to SPRINT feeds Cross, plus R2 as before.
+        return locomotion::ActionHeld(locomotion::BIND_ACT_SPRINT,
+                                      input.a,input.b,input.x,input.y,true)||
+               input.triggers[1]>=0.50f;
     }
     return g_origSprint?g_origSprint(pad,sprintType):false;
 }
@@ -2896,15 +2873,11 @@ void ResetVehiclePreset(int vehicleType) {
         const int model=GetActiveVehicleModelId();
         std::lock_guard<std::mutex> lock(g_modelMutex);
         ModelCalibration& calibration=g_modelCalibration[model];
-        const ModelCalibration defaults=DefaultModelCalibration(model);
-        calibration.seatForward[mode]=defaults.seatForward[mode];
-        calibration.seatHeight[mode]=defaults.seatHeight[mode];
+        calibration.seatForward[mode]=0;
+        calibration.seatHeight[mode]=0;
         if (mode==MODE_IMMERSIVE)
-            std::memcpy(calibration.control,defaults.control,
-                        sizeof(calibration.control));
-        std::memcpy(calibration.wheel,defaults.wheel,
-                    sizeof(calibration.wheel));
-        calibration.acceleratorMode=defaults.acceleratorMode;
+            std::memset(calibration.control,0,sizeof(calibration.control));
+        calibration.acceleratorMode=BIKE_ACCEL_HOLD_TRIGGER;
     }
     Save(); ResetInteraction();
 }
@@ -3010,7 +2983,9 @@ void UpdateInput(const xr::InputState& input,bool gameplay,bool blocked) {
     {
         // One frame-coherent X edge for the JumpJustDown touch-query hook.
         static bool prevJumpButton=false;
-        const bool jumpButton=input.x;
+        const bool jumpButton=locomotion::ActionHeld(
+            locomotion::BIND_ACT_JUMP,
+            input.a,input.b,input.x,input.y,true);
         g_jumpEdge.store(gameplay&&!blocked&&activeType==VEHICLE_NONE&&
                              jumpButton&&!prevJumpButton,
                          std::memory_order_release);

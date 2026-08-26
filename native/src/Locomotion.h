@@ -67,4 +67,34 @@ void ToggleFlightCameraTilt();
 // heading for HEAD and HEAD TURN EXP modes.
 void TransformMoveStick(float localHeadYaw, float* x, float* y);
 
+// Vice City Quest parity: remappable face buttons. Each physical button picks
+// the game action it triggers ON FOOT; vehicles always use the shipped
+// layout, exactly like the VC port's CONTROLS page.
+enum ButtonAction {
+    BIND_ACT_NONE = 0,
+    BIND_ACT_SPRINT,   // Cross
+    BIND_ACT_JUMP,     // Square
+    BIND_ACT_ATTACK,   // Circle (vehicle fire stays on the shipped button)
+    BIND_ACT_ENTER,    // Triangle
+    BIND_ACT_COUNT
+};
+enum ButtonSource {
+    BIND_SRC_A = 0, BIND_SRC_B, BIND_SRC_X, BIND_SRC_Y, BIND_SRC_COUNT
+};
+enum ControlsLayoutKind {
+    CONTROLS_LAYOUT_DEFAULT = 0,
+    CONTROLS_LAYOUT_SWAPPED_HANDS,
+    CONTROLS_LAYOUT_CUSTOM
+};
+int  GetButtonBinding(int source);
+void CycleButtonBinding(int source, int direction);   // persists
+int  ControlsLayout();
+void ApplyControlsLayout(int layout);                 // DEFAULT/SWAPPED, persists
+const char* ButtonActionName(int action);
+const char* ButtonSourceName(int source);
+const char* ControlsLayoutName();
+// True while any face button bound to `action` is held. onFoot=false uses the
+// shipped layout regardless of custom bindings (VC behaviour in vehicles).
+bool ActionHeld(int action, bool a, bool b, bool x, bool y, bool onFoot);
+
 } // namespace savr::locomotion

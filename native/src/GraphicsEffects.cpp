@@ -27,9 +27,9 @@ namespace {
 
 constexpr char kEffectsProperty[] = "debug.savr.effects";
 constexpr char kFxProbeProperty[] = "debug.savr.fxprobe";
-// Keep unrelated performance captures bit-identical until the effect A/B is
+// Keep parallel performance work bit-identical until the effect A/B is
 // explicitly requested on the device. Profile 1 is the intended candidate,
-// while process-start opt-in prevents an unrequested configuration change.
+// but process-start opt-in avoids silently contaminating another agent's run.
 constexpr int kDefaultProfile = 0;
 constexpr std::uint64_t kReportIntervalCalls = 240; // 120 stereo frames
 constexpr std::uint64_t kFlameLifecycleGraceMs = 120;
@@ -3061,8 +3061,8 @@ bool InstallEyeBeginViewSync(void* handle) {
     }
 
     // The Quest eye loop deliberately calls this shared symbol pointer. Wrap
-    // that one local dispatch point instead of editing the camera renderer or
-    // patching every libGame callsite.
+    // that one local dispatch point instead of editing the concurrently-owned
+    // camera renderer or patching every libGame callsite.
     g_origRwCameraBeginUpdate = resolved;
     g.RwCameraBeginUpdate = &OnRwCameraBeginUpdate;
     LOGI("[gfxfx.citylight] pre_scene_sync_ready=1 begin=%p scene=%p",

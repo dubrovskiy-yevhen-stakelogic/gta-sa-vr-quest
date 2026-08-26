@@ -176,6 +176,10 @@ struct GameSymbols {
     // player_parachute.scm polls (widget 187) for "open the parachute".
     // Raw address — hooked, not called.
     void* CTouchInterface_IsReleased;
+    void* CTouchInterface_IsHeldDown;
+    void* CTouchInterface_IsJustPressed;
+    void* CTouchInterface_IsDoubleTapped;
+    void* CTouchInterface_IsTouchedQuery;
 
     // SCM global variable pool. Globals are 32-bit at their byte offset;
     // player_parachute.scm keeps its phase in $2D0C (3 = deploy-ready).
@@ -606,7 +610,7 @@ struct GameSymbols {
     void   (*SetAndroidPaused)(int paused);
 
     // Base address libGame.so is mapped at, for turning a runtime address back
-    // into the file offset seen in the audited retail symbol dump.
+    // into the file offset seen in the symbol dumps under recon/.
     std::uintptr_t LoadBase;
 };
 

@@ -15,7 +15,7 @@ namespace {
 constexpr const char* kPath =
     "/sdcard/Android/data/com.rockstargames.gtasa/files/vr_hud.ini";
 
-// The Vice City Quest port ships CLASSIC as the approachable default. SA follows that behaviour
+// qbuild ships CLASSIC as the approachable default.  SA follows that behaviour
 // so a new test build immediately proves that the integration is active.
 std::atomic<int>  g_preset{CLASSIC};
 std::atomic<bool> g_enabled{true};
@@ -30,13 +30,14 @@ struct ElementDefaults {
     int scaleTenths;
 };
 
-// Author defaults captured from the release Quest on 2026-08-26.
+// Calibrated on-device on 2026-08-24. Radar and Health are the two authoritative
+// real-image crops; Health contains the complete top-right status block.
 constexpr ElementDefaults kElementDefaults[ELEMENT_COUNT] = {
-    {1,   0,   0, 284, 284,  31, 53, 20, 20,  6}, // radar
-    {1, 788,  40, 216,  88,  53, 44,  8,  3, 14}, // complete top-right status
-    {1, 348, 308, 676, 264,  40, 56, 23,  5,  5}, // large mission messages
-    {1, 200,   0, 624, 240,  39, 55, 24, 15,  7}, // help/tutorial/brief text
-    {1,   0,   0,  64,  64,  52, 43, 24,  8, 10}, // mission timers/counters
+    {1,   0, 104, 284, 284,  25, 47, 28, 34,  2}, // radar
+    {1, 788,  40, 216,  88,  53, 44,  8,  2, 10}, // complete top-right status
+    {0, 348, 308, 676, 264,  40, 40, 23,  5, 10}, // large mission messages
+    {1, 200,   0, 624, 240,  36, 34, 24, 15, 10}, // help/tutorial/brief text
+    {1,   0,   0,  64,  64,  62, 26, 24,  8, 10}, // mission timers/counters
 };
 
 std::atomic<int> g_element[ELEMENT_COUNT][ELEMENT_FIELD_COUNT]{};
@@ -70,34 +71,13 @@ const char* const kDashModelFieldKeys[WRIST_FIELD_COUNT] = {
     "PitchDeg", "YawDeg", "RollDeg", "ScaleTenths"
 };
 constexpr int kWristFieldDefaults[WRIST_FIELD_COUNT] = {0, 0, 0, 0, 0, 0, 10};
-constexpr int kWristRadarDefaults[WRIST_FIELD_COUNT] =
-    {-37, -31, -54, 5, -90, 0, 10};
-constexpr int kWristHealthDefaults[WRIST_FIELD_COUNT] =
-    {-38, -33, 26, 5, -85, -25, 7};
-// Vehicle-dash defaults calibrated against the Turismo cockpit: radar
-// low-left of the wheel and health bar low-right. Saved settings and per-model
-// overrides still take precedence.
+// Vehicle-dash defaults calibrated in the field (Turismo cockpit; user
+// request): radar low-left of the wheel, health bar low-right. Saved settings
+// and per-model overrides still win over these.
 constexpr int kDashRadarDefaults[WRIST_FIELD_COUNT] =
     {0, 149, -163, 0, 5, 0, 26};
 constexpr int kDashHealthDefaults[WRIST_FIELD_COUNT] =
     {0, -47, -169, 0, 0, 0, 23};
-
-struct DashModelDefault {
-    int element;
-    int model;
-    std::array<int, WRIST_FIELD_COUNT> values;
-};
-
-constexpr DashModelDefault kDashModelDefaults[] = {
-    {RADAR, 411, {67, 214, -91, 0, 5, 0, 26}},
-    {RADAR, 451, {0, 149, -163, 0, 5, 0, 26}},
-    {RADAR, 463, {0, 25, 3, 0, 5, 0, 26}},
-    {RADAR, 520, {-32, 122, -103, 0, 5, 0, 26}},
-    {HEALTH, 411, {65, -133, -126, 0, 0, 0, 23}},
-    {HEALTH, 451, {0, -47, -169, 0, 0, 0, 23}},
-    {HEALTH, 463, {0, 39, 12, 0, 0, 0, 23}},
-    {HEALTH, 520, {-18, -91, -128, 0, 0, 0, 20}},
-};
 
 // Sparse per-vehicle dashboard overrides; created on first adjustment from a
 // copy of the shared dash slot. Guarded by g_dashModelMutex (read twice per
@@ -105,36 +85,6 @@ constexpr DashModelDefault kDashModelDefaults[] = {
 std::mutex g_dashModelMutex;
 std::map<int, std::array<int, WRIST_FIELD_COUNT>>
     g_dashModel[ELEMENT_COUNT];
-
-void StoreWristDefaultsForElement(int element, std::memory_order order) {
-    for (int slot = 0; slot < WRIST_SLOT_COUNT; ++slot)
-        for (int field = 0; field < WRIST_FIELD_COUNT; ++field)
-            g_wrist[slot][element][field].store(kWristFieldDefaults[field], order);
-
-    g_wrist[WRIST_SLOT_WEAPON][element][WRIST_ACROSS_MM].store(-120, order);
-    g_wrist[WRIST_SLOT_TWOHAND][element][WRIST_ACROSS_MM].store(-150, order);
-
-    const int* wrist = nullptr;
-    const int* dash = nullptr;
-    if (element == RADAR) {
-        wrist = kWristRadarDefaults;
-        dash = kDashRadarDefaults;
-        g_wrist[WRIST_SLOT_TWOHAND][element][WRIST_LIFT_MM].store(70, order);
-    } else if (element == HEALTH) {
-        wrist = kWristHealthDefaults;
-        dash = kDashHealthDefaults;
-        g_wrist[WRIST_SLOT_TWOHAND][element][WRIST_LIFT_MM].store(-70, order);
-    }
-    for (int field = 0; field < WRIST_FIELD_COUNT; ++field) {
-        if (wrist) g_wrist[WRIST_SLOT_HAND][element][field].store(wrist[field], order);
-        if (dash) g_wrist[WRIST_SLOT_VEHICLE][element][field].store(dash[field], order);
-    }
-}
-
-void StoreDashModelDefaultsForElement(int element) {
-    for (const DashModelDefault& row : kDashModelDefaults)
-        if (row.element == element) g_dashModel[element][row.model] = row.values;
-}
 
 int ClampElement(int element) {
     return std::clamp(element, 0, ELEMENT_COUNT - 1);
@@ -174,8 +124,30 @@ int ClampWristSlot(int slot) {
 }
 
 void LoadWristDefaults() {
-    for (int element = 0; element < ELEMENT_COUNT; ++element)
-        StoreWristDefaultsForElement(element, std::memory_order_relaxed);
+    for (int slot = 0; slot < WRIST_SLOT_COUNT; ++slot)
+        for (int element = 0; element < ELEMENT_COUNT; ++element)
+            for (int field = 0; field < WRIST_FIELD_COUNT; ++field)
+                g_wrist[slot][element][field].store(
+                    kWristFieldDefaults[field], std::memory_order_relaxed);
+    for (int field = 0; field < WRIST_FIELD_COUNT; ++field) {
+        g_wrist[WRIST_SLOT_VEHICLE][RADAR][field].store(
+            kDashRadarDefaults[field], std::memory_order_relaxed);
+        g_wrist[WRIST_SLOT_VEHICLE][HEALTH][field].store(
+            kDashHealthDefaults[field], std::memory_order_relaxed);
+    }
+    // Weapon-grip starting points (the user calibrates the exact spots):
+    // one-hand grip slides the panel outboard of the gripping hand; the
+    // two-hand grip stacks both panels beside the primary hand.
+    for (int element = 0; element < ELEMENT_COUNT; ++element) {
+        g_wrist[WRIST_SLOT_WEAPON][element][WRIST_ACROSS_MM].store(
+            -120, std::memory_order_relaxed);
+        g_wrist[WRIST_SLOT_TWOHAND][element][WRIST_ACROSS_MM].store(
+            -150, std::memory_order_relaxed);
+    }
+    g_wrist[WRIST_SLOT_TWOHAND][RADAR][WRIST_LIFT_MM].store(
+        70, std::memory_order_relaxed);
+    g_wrist[WRIST_SLOT_TWOHAND][HEALTH][WRIST_LIFT_MM].store(
+        -70, std::memory_order_relaxed);
 }
 
 void LoadElementDefaults() {
@@ -207,10 +179,7 @@ void Load() {
     LoadWristDefaults();
     {
         std::lock_guard<std::mutex> lock(g_dashModelMutex);
-        for (int element = 0; element < ELEMENT_COUNT; ++element) {
-            g_dashModel[element].clear();
-            StoreDashModelDefaultsForElement(element);
-        }
+        for (auto& map : g_dashModel) map.clear();
     }
     int preset = CLASSIC;
     int enabled = 1;
@@ -567,11 +536,13 @@ void ResetElement(int element) {
     };
     for (int field = 0; field < ELEMENT_FIELD_COUNT; ++field)
         g_element[element][field].store(values[field], std::memory_order_release);
-    StoreWristDefaultsForElement(element, std::memory_order_release);
+    for (int slot = 0; slot < WRIST_SLOT_COUNT; ++slot)
+        for (int field = 0; field < WRIST_FIELD_COUNT; ++field)
+            g_wrist[slot][element][field].store(kWristFieldDefaults[field],
+                                                std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(g_dashModelMutex);
         g_dashModel[element].clear();
-        StoreDashModelDefaultsForElement(element);
     }
     Save();
 }

@@ -31,10 +31,11 @@ enum Field {
 // Support grip style values (row 19).
 enum { SUPPORT_MAGAZINE = 0, SUPPORT_FROM_BELOW = 1 };
 
-// One weapon's full stored profile. The compiled per-weapon defaults are the
-// release Quest calibration. Legacy all-zero SUPPORT rows are still exposed
-// through Snapshot/GetField as the generic Quest socket
-// {0,60,-10}/{0,360,0}; the first support edit materialises those values.
+// One weapon's full stored profile. Aim/model defaults remain zero because the SA
+// authored transform already places them correctly. Legacy all-zero SUPPORT rows
+// are exposed through Snapshot/GetField as the generic Quest socket
+// {0,60,-10}/{0,360,0}; the first support edit materialises those values for that
+// weapon, avoiding a jump while keeping VC's model-specific numbers out of SA.
 struct WeaponCalib {
     int16_t aimOffX = 0, aimOffY = 0, aimOffZ = 0;
     int16_t aimRotX = 0, aimRotY = 0, aimRotZ = 0;

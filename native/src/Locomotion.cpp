@@ -30,16 +30,25 @@ std::atomic<bool> g_gestureSwim{true};
 // players — the model turns while the camera holds its heading.
 std::atomic<bool> g_parachuteCameraFollow{true};
 // Keep a parachute permanently in the inventory (re-given whenever missing),
-// so no cheat-menu trip is needed before a jump. Enabled in release defaults.
-std::atomic<bool> g_autoParachute{true};
+// so no cheat-menu trip is needed before a jump.
+std::atomic<bool> g_autoParachute{false};
 // Canopy input source. DEFAULT = the sticks steer (script joystick path);
 // IMMERSIVE = only the physical riser toggles steer, sticks are muted so the
-// two never fight. Release defaults use IMMERSIVE.
-std::atomic<bool> g_parachuteImmersiveControl{true};
+// two never fight.
+std::atomic<bool> g_parachuteImmersiveControl{false};
 // Realistic flight: the camera base rolls/pitches WITH the airframe instead
-// of staying level while the cockpit rotates around the pilot. Release
-// defaults enable the aircraft-relative camera.
-std::atomic<bool> g_flightCameraTilt{true};
+// of staying level while the cockpit rotates around the pilot (default OFF —
+// the level horizon is the comfort behaviour).
+std::atomic<bool> g_flightCameraTilt{false};
+// Face-button bindings, VC-port layout tables: A/B/X/Y each name the action
+// they trigger on foot.
+constexpr int kBindingDefault[BIND_SRC_COUNT]={
+    BIND_ACT_SPRINT, BIND_ACT_ATTACK, BIND_ACT_JUMP, BIND_ACT_ENTER};
+constexpr int kBindingSwapped[BIND_SRC_COUNT]={
+    BIND_ACT_JUMP, BIND_ACT_ENTER, BIND_ACT_SPRINT, BIND_ACT_ATTACK};
+std::atomic<int> g_binding[BIND_SRC_COUNT]={
+    {kBindingDefault[0]},{kBindingDefault[1]},
+    {kBindingDefault[2]},{kBindingDefault[3]}};
 
 void Save() {
     std::lock_guard<std::mutex> lock(g_saveMutex);
@@ -58,13 +67,19 @@ void Save() {
     std::fprintf(file,"ParachuteImmersiveControl=%d\n",
                  g_parachuteImmersiveControl.load()?1:0);
     std::fprintf(file,"FlightCameraTilt=%d\n",g_flightCameraTilt.load()?1:0);
+    std::fprintf(file,"BindA=%d\n",g_binding[0].load());
+    std::fprintf(file,"BindB=%d\n",g_binding[1].load());
+    std::fprintf(file,"BindX=%d\n",g_binding[2].load());
+    std::fprintf(file,"BindY=%d\n",g_binding[3].load());
     std::fclose(file);
 }
 
 void Load() {
     int movement=MOVEMENT_HEAD,turn=TURN_SMOOTH,sensitivity=100,snap=30,bob=0;
-    int chuteFollow=1,autoChute=1,chuteImmersive=1,flightTilt=1;
+    int chuteFollow=1,autoChute=0,chuteImmersive=0,flightTilt=0;
     int gestureRun=1,gestureSwim=1;
+    int bind[BIND_SRC_COUNT]={kBindingDefault[0],kBindingDefault[1],
+                              kBindingDefault[2],kBindingDefault[3]};
     if (FILE* file=std::fopen(kPath,"r")) {
         char line[128];
         while (std::fgets(line,sizeof(line),file)) {
@@ -84,6 +99,10 @@ void Load() {
                 chuteImmersive=value;
             else if (std::sscanf(line,"FlightCameraTilt=%d",&value)==1)
                 flightTilt=value;
+            else if (std::sscanf(line,"BindA=%d",&value)==1) bind[0]=value;
+            else if (std::sscanf(line,"BindB=%d",&value)==1) bind[1]=value;
+            else if (std::sscanf(line,"BindX=%d",&value)==1) bind[2]=value;
+            else if (std::sscanf(line,"BindY=%d",&value)==1) bind[3]=value;
         }
         std::fclose(file);
     }
@@ -98,6 +117,10 @@ void Load() {
     g_autoParachute.store(autoChute!=0);
     g_parachuteImmersiveControl.store(chuteImmersive!=0);
     g_flightCameraTilt.store(flightTilt!=0);
+    for (int i=0;i<BIND_SRC_COUNT;++i)
+        g_binding[i].store(
+            bind[i]>=BIND_ACT_NONE&&bind[i]<BIND_ACT_COUNT
+                ?bind[i]:kBindingDefault[i]);
     const char* movementName=g_movement.load()==MOVEMENT_BODY?"BODY":
         (g_movement.load()==MOVEMENT_HEAD?"HEAD":"HEAD TURN EXP");
     const char* turnName=g_turn.load()==TURN_SNAP?"SNAP":"SMOOTH";
@@ -112,6 +135,73 @@ int DirectionStep(int direction) { return direction<0?-1:1; }
 } // namespace
 
 void Init() { EnsureInit(); }
+
+int GetButtonBinding(int source) {
+    EnsureInit();
+    if (source<0||source>=BIND_SRC_COUNT) return BIND_ACT_NONE;
+    return g_binding[source].load();
+}
+void CycleButtonBinding(int source, int direction) {
+    EnsureInit();
+    if (source<0||source>=BIND_SRC_COUNT||!direction) return;
+    g_binding[source].store(
+        (g_binding[source].load()+BIND_ACT_COUNT+DirectionStep(direction))%
+        BIND_ACT_COUNT);
+    Save();
+}
+int ControlsLayout() {
+    EnsureInit();
+    bool def=true,swp=true;
+    for (int i=0;i<BIND_SRC_COUNT;++i) {
+        const int v=g_binding[i].load();
+        def=def&&v==kBindingDefault[i];
+        swp=swp&&v==kBindingSwapped[i];
+    }
+    if (def) return CONTROLS_LAYOUT_DEFAULT;
+    if (swp) return CONTROLS_LAYOUT_SWAPPED_HANDS;
+    return CONTROLS_LAYOUT_CUSTOM;
+}
+void ApplyControlsLayout(int layout) {
+    EnsureInit();
+    const int* table=layout==CONTROLS_LAYOUT_SWAPPED_HANDS
+        ?kBindingSwapped:kBindingDefault;
+    for (int i=0;i<BIND_SRC_COUNT;++i) g_binding[i].store(table[i]);
+    Save();
+}
+const char* ButtonActionName(int action) {
+    switch (action) {
+        case BIND_ACT_SPRINT: return "SPRINT";
+        case BIND_ACT_JUMP:   return "JUMP";
+        case BIND_ACT_ATTACK: return "ATTACK / FIRE";
+        case BIND_ACT_ENTER:  return "ENTER / EXIT";
+        default:              return "UNUSED";
+    }
+}
+const char* ButtonSourceName(int source) {
+    switch (source) {
+        case BIND_SRC_A: return "A";
+        case BIND_SRC_B: return "B";
+        case BIND_SRC_X: return "X";
+        case BIND_SRC_Y: return "Y";
+        default:         return "?";
+    }
+}
+const char* ControlsLayoutName() {
+    switch (ControlsLayout()) {
+        case CONTROLS_LAYOUT_DEFAULT:       return "DEFAULT";
+        case CONTROLS_LAYOUT_SWAPPED_HANDS: return "SWAPPED HANDS";
+        default:                            return "CUSTOM";
+    }
+}
+bool ActionHeld(int action, bool a, bool b, bool x, bool y, bool onFoot) {
+    EnsureInit();
+    const bool held[BIND_SRC_COUNT]={a,b,x,y};
+    for (int i=0;i<BIND_SRC_COUNT;++i) {
+        const int bound=onFoot?g_binding[i].load():kBindingDefault[i];
+        if (bound==action&&held[i]) return true;
+    }
+    return false;
+}
 int GetMovementMode() { EnsureInit(); return g_movement.load(); }
 const char* MovementModeName() {
     switch (GetMovementMode()) {

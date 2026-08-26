@@ -15,6 +15,9 @@ import android.text.TextUtils;
 import android.view.Surface;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 
 /**
  * Loads the VR layer before anything of the game runs.
@@ -38,6 +41,15 @@ public final class SavrApplication extends Application {
     private static final String GAME_ACTIVITY = "com.rockstargames.gtasa.GameActivity";
 
     private static boolean nativeReady = false;
+    private static final String[] DEFAULT_SETTINGS = {
+            "vr_driving.ini",
+            "vr_appearance.ini",
+            "vr_calib.ini",
+            "vr_graphics.ini",
+            "vr_holsters.ini",
+            "vr_hud.ini",
+            "vr_locomotion.ini"
+    };
 
     static {
         try {
@@ -55,23 +67,8 @@ public final class SavrApplication extends Application {
             return;
         }
 
-        File externalFiles = getExternalFilesDir(null);
-        String externalFilesPath = externalFiles == null ? "" : externalFiles.getAbsolutePath();
-        File bankLookup = externalFiles == null ? null
-                : new File(externalFiles, "audio/CONFIG/BankLkup.dat");
-        File leftHandMesh = externalFiles == null ? null
-                : new File(externalFiles, "vrhands/BigHandLeft.uxrh");
-        File handTexture = externalFiles == null ? null
-                : new File(externalFiles, "vrhands/BigHandsAlbedo.rgba");
-        android.util.Log.i(TAG, "audio preflight externalFiles=" + externalFilesPath
-                + " bankExists=" + (bankLookup != null && bankLookup.isFile())
-                + " bankReadable=" + (bankLookup != null && bankLookup.canRead()));
-        android.util.Log.i(TAG, "hands preflight meshExists="
-                + (leftHandMesh != null && leftHandMesh.isFile())
-                + " meshReadable=" + (leftHandMesh != null && leftHandMesh.canRead())
-                + " textureExists=" + (handTexture != null && handTexture.isFile())
-                + " textureReadable=" + (handTexture != null && handTexture.canRead()));
-        nativeOnApplicationCreate(SavrApplication.class.getClassLoader(), externalFilesPath);
+        installMissingDefaultSettings();
+        nativeOnApplicationCreate(SavrApplication.class.getClassLoader());
 
         registerActivityLifecycleCallbacks(new ActivityLifecycleCallbacks() {
             @Override
@@ -108,6 +105,58 @@ public final class SavrApplication extends Application {
                 }
             }
         });
+    }
+
+    /**
+     * Seeds a clean installation with the project owner's verified Quest
+     * settings. Existing files always win, so an update never destroys a
+     * player's own calibration. Deleting the SAVR INI files and launching the
+     * game again restores this exact shipping baseline.
+     */
+    private void installMissingDefaultSettings() {
+        final File filesDirectory = getExternalFilesDir(null);
+        if (filesDirectory == null) {
+            android.util.Log.w(TAG, "default settings skipped: no writable app directory");
+            return;
+        }
+        final File destinationDirectory = filesDirectory;
+
+        for (String name : DEFAULT_SETTINGS) {
+            final File destination = new File(destinationDirectory, name);
+            if (destination.isFile()) {
+                continue;
+            }
+
+            final File temporary = new File(destinationDirectory, name + ".shipping.tmp");
+            try (InputStream input = getAssets().open("savr_defaults/" + name);
+                 FileOutputStream output = new FileOutputStream(temporary, false)) {
+                byte[] buffer = new byte[16 * 1024];
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    if (read > 0) {
+                        output.write(buffer, 0, read);
+                    }
+                }
+                output.getFD().sync();
+            } catch (IOException error) {
+                if (temporary.exists() && !temporary.delete()) {
+                    android.util.Log.w(TAG, "could not remove " + temporary);
+                }
+                android.util.Log.e(TAG, "could not seed " + name, error);
+                continue;
+            }
+
+            if (destination.exists() || !temporary.renameTo(destination)) {
+                if (temporary.exists() && !temporary.delete()) {
+                    android.util.Log.w(TAG, "could not remove " + temporary);
+                }
+                if (!destination.exists()) {
+                    android.util.Log.e(TAG, "could not publish shipping default " + name);
+                }
+                continue;
+            }
+            android.util.Log.i(TAG, "installed shipping default " + name);
+        }
     }
 
     private static SurfaceTexture gameTexture;
@@ -294,8 +343,7 @@ public final class SavrApplication extends Application {
         android.util.Log.i(TAG, "supplied data pack path " + DATA_PACK_PATH);
     }
 
-    private static native void nativeOnApplicationCreate(
-            ClassLoader loader, String externalFilesPath);
+    private static native void nativeOnApplicationCreate(ClassLoader loader);
 
     private static native void nativeOnActivityCreated(Object activity);
 }

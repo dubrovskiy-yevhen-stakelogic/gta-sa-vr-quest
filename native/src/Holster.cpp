@@ -15,7 +15,7 @@
 namespace savr::holster {
 namespace {
 
-constexpr int kDefaultSlots[POINT_COUNT] = {3, 1, 7, 2, 8, 5, 4};
+constexpr int kDefaultSlots[POINT_COUNT] = {4, 2, 3, 1, 8, 7, 5};
 constexpr int kCenterThrowableSlot = 8;
 constexpr int kEmptySlot = -1;
 
@@ -39,7 +39,7 @@ const PointMetadata kMetadata[POINT_COUNT] = {
     {"BACK RIGHT",              -0.24f, -0.14f, -0.23f, true },
 };
 
-std::atomic<int> gPointSlots[POINT_COUNT] = {3, 1, 7, 2, 8, 5, 4};
+std::atomic<int> gPointSlots[POINT_COUNT] = {4, 2, 3, 1, 8, 7, 5};
 std::atomic<bool> gGripMarkersEnabled{true};
 // Reach for pulling a weapon off a body socket. The old fixed 27cm sphere
 // kept catching a holster during ordinary hand movement, so it is smaller by
@@ -93,13 +93,13 @@ void AssignPointSlotLocked(int point, int slot) {
 
 int DefaultPreviewPoint(int slot) {
     switch (slot) {
-        case 1: return WAIST_RIGHT;
-        case 2: return CHEST_RIGHT;
-        case 3: return WAIST_LEFT;
-        case 4: return BACK_RIGHT;
-        case 5: return BACK_LEFT;
+        case 1: return CHEST_RIGHT;
+        case 2: return WAIST_RIGHT;
+        case 3: return CHEST_LEFT;
+        case 4: return WAIST_LEFT;
+        case 5: return BACK_RIGHT;
         case 6: return BACK_RIGHT;  // sniper is the one category omitted by defaults
-        case 7: return CHEST_LEFT;
+        case 7: return BACK_LEFT;
         case 8: return CHEST_CENTER;
         default: return -1;
     }

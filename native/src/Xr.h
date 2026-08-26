@@ -10,10 +10,6 @@ namespace savr::xr {
 // and the game Activity are known; no GL context is required yet.
 bool Initialize(JavaVM* vm, jobject activity);
 
-// Use Android's app-resolved external-files directory for optional payloads.
-// Set during Application.onCreate, before the OpenXR activity starts.
-void SetExternalFilesDir(const char* path);
-
 // Create the session on top of the EGL context that is current on the calling
 // thread. Must be called from the game's render thread, after the game has made
 // its own context current, because the runtime binds to exactly that context.
@@ -216,6 +212,16 @@ void SetHolsterMarkers(const float positions[][3], int count);
 void SetParachuteToggles(const float positions[2][3], const bool grabbed[2],
                          bool visible);
 
+// Active weapon's object-space geometry, published by the GameThread (extracted
+// from the loaded RpAtomic). The present thread transforms it to the right hand's
+// pose and draws it with our own GL, in the same eye FBO / mvp / depth pass as the
+// hand — so weapon and hand stay perfectly aligned. Stage 1 = positions only.
+//   verts: numVerts * 3 floats (x,y,z), object space
+//   idx:   numIdx unsigned shorts (triangle list into verts)
+// Pass nullptr / 0 to clear (unarmed). Copies internally; caller keeps ownership.
+void SetWeaponGeometry(const float* verts, int numVerts,
+                       const unsigned short* idx, int numIdx);
+
 // The hand (0/1) currently holding a game-rendered weapon, or -1 for none. It is
 // hidden only as a fallback when the game eye depth cannot be shared with GL hands.
 void SetWeaponHeldHand(int hand);
@@ -281,6 +287,7 @@ bool HudSourceScanActive();
 // when the classic gameplay HUD itself is disabled.
 bool HudCalibrationActive();
 void SetGraphicsMenu(bool active, int selection);
+void SetControlsMenu(bool active, int selection);
 void SetGraphicsDistanceMenu(bool active, int selection);
 
 // Stop the compositor consuming the current RenderWare eye-texture generation.

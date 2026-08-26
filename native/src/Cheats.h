@@ -29,7 +29,7 @@ int         Count();
 const char* Name(int index);
 
 // Whether the row is backed by a symbol in this exact libGame.so.  The current
-// The SA 2.11 table is audited against the supported retail symbols, but keeping this
+// SA 2.11 table is audited against recon/gtasa211-dynsym.txt, but keeping this
 // query lets the UI fail visibly if Rockstar ships a different binary.
 bool Available(int index);
 

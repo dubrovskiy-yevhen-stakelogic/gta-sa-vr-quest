@@ -40,7 +40,7 @@ constexpr float kMaximumThrowSpeed = 6.0f;
 // still authoritative (including a deliberate downward throw); this modest
 // +Y impulse only gives a stationary release a visible, catchable arc.
 constexpr float kReleaseUpwardImpulse = 1.0f;
-// The reference port uses p = p0 + v*t - up*(2.1*t*t), i.e. 4.2 m/s^2 acceleration.
+// qbuild uses p = p0 + v*t - up*(2.1*t*t), i.e. 4.2 m/s^2 acceleration.
 constexpr float kDropGravityTerm = 2.1f;
 
 struct V3 {
@@ -183,7 +183,7 @@ bool ValidHand(int hand) { return hand >= 0 && hand < kHandCount; }
 bool ValidSlot(int slot) { return slot > 0 && slot < kWeaponSlotCount; }
 
 bool IsTwoHandedWeaponTypeInternal(int weaponType) {
-    // SA equivalents of the reference Quest long-gun list. Compact SMGs and
+    // SA equivalents of qbuild's current Quest long-gun list. Compact SMGs and
     // pistols intentionally stay one-handed; MP5 and every full-size long gun
     // use a calibrated foregrip.
     switch (weaponType) {
@@ -459,7 +459,7 @@ void StartDropLocked(int hand, int slot, double now) {
         dropped.angularAxis=Scale(angularVelocity,1.0f/dropped.angularSpeed);
     }
 
-    // Keep one flying record per source hand; replacing this record makes
+    // qbuild has one flying record per source hand; replacing this record makes
     // an older throw by the same hand respawn immediately rather than duplicate.
     gDropped[hand] = dropped;
     LOGI("[physwpn] dropped slot=%d hand=%d tracked=(%.2f %.2f %.2f) launch=(%.2f %.2f %.2f) spin=%.2f",
@@ -567,7 +567,7 @@ bool BuildSupportAnchorLocked(int primaryHand, TrackingPose* out) {
     const int weaponType = WeaponTypeInSlot(ped, slot);
     if (!IsTwoHandedWeaponTypeInternal(weaponType)) return false;
 
-    // Model-bound support contract: model RIGHT is the barrel,
+    // qbuild v5's model-bound support contract: model RIGHT is the barrel,
     // model FORWARD is the top candidate, and their canonical cross product is
     // the lateral socket axis. Rebuilding this proper frame also deliberately
     // removes the reflected RenderWare winding from the wrist pose.
@@ -589,7 +589,7 @@ bool BuildSupportAnchorLocked(int primaryHand, TrackingPose* out) {
     int offsetX = calibration.supOffX;
     int offsetY = calibration.supOffY;
     int offsetZ = calibration.supOffZ;
-    // RIGHT is the one saved/master profile. Match the reference port's derived LEFT
+    // RIGHT is the one saved/master profile. Match qbuild's derived LEFT
     // support calibration without asking the user to tune the same weapon
     // twice: lateral offset and the two handedness-sensitive rotations mirror.
     if (primaryHand == 0) offsetX = -offsetX;
@@ -600,7 +600,7 @@ bool BuildSupportAnchorLocked(int primaryHand, TrackingPose* out) {
             Scale(barrel, offsetY * kCalibUnitToMetres)),
         Scale(top, offsetZ * kCalibUnitToMetres));
 
-    // The Quest wrist contract is style-dependent. Build the
+    // qbuild's current Quest wrist contract is style-dependent. Build the
     // conventional visual hand frame here (right/forward/up), then let Xr apply
     // only the shared two-hand shortest arc. Keeping this in one place avoids
     // distributing palm mirroring across PhysicalWeapon, VrCamera and Xr.
@@ -729,7 +729,7 @@ void Init() {
     holster::Init();
     std::lock_guard<std::mutex> lock(gMutex);
     ResetRuntimeLocked();
-    LOGI("[physwpn] initialised (dual-hand mode)");
+    LOGI("[physwpn] initialised (qbuild dual-hand mode)");
 }
 
 void Update(bool interactionsBlocked, bool showHolsterMarkersWhileBlocked,
@@ -799,7 +799,7 @@ void Update(bool interactionsBlocked, bool showHolsterMarkersWhileBlocked,
         // Keep/release an established support grip first. Releasing only the
         // support side detaches it. Releasing the primary while support remains
         // squeezed naturally promotes that controller instead of throwing the
-        // weapon -- the current Quest hand-off contract.
+        // weapon -- the newer Quest qbuild hand-off contract.
         for (int primary = 0; primary < kHandCount; ++primary) {
             const int support = gSupportHand[primary];
             if (!ValidHand(support)) continue;
@@ -906,7 +906,7 @@ void Update(bool interactionsBlocked, bool showHolsterMarkersWhileBlocked,
             const V3 weaponPosition = PositionOf(transferredPose);
             const V3 receiverPosition = GripPosition(gHands[receiver]);
             // Some SA weapon clumps have their object origin away from the grip.
-            // Accept either the final rendered origin (reference behavior) or the
+            // Accept either the final rendered origin (qbuild behaviour) or the
             // primary controller/handle itself, so a natural hand-over at the
             // visible holding hand cannot miss solely because of model pivots.
             const float modelDistance = Distance(receiverPosition, weaponPosition);
@@ -1040,7 +1040,7 @@ void Update(bool interactionsBlocked, bool showHolsterMarkersWhileBlocked,
             }
         }
 
-        // The model-bound foregrip uses the same marker
+        // Current qbuild exposes the model-bound foregrip with the same marker
         // toggle as body holsters during gameplay. Weapon calibration instead
         // forces this one socket, ignores proximity, and suppresses body markers:
         // changing SUPPORT OFFSET/ROT therefore has immediate, unambiguous

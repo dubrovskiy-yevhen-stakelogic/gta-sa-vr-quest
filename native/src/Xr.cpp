@@ -36,7 +36,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -50,12 +49,11 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.1.0";
+constexpr char kModVersion[] = "0.9.78";
 
 JavaVM*   g_hudTextVm{};
 jobject   g_hudTextApplication{};
 jmethodID g_renderVrTextMethod{};
-std::string g_externalFilesDir;
 
 struct HudTextState {
     std::u16string brief;
@@ -303,6 +301,8 @@ std::atomic<int>      g_hudScanElement{-1};
 constexpr std::uint64_t kHudScanDurationNs=12000000000ULL;
 std::atomic<bool>     g_gfxActive{false};        // graphics/perf submenu shown
 std::atomic<int>      g_gfxSel{0};
+std::atomic<bool>     g_controlsMenuActive{false};
+std::atomic<int>      g_controlsSel{0};
 std::atomic<bool>     g_gfxDistanceActive{false}; // draw-distance submenu shown
 std::atomic<int>      g_gfxDistanceSel{0};
 float                 g_holsterPos[8][3]{};      // holster anchors (guarded by g_headPoseMutex)
@@ -312,6 +312,8 @@ bool                  g_chuteTogglesVisible{false};
 int                   g_holsterCount = 0;
 // Active weapon object-space geometry (guarded by g_headPoseMutex). Published by
 // the GameThread; the present thread transforms it to the hand pose and draws it.
+std::vector<float>          g_wpnObjVerts;         // xyz per vertex, object space
+std::vector<unsigned short> g_wpnObjIdx;           // triangle indices into the above
 constexpr int         kPanelW = 512, kPanelH = 512;   // FPS/profiler + cheat-menu panel
 
 // The exact head pose (LOCAL space) each ring set's PIXELS were rendered at,
@@ -2772,6 +2774,11 @@ bool HudCalibrationActive() {
     return g_hudActive.load(std::memory_order_acquire);
 }
 
+void SetControlsMenu(bool active, int selection) {
+    g_controlsMenuActive.store(active, std::memory_order_relaxed);
+    g_controlsSel.store(selection, std::memory_order_relaxed);
+}
+
 void SetGraphicsMenu(bool active, int selection) {
     g_gfxActive.store(active, std::memory_order_relaxed);
     g_gfxSel.store(selection, std::memory_order_relaxed);
@@ -2878,6 +2885,18 @@ void SetTwoHandVisualState(const TwoHandVisualState& state) {
         axisLenSq < 0.000001f) {
         g_twoHandVisualState.active = false;
     }
+}
+
+void SetWeaponGeometry(const float* verts, int numVerts,
+                       const unsigned short* idx, int numIdx) {
+    std::lock_guard<std::mutex> lock(g_headPoseMutex);
+    if (verts == nullptr || numVerts <= 0 || idx == nullptr || numIdx <= 0) {
+        g_wpnObjVerts.clear();
+        g_wpnObjIdx.clear();
+        return;
+    }
+    g_wpnObjVerts.assign(verts, verts + static_cast<size_t>(numVerts) * 3);
+    g_wpnObjIdx.assign(idx, idx + numIdx);
 }
 
 // Which hand currently holds a rendered weapon (-1 = none). The GL hand mesh for
@@ -3216,12 +3235,6 @@ void SetGameFrame(unsigned int texture, const float* transform) {
     if (transform != nullptr) {
         std::memcpy(s.gameTransform, transform, sizeof(s.gameTransform));
     }
-}
-
-void SetExternalFilesDir(const char* path) {
-    g_externalFilesDir = path == nullptr ? "" : path;
-    LOGI("XR external files=%s",
-         g_externalFilesDir.empty() ? "(fallback)" : g_externalFilesDir.c_str());
 }
 
 bool Initialize(JavaVM* vm, jobject activity) {
@@ -3896,6 +3909,36 @@ void PanelClear() {
 
 // Root VR menu: the list of sections (Vice City style). A enters a section, B
 // closes. The stick moves the highlight.
+// Vice City parity: the CONTROLS page. One layout row (DEFAULT / SWAPPED
+// HANDS / CUSTOM) and one row per face button choosing the action it
+// triggers on foot; vehicles always keep the shipped layout.
+void BuildControlsMenu() {
+    PanelClear();
+    const int cx = kPanelW / 2;
+    PanelText("CONTROLS", cx, 20, 5, 100, 225, 255);
+    PanelText("ON FOOT ONLY - VEHICLES KEEP THE SHIPPED LAYOUT",
+              cx, 56, 2, 150, 185, 150);
+    char rows[6][64];
+    std::snprintf(rows[0], sizeof(rows[0]), "LAYOUT  < %s >",
+                  locomotion::ControlsLayoutName());
+    for (int srcRow = 0; srcRow < locomotion::BIND_SRC_COUNT; ++srcRow) {
+        std::snprintf(rows[1 + srcRow], sizeof(rows[0]), "%s  < %s >",
+                      locomotion::ButtonSourceName(srcRow),
+                      locomotion::ButtonActionName(
+                          locomotion::GetButtonBinding(srcRow)));
+    }
+    std::snprintf(rows[5], sizeof(rows[0]), "BACK");
+    const int sel = g_controlsSel.load(std::memory_order_relaxed);
+    const int top = 96, rowH = 50;
+    for (int i = 0; i < 6; ++i) {
+        const int y = top + i * rowH;
+        if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
+        const int c = (i == sel) ? 255 : 200;
+        PanelText(rows[i], cx, y, 2, c, c, (i == sel) ? 120 : c);
+    }
+    PanelText("STICK SEL   L2/R2 CHANGE   B BACK", cx, kPanelH - 22, 2, 150, 185, 150);
+}
+
 void BuildMainMenu() {
     PanelClear();
     const int cx = kPanelW / 2;
@@ -3924,16 +3967,17 @@ void BuildMainMenu() {
         handSkinRow,
         "CHEATS",
         "GRAPHICS",
+        "CONTROLS",
         "CLOSE"
     };
-    const int N   = 12;
+    const int N   = 13;
     const int sel = g_mainSel.load(std::memory_order_relaxed);
     const int top = 82, rowH = 34;
     for (int i = 0; i < N; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
         const bool submenu=i==1||i==2||i==3||i==5||i==6||i==7||
-                           i==9||i==10;
+                           i==9||i==10||i==11;
         if (submenu)
             PanelText(kItems[i],cx,y,2,i==sel?255:100,
                       i==sel?235:225,i==sel?120:255);
@@ -4344,7 +4388,8 @@ void BuildLocomotionMenu() {
                   locomotion::FlightCameraTilt()?"FULL TILT":"LEVEL");
     std::snprintf(rows[11],sizeof(rows[11]),"RECENTER VIEW");
     std::snprintf(rows[12],sizeof(rows[12]),"BACK");
-    // Thirteen rows need a compact pitch to keep the final actions on-panel.
+    // 13 rows on the 512px panel: the old 52px pitch already pushed the
+    // bottom rows past the panel edge; a 32px pitch keeps everything on it.
     const int top=64,rowH=32;
     for (int i=0;i<13;++i) {
         const int y=top+i*rowH;
@@ -4639,6 +4684,8 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
         std::fill(g_debugImageRevisions.begin(), g_debugImageRevisions.end(),
                   ~std::uint64_t{0});
         if      (mainMenu)          BuildMainMenu();
+        else if (g_controlsMenuActive.load(std::memory_order_relaxed))
+                                    BuildControlsMenu();
         else if (calibMenu)         BuildCalibMenu();
         else if (holsterCalibMenu)  BuildHolsterCalibMenu();
         else if (holsterMenu)       BuildHolsterMenu();
@@ -4916,12 +4963,7 @@ bool     g_handAssetsTried = false;
 
 bool LoadUxrh(const char* path, HandMesh& m) {
     FILE* f = std::fopen(path, "rb");
-    if (!f) {
-        const int openErrno = errno;
-        LOGE("[hands] cannot open %s: errno=%d(%s)",
-             path, openErrno, std::strerror(openErrno));
-        return false;
-    }
+    if (!f) { LOGE("[hands] cannot open %s", path); return false; }
     char magic[4]; uint32_t ver = 0, vc = 0, ic = 0;
     if (std::fread(magic, 1, 4, f) != 4 || std::fread(&ver, 4, 1, f) != 1 ||
         std::fread(&vc, 4, 1, f) != 1 || std::fread(&ic, 4, 1, f) != 1 ||
@@ -4937,12 +4979,7 @@ bool LoadUxrh(const char* path, HandMesh& m) {
 
 GLuint LoadRgbaTexture(const char* path, int w, int h) {
     FILE* f = std::fopen(path, "rb");
-    if (!f) {
-        const int openErrno = errno;
-        LOGE("[hands] cannot open tex %s: errno=%d(%s)",
-             path, openErrno, std::strerror(openErrno));
-        return 0;
-    }
+    if (!f) { LOGE("[hands] cannot open tex %s", path); return 0; }
     std::vector<unsigned char> px(static_cast<size_t>(w) * h * 4);
     const size_t n = std::fread(px.data(), 1, px.size(), f);
     std::fclose(f);
@@ -4961,14 +4998,11 @@ GLuint LoadRgbaTexture(const char* path, int w, int h) {
 void EnsureHandAssets() {
     if (g_handAssetsTried) return;
     g_handAssetsTried = true;
-    const std::string dir = (g_externalFilesDir.empty()
-        ? "/sdcard/Android/data/com.rockstargames.gtasa/files"
-        : g_externalFilesDir) + "/vrhands/";
-    LOGI("[hands] asset directory %s", dir.c_str());
-    char path[512];
-    std::snprintf(path, sizeof(path), "%sBigHandLeft.uxrh", dir.c_str());  LoadUxrh(path, g_handMesh[0]);
-    std::snprintf(path, sizeof(path), "%sBigHandRight.uxrh", dir.c_str()); LoadUxrh(path, g_handMesh[1]);
-    std::snprintf(path, sizeof(path), "%sBigHandsAlbedo.rgba", dir.c_str()); g_handTex = LoadRgbaTexture(path, 1024, 1024);
+    const char* dir = "/sdcard/Android/data/com.rockstargames.gtasa/files/vrhands/";
+    char path[256];
+    std::snprintf(path, sizeof(path), "%sBigHandLeft.uxrh", dir);  LoadUxrh(path, g_handMesh[0]);
+    std::snprintf(path, sizeof(path), "%sBigHandRight.uxrh", dir); LoadUxrh(path, g_handMesh[1]);
+    std::snprintf(path, sizeof(path), "%sBigHandsAlbedo.rgba", dir); g_handTex = LoadRgbaTexture(path, 1024, 1024);
 }
 
 constexpr int  kHandMaxV = 5000, kHandMaxI = 27000;
@@ -5011,7 +5045,7 @@ void BuildHandMeshes(const HandPose hp[2], const TwoHandVisualState& twoHand,
         const bool steeringHand = drivingWheel.active &&
                                   drivingWheel.grabbed[hand];
         if (steeringHand) {
-            // The car socket is a RenderWare matrix whose Right axis lies
+            // qbuild's car socket is a RenderWare matrix whose Right axis lies
             // along the rim and Forward axis is the wheel normal. Reproduce its
             // final UltimateXR anatomical decode, including LEFT parity, rather
             // than forcing a controller quaternion onto a synthetic socket.
@@ -5077,21 +5111,21 @@ void BuildHandMeshes(const HandPose hp[2], const TwoHandVisualState& twoHand,
                     const XrVector3f wristUp = TwoHandRotateVector(twoHand,
                         {twoHand.supportUp[0], twoHand.supportUp[1],
                          twoHand.supportUp[2]});
-                    // PhysicalWeapon publishes the fully style-aware
+                    // PhysicalWeapon publishes the fully style-aware qbuild
                     // visual hand frame (including LEFT mesh mirroring). The UXR
                     // builder below consumes that conventional right/forward/up
                     // basis directly; only the shared shortest arc is applied here.
                     forward = vnorm(wristForward);
                     right   = vnorm(wristRight);
                     up      = vnorm(wristUp);
-                    // The LEFT support matrix passes through one final
+                    // qbuild's LEFT support matrix passes through one final
                     // controller-to-UltimateXR parity test before the mesh draw.
                     // Our direct basis bypasses that encode/decode, so reproduce
                     // its final visual result explicitly here.
                     if (hand == 0) right = vscale(right, -1.0f);
                 }
 
-                // The default MAGAZINE gesture closes every finger. A
+                // qbuild's default MAGAZINE gesture closes every finger.  A
                 // caller may explicitly publish the FROM_BELOW blend instead.
                 grip = twoHand.supportGestureValid
                     ? std::clamp(twoHand.supportGestureGrip, 0.0f, 1.0f) : 1.0f;
@@ -5910,7 +5944,7 @@ void DrawParachuteToggles(const float* mvp) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
-// The cabin wheel is procedural because many authored DFFs bake the stock
+// qbuild's cabin wheel is procedural because many authored DFFs bake the stock
 // wheel into chassis_hi.  Draw the calibrated VR wheel from the exact same two
 // sockets used by the grab solver and snapped hands, so all three always share
 // one centre, radius and physical angle.
@@ -6415,6 +6449,118 @@ void DrawBulletTracers(const float* mvp, XrVector3f eyePosition,
     glDepthMask(GL_TRUE);
 }
 
+// ---- Stage 1 weapon rendering: object-space geometry -> right-hand pose ----
+// The active weapon's object-space verts (published by the GameThread) are
+// transformed here into XR world space at the hand pose and drawn flat, in the
+// SAME eye FBO / mvp / depth pass as the hand, so the two can't slip apart.
+constexpr int kWpnMaxV = 8000;
+float          g_wVerts[kWpnMaxV * 3];   // xyz only (Stage 1: no normals/uv)
+unsigned short g_wIdx[kWpnMaxV * 3];
+int            g_wVc = 0, g_wIc = 0;
+GLuint         g_wpnVbo = 0, g_wpnEbo = 0;
+
+// Weapon calibration: object space -> hand frame. Live-tunable (edit + rebuild);
+// refined in Stage 2 once we can see it. rot=0 -> object axes map straight onto
+// (right, up, forward). Object units are ~metres already (RW ~1u = 1m).
+int   g_wpnHand      = 1;                       // 1 = right hand
+float g_wpnScale     = 1.0f;
+float g_wpnRotDeg[3] = {0.0f, 0.0f, 0.0f};      // Euler XYZ applied to object vert
+float g_wpnTrans[3]  = {0.0f, 0.0f, 0.0f};      // (right, up, forward) offset, metres
+
+void EulerXYZ(const float deg[3], float R[9]) {
+    const float cx = std::cos(deg[0] * 0.0174532925f), sx = std::sin(deg[0] * 0.0174532925f);
+    const float cy = std::cos(deg[1] * 0.0174532925f), sy = std::sin(deg[1] * 0.0174532925f);
+    const float cz = std::cos(deg[2] * 0.0174532925f), sz = std::sin(deg[2] * 0.0174532925f);
+    // Rz * Ry * Rx
+    R[0] = cz * cy;                 R[1] = cz * sy * sx - sz * cx;  R[2] = cz * sy * cx + sz * sx;
+    R[3] = sz * cy;                 R[4] = sz * sy * sx + cz * cx;  R[5] = sz * sy * cx - cz * sx;
+    R[6] = -sy;                     R[7] = cy * sx;                 R[8] = cy * cx;
+}
+
+// Build the weapon's world-space triangle mesh at the right hand's pose. Mirrors
+// the basis math in BuildHandMeshes for the same hand so the gun sits in the same
+// frame as the hand mesh. Runs on the present thread, once per frame.
+void BuildWeaponMesh(const HandPose hp[2]) {
+    g_wVc = 0; g_wIc = 0;
+    std::vector<float> obj; std::vector<unsigned short> idx;
+    {
+        std::lock_guard<std::mutex> lock(g_headPoseMutex);
+        if (g_wpnObjVerts.empty() || g_wpnObjIdx.empty()) return;
+        obj = g_wpnObjVerts; idx = g_wpnObjIdx;      // small copy out under lock
+    }
+    const int hand = (g_wpnHand == 0) ? 0 : 1;
+    {
+        static int dbg = 0;
+        if (dbg < 4) { ++dbg; LOGI("[wpn.dbg] build: obj verts=%d idx=%d handValid=%d",
+                                   static_cast<int>(obj.size() / 3), static_cast<int>(idx.size()), hp[hand].valid ? 1 : 0); }
+    }
+    if (!hp[hand].valid) return;
+
+    const XrQuaternionf gq{hp[hand].gripOri[0], hp[hand].gripOri[1], hp[hand].gripOri[2], hp[hand].gripOri[3]};
+    const XrQuaternionf aq{hp[hand].aimOri[0], hp[hand].aimOri[1], hp[hand].aimOri[2], hp[hand].aimOri[3]};
+    const XrVector3f pos{hp[hand].gripPos[0], hp[hand].gripPos[1], hp[hand].gripPos[2]};
+    const XrVector3f gRight = vnorm(QuatRotate(gq, {1, 0, 0}));
+    const XrVector3f gFwd   = vnorm(QuatRotate(gq, {0, 0, -1}));
+    const XrVector3f aimFwd = vnorm(QuatRotate(aq, {0, 0, -1}));
+    const float sign = (1 - hand) == 0 ? 1.0f : -1.0f;
+    XrVector3f forward = (vdot(aimFwd, aimFwd) > 0.1f) ? aimFwd : QuatRotate(gq, {0, 1, 0});
+    forward = vnorm(forward);
+    XrVector3f up = vscale(gRight, sign);
+    up = vsub(up, vscale(forward, vdot(up, forward)));
+    if (vdot(up, up) < 0.0001f) up = vscale(gRight, sign);
+    up = vnorm(up);
+    XrVector3f right = vnorm(vcross(up, forward));
+    if (vdot(right, gFwd) < 0.0f) right = vscale(right, -1.0f);
+
+    float R[9]; EulerXYZ(g_wpnRotDeg, R);
+    const int nv = static_cast<int>(obj.size() / 3);
+    for (int i = 0; i < nv && g_wVc < kWpnMaxV; ++i) {
+        const float ox = obj[i * 3 + 0] * g_wpnScale;
+        const float oy = obj[i * 3 + 1] * g_wpnScale;
+        const float oz = obj[i * 3 + 2] * g_wpnScale;
+        const float rx = R[0] * ox + R[1] * oy + R[2] * oz + g_wpnTrans[0];
+        const float ry = R[3] * ox + R[4] * oy + R[5] * oz + g_wpnTrans[1];
+        const float rz = R[6] * ox + R[7] * oy + R[8] * oz + g_wpnTrans[2];
+        const XrVector3f wp = vadd(pos, vadd(vscale(right, rx), vadd(vscale(up, ry), vscale(forward, rz))));
+        g_wVerts[g_wVc * 3 + 0] = wp.x; g_wVerts[g_wVc * 3 + 1] = wp.y; g_wVerts[g_wVc * 3 + 2] = wp.z;
+        ++g_wVc;
+    }
+    // Filter a whole triangle at a time: if the vertex cap truncated any of a
+    // triangle's three verts, drop the triangle entirely (a clean hole) rather
+    // than emitting stray indices that would desync the whole triangle stream.
+    for (size_t t = 0; t + 2 < idx.size(); t += 3) {
+        if (g_wIc + 3 > kWpnMaxV * 3) break;
+        const unsigned short a = idx[t], b = idx[t + 1], c = idx[t + 2];
+        if (a < g_wVc && b < g_wVc && c < g_wVc) {
+            g_wIdx[g_wIc++] = a; g_wIdx[g_wIc++] = b; g_wIdx[g_wIc++] = c;
+        }
+    }
+}
+
+// Draw the weapon mesh flat-shaded (orange) with the marker program, sharing the
+// hand pass's depth buffer. `mvp` is the per-eye matrix already built by the hand.
+void DrawWeaponForEye(const float* mvp) {
+    if (g_wVc <= 0 || g_wIc <= 0) return;
+    EnsureMarkerProgram();
+    if (!g_wpnVbo) { glGenBuffers(1, &g_wpnVbo); glGenBuffers(1, &g_wpnEbo); }
+    glUseProgram(g_markerProg);
+    glUniformMatrix4fv(g_markerMvpLoc, 1, GL_FALSE, mvp);
+    glUniform4f(g_markerColLoc, 245 / 255.0f, 150 / 255.0f, 30 / 255.0f, 1.0f);   // orange
+    glBindBuffer(GL_ARRAY_BUFFER, g_wpnVbo);
+    glBufferData(GL_ARRAY_BUFFER, g_wVc * 3 * sizeof(float), g_wVerts, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_wpnEbo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, g_wIc * sizeof(unsigned short), g_wIdx, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), reinterpret_cast<void*>(0));
+    glDrawElements(GL_TRIANGLES, g_wIc, GL_UNSIGNED_SHORT, nullptr);
+    glDisableVertexAttribArray(0);
+    glUseProgram(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    static bool logged = false;
+    if (!logged) { LOGI("[wpn] mesh drawn %d verts %d idx", g_wVc, g_wIc); logged = true; }
+}
+
 // Draw the built hand meshes into the currently-bound swapchain framebuffer for
 // one eye. rp = the presented set's render pose; e = 0 left / 1 right.
 void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
@@ -6447,6 +6593,7 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
          (trackedVisuals &&
           (bakedHands[0].valid || bakedHands[1].valid)));
     if (!haveHands && (!trackedVisuals || g_holsterCount <= 0) &&
+        (!trackedVisuals || g_wVc <= 0) &&
         (!trackedVisuals || !laser.valid) &&
         (!trackedVisuals || !drivingWheel.active) &&
         (!trackedVisuals || (throwableTrajectory[0].count <= 1 &&
@@ -6576,7 +6723,7 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_TRUE);
     glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
 
-    // Render order: the virtual cabin control is world-depth tested first, then
+    // qbuild order: the virtual cabin control is world-depth tested first, then
     // the closed hands are drawn over it at the exact animated rim sockets.
     if (trackedVisuals && drivingWheel.active)
         DrawImmersiveDrivingWheel(mvp, drivingWheel);
@@ -6617,6 +6764,7 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
         DrawHolsterMarkers(mvp);   // cyan cubes at the holster anchors (shares this depth pass)
         DrawParachuteToggles(mvp); // canopy brake handles while parachuting
         DrawWeaponLaser(mvp, laser); // calibrated red beam, occluded by world + weapon
+        DrawWeaponForEye(mvp);     // active weapon mesh pinned to the hand (Stage 1)
         DrawThrowableTrajectories(mvp, throwableTrajectory);
     }
     DrawBulletTracers(mvp, eyePos, tracers, tracerCount); // original-SA short streak, same stereo depth
@@ -6715,6 +6863,7 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
 
     if (!bakedScope.active) {
         BuildHandMeshes(bakedHands, bakedTwoHand, drivingWheel); // same ring pose + cockpit/support correction
+        BuildWeaponMesh(bakedHands);   // (weapon-mesh path; dead until Approach-B geometry exists)
     }
     BulletTracer liveTracers[kMaxBulletTracers]{};
     const int liveTracerCount = SnapshotBulletTracers(liveTracers);
@@ -6939,19 +7088,10 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
 
     SyncInput(frameState.predictedDisplayTime);
 
-    // Toggle the FPS/debug panel on the Vice City chord: both grips + A (rising
-    // edge). Grips alone are the modifier so it never fires during normal play.
-    {
-        InputState in{};
-        GetInput(in);
-        const bool chord = in.grip[0] >= 0.75f && in.grip[1] >= 0.75f && in.a;
-        static bool chordDown = false;
-        if (chord && !chordDown) {
-            s.debugVisible = !s.debugVisible;
-            LOGI("[vr] debug panel %s", s.debugVisible ? "ON" : "OFF");
-        }
-        chordDown = chord;
-    }
+    // The grips+A FPS/debug profiler chord is DISABLED for players: the
+    // panel is a developer tool and the chord was too easy to hit by
+    // accident. The rendering machinery stays; re-enable here for profiling.
+    s.debugVisible = false;
 
     // Turn the GameThread frame counter into a rate every half second (using the
     // predicted display time as a monotonic clock in nanoseconds).

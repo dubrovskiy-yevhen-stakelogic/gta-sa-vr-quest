@@ -10,15 +10,17 @@
 #include <algorithm>
 #include <dlfcn.h>
 #include <cstdio>
+#include <ctime>
 #include <iterator>
 
 namespace savr::cheats {
 namespace {
 
 // Every symbol below is present in the checked-in 2.11 arm64 export table
-// (audited against the supported retail dynamic symbol table). Calling the game's handlers retains its own model
+// (recon/gtasa211-dynsym.txt). Calling the game's handlers retains its own model
 // streaming, wanted, weather and ped logic.
-enum class Kind : unsigned char { Plain, Vehicle, GodMode, UnlockCities, Reset };
+enum class Kind : unsigned char { Plain, Vehicle, GodMode, UnlockCities, Reset,
+                                  MissionSkip, TutorialSkip };
 
 struct Entry {
     const char* label;
@@ -112,6 +114,15 @@ Entry g_cheats[] = {
     {"UNLOCK ALL CITIES",      "_ZN6CStats12SetStatValueEtf",          -1, Kind::UnlockCities, nullptr},
     {"SUICIDE",                "_ZN6CCheat12SuicideCheatEv",           -1, Kind::Plain, nullptr},
     {"RESET ALL CHEATS",       "_ZN6CCheat11ResetCheatsEv",            -1, Kind::Reset, nullptr},
+
+
+    // Manual 5-second window that auto-passes "press key to continue" script
+    // waits (CCheat debug leftover). Deliberately NOT automatic: always-on it
+    // skipped real story sequences.
+    {"SKIP SCRIPT PROMPT (5S)", "_ZN6CCheat17ScriptBypassCheatEv",     -1, Kind::Plain, nullptr},
+    {"SKIP MISSION (BETA)",    "DoMissionSkip",                        -1, Kind::MissionSkip, nullptr},
+    {"SKIP TUTORIAL PROMPT",   nullptr,                                -1, Kind::TutorialSkip, nullptr},
+
 };
 
 std::atomic<bool> g_godMode{false};
@@ -119,6 +130,8 @@ bool* g_nativeInvincible = nullptr;
 bool* g_playerIsOffTheMap = nullptr;
 float (*g_getStatValue)(unsigned short) = nullptr;
 void (*g_setStatValue)(unsigned short, float) = nullptr;
+bool (*g_isPlayerOnAMission)() = nullptr;
+void (*g_scriptBypassCheat)() = nullptr;
 // The city-unlock stat can be rewritten by the mission script as the story
 // state machine runs, so a single write silently reverted. While the cheat is
 // latched, the per-frame tick re-asserts it.
@@ -323,6 +336,10 @@ void Init(void* handle) {
         dlsym(handle, "_ZN6CStats12GetStatValueEt"));
     g_setStatValue = reinterpret_cast<void (*)(unsigned short, float)>(
         dlsym(handle, "_ZN6CStats12SetStatValueEtf"));
+    g_isPlayerOnAMission = reinterpret_cast<bool (*)()>(
+        dlsym(handle, "_ZN11CTheScripts18IsPlayerOnAMissionEv"));
+    g_scriptBypassCheat = reinterpret_cast<void (*)()>(
+        dlsym(handle, "_ZN6CCheat17ScriptBypassCheatEv"));
     if (g_nativeInvincible != nullptr)
         g_godMode.store(*g_nativeInvincible, std::memory_order_release);
     LOGI("cheats: resolved %d/%d handlers, native god state=%s", ok,
@@ -331,6 +348,57 @@ void Init(void* handle) {
 }
 
 void Tick() {
+    // NOTE: an always-on ScriptBypassCheat was tried here and REVERTED: it
+    // auto-passed scripted waits that are real gameplay beats (it skipped an
+    // entire story bicycle ride). The bypass is manual-only again below.
+    // Field diagnostic for the blocking touch tutorial: watch its step
+    // counter and the stats-view global live.
+    if (g.CTheScripts_ScriptSpace != nullptr) {
+        static double lastTutorialLog = 0.0;
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const double now = static_cast<double>(ts.tv_sec) + ts.tv_nsec * 1e-9;
+        if (now - lastTutorialLog > 2.0) {
+            lastTutorialLog = now;
+            const auto* space =
+                static_cast<const unsigned char*>(g.CTheScripts_ScriptSpace);
+            // Full gate probe: pad control flags (0x110 disable, 0x12d
+            // enter-car button, 0x133 vital-stats button) and the live
+            // CWidgetHelpText queue with each entry's condition id + timer.
+            int p110=-1,p12d=-1,p133=-1;
+            if (g.CPad_GetPad) {
+                if (const auto* pad = static_cast<const unsigned char*>(
+                        g.CPad_GetPad(0))) {
+                    p110=*reinterpret_cast<const unsigned short*>(pad+0x110);
+                    p12d=pad[0x12d];
+                    p133=pad[0x133];
+                }
+            }
+            char queue[128]{}; int ql=0;
+            if (g.CWidgetHelpText_m_pInstance) {
+                if (const auto* inst = static_cast<const unsigned char*>(
+                        *g.CWidgetHelpText_m_pInstance)) {
+                    for (int i = 0; i < 10 && ql < 100; ++i) {
+                        const unsigned char* e = inst + 0xcc + i * 0x334;
+                        const unsigned cond =
+                            *reinterpret_cast<const unsigned*>(e + 0x330);
+                        const float timer =
+                            *reinterpret_cast<const float*>(e + 0x320);
+                        const short ch =
+                            *reinterpret_cast<const short*>(e);
+                        if (ch == 0 && cond == 0) continue;
+                        ql += std::snprintf(queue + ql, sizeof(queue) - ql,
+                                            " [%d]c=%u t=%.1f", i, cond,
+                                            timer);
+                    }
+                }
+            }
+            LOGI("[tutorial] $B904=%d $AD3C=%d pad110=%d pad12d=%d pad133=%d help:%s",
+                 *reinterpret_cast<const int*>(space + 0xB904),
+                 *reinterpret_cast<const int*>(space + 0xAD3C),
+                 p110, p12d, p133, ql ? queue : " empty");
+        }
+    }
     if (!g_unlockCitiesActive.load(std::memory_order_acquire)) return;
     if (!g_getStatValue || !g_setStatValue) return;
     if (g_getStatValue(181u) < 3.0f) {
@@ -370,13 +438,28 @@ void Activate(int index) {
         return;
     }
     Entry& cheat = g_cheats[index];
-    if (cheat.fn == nullptr) {
+    if (cheat.fn == nullptr && cheat.kind != Kind::TutorialSkip) {
         LOGW("cheat '%s' unavailable (symbol missing)", cheat.label);
         return;
     }
 
     if (cheat.kind == Kind::Vehicle) {
         reinterpret_cast<void (*)(int)>(cheat.fn)(cheat.vehicleModel);
+    } else if (cheat.kind == Kind::TutorialSkip) {
+        auto* space = static_cast<unsigned char*>(g.CTheScripts_ScriptSpace);
+        if (space == nullptr) { LOGW("tutorial skip: no ScriptSpace"); return; }
+        auto* step = reinterpret_cast<int*>(space + 0xB904);
+        LOGI("tutorial skip: step global $B904 %d -> 100", *step);
+        *step = 100;
+        return;
+    } else if (cheat.kind == Kind::MissionSkip) {
+        // cheat.fn resolves to the DoMissionSkip DATA byte, not code.
+        if (g_isPlayerOnAMission == nullptr || !g_isPlayerOnAMission()) {
+            LOGW("mission skip ignored: no mission running");
+            return;
+        }
+        *static_cast<unsigned char*>(cheat.fn) = 1;
+        LOGI("mission skip: DoMissionSkip=1 (main.scm takes over)");
     } else if (cheat.kind == Kind::UnlockCities) {
         // STAT_CITY_UNLOCKED (181) > 1 removes the forbidden-territory wanted
         // gate for all three cities (CGameLogic checks <=0 for SF, <=1 for

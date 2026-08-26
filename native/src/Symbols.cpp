@@ -43,7 +43,7 @@ bool ResolveOne(void* handle, const Entry& e) {
 
 // dl_iterate_phdr rather than dlinfo: dlinfo only exists from API 30, and the
 // load base is wanted precisely on older devices too. Runtime address minus this
-// gives the file offset from the supported retail symbol table.
+// gives the file offset printed in recon/gtasa211-dynsym.txt.
 int MatchLibGame(dl_phdr_info* info, size_t, void* out) {
     if (info->dlpi_name == nullptr) {
         return 0;
@@ -140,6 +140,10 @@ bool ResolveGameSymbols(void* handle) {
         {"_ZNK4CPed7IsAliveEv",                                                  reinterpret_cast<void**>(&g.CPed_IsAlive),                          false},
         {"_ZN20CPedGeometryAnalyser7IsInAirERK4CPed",                            reinterpret_cast<void**>(&g.CPedGeometryAnalyser_IsInAir),          false},
         {"_ZN15CTouchInterface10IsReleasedENS_9WidgetIDsEP9CVector2Di",          reinterpret_cast<void**>(&g.CTouchInterface_IsReleased),            false},
+        {"_ZN15CTouchInterface10IsHeldDownENS_9WidgetIDsEi",                     reinterpret_cast<void**>(&g.CTouchInterface_IsHeldDown),            false},
+        {"_ZN15CTouchInterface13IsJustPressedENS_9WidgetIDsEP9CVector2Di",       reinterpret_cast<void**>(&g.CTouchInterface_IsJustPressed),         false},
+        {"_ZN15CTouchInterface14IsDoubleTappedENS_9WidgetIDsEbi",                reinterpret_cast<void**>(&g.CTouchInterface_IsDoubleTapped),        false},
+        {"_ZN15CTouchInterface9IsTouchedENS_9WidgetIDsEP9CVector2Di",            reinterpret_cast<void**>(&g.CTouchInterface_IsTouchedQuery),        false},
         {"_ZN9CPhysical14ApplyMoveForceE7CVector",                               reinterpret_cast<void**>(&g.CPhysical_ApplyMoveForce),              false},
         {"_ZN11CTheScripts11ScriptSpaceE",                                       reinterpret_cast<void**>(&g.CTheScripts_ScriptSpace),               false},
         {"_ZN10CStreaming9LoadSceneERK7CVector",                                 reinterpret_cast<void**>(&g.CStreaming_LoadScene),                  false},
