@@ -49,7 +49,12 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.1.0.8";
+constexpr char kModVersion[] = "0.1.0.12";  // internal build id (4th digit)
+#ifdef SAVR_DEV
+constexpr const char* kModVersionShown = kModVersion;
+#else
+constexpr const char* kModVersionShown = "0.1.0";  // players see the release id
+#endif
 
 JavaVM*   g_hudTextVm{};
 jobject   g_hudTextApplication{};
@@ -326,6 +331,8 @@ constexpr int         kPanelW = 512, kPanelH = 512;   // FPS/profiler + cheat-me
 // is the actual cure for the rotation ghosting. Guarded by g_headPoseMutex.
 XrPosef g_stereoRenderPose[kStereoSets]{};
 bool    g_stereoRenderPoseValid[kStereoSets] = {};
+MobileColorState g_pendingMobileColor{};
+MobileColorState g_stereoMobileColor[kStereoSets]{};
 // Hand poses baked into each set, captured when that set's eye textures were
 // published (the same GameThread sample the weapon was baked from). The present
 // thread builds the hand meshes from the DISPLAYED set's snapshot, so the hands and
@@ -546,6 +553,12 @@ struct State {
     GLint  fxaaInverseSizeUniform{-1};
     GLint  fxaaUnderwaterUniform{-1};
     GLint  fxaaWaterDepthUniform{-1};
+    GLint  fxaaMobileColorModeUniform{-1};
+    GLint  fxaaContrastMultUniform{-1};
+    GLint  fxaaContrastAddUniform{-1};
+    GLint  fxaaRedGradeUniform{-1};
+    GLint  fxaaGreenGradeUniform{-1};
+    GLint  fxaaBlueGradeUniform{-1};
 
     // When FXAA is disabled, underwater grading replaces the normal linear
     // blit with this one-sample copy. It is created lazily and used only while
@@ -556,6 +569,12 @@ struct State {
     GLint  underwaterTextureUniform{-1};
     GLint  underwaterAmountUniform{-1};
     GLint  underwaterDepthUniform{-1};
+    GLint  underwaterMobileColorModeUniform{-1};
+    GLint  underwaterContrastMultUniform{-1};
+    GLint  underwaterContrastAddUniform{-1};
+    GLint  underwaterRedGradeUniform{-1};
+    GLint  underwaterGreenGradeUniform{-1};
+    GLint  underwaterBlueGradeUniform{-1};
 
     // Full classic HUD is alpha-keyed into each finished eye. Unlike the old
     // three OpenXR crop cards this has no opaque quad background or guessed
@@ -1170,6 +1189,12 @@ uniform sampler2D uTexture;
 uniform vec2 uInverseSourceSize;
 uniform float uUnderwater;
 uniform float uWaterDepth;
+uniform int uMobileColorMode;
+uniform vec3 uContrastMult;
+uniform vec3 uContrastAdd;
+uniform vec4 uRedGrade;
+uniform vec4 uGreenGrade;
+uniform vec4 uBlueGrade;
 out vec4 outColor;
 
 float Luma(vec3 colour) {
@@ -1193,6 +1218,25 @@ vec3 GradeUnderwater(vec3 colour) {
     return mix(colour, clamp(water, 0.0, 1.0), amount);
 }
 
+vec3 GradeMobileOriginal(vec3 colour) {
+    if (uMobileColorMode == 1)
+        return colour * uContrastMult + uContrastAdd;
+    if (uMobileColorMode == 2) {
+        vec4 sampleColour = vec4(colour, 1.0);
+        return vec3(dot(sampleColour, uRedGrade),
+                    dot(sampleColour, uGreenGrade),
+                    dot(sampleColour, uBlueGrade));
+    }
+    return colour;
+}
+
+vec3 GradeOutput(vec3 colour) {
+    // Retail MobileRender first lands in a normalized render target. Preserve
+    // that saturation point before our compositor-only underwater blend;
+    // otherwise highlights above 1.0 would be over-weighted under water.
+    return GradeUnderwater(clamp(GradeMobileOriginal(colour), 0.0, 1.0));
+}
+
 void main() {
     vec3 middle = SampleColour(vUv);
     vec3 nw = SampleColour(vUv + vec2(-1.0, -1.0) * uInverseSourceSize);
@@ -1208,7 +1252,7 @@ void main() {
     float lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));
 
     if (lmax - lmin < max(0.0312, lmax * 0.125)) {
-        outColor = vec4(GradeUnderwater(middle), 1.0);
+        outColor = vec4(GradeOutput(middle), 1.0);
         return;
     }
 
@@ -1225,7 +1269,7 @@ void main() {
         SampleColour(vUv + direction * -0.5) +
         SampleColour(vUv + direction *  0.5));
     float lb = Luma(b);
-    outColor = vec4(GradeUnderwater((lb < lmin || lb > lmax) ? a : b), 1.0);
+    outColor = vec4(GradeOutput((lb < lmin || lb > lmax) ? a : b), 1.0);
 }
 )";
 
@@ -1235,10 +1279,31 @@ in vec2 vUv;
 uniform sampler2D uTexture;
 uniform float uUnderwater;
 uniform float uWaterDepth;
+uniform int uMobileColorMode;
+uniform vec3 uContrastMult;
+uniform vec3 uContrastAdd;
+uniform vec4 uRedGrade;
+uniform vec4 uGreenGrade;
+uniform vec4 uBlueGrade;
 out vec4 outColor;
 
+vec3 GradeMobileOriginal(vec3 colour) {
+    if (uMobileColorMode == 1)
+        return colour * uContrastMult + uContrastAdd;
+    if (uMobileColorMode == 2) {
+        vec4 sampleColour = vec4(colour, 1.0);
+        return vec3(dot(sampleColour, uRedGrade),
+                    dot(sampleColour, uGreenGrade),
+                    dot(sampleColour, uBlueGrade));
+    }
+    return colour;
+}
+
 void main() {
-    vec3 colour = texture(uTexture, vUv).rgb;
+    // Match the normalized intermediate target used by retail before applying
+    // the compositor-only underwater tint.
+    vec3 colour = clamp(GradeMobileOriginal(texture(uTexture, vUv).rgb),
+                        0.0, 1.0);
     float amount = smoothstep(0.12, 0.50, clamp(uUnderwater, 0.0, 1.0));
     float depth = clamp(uWaterDepth * 0.08, 0.0, 0.65);
     vec3 tinted = colour * vec3(0.40, 0.66, 0.74) +
@@ -1316,6 +1381,7 @@ bool g_fxaaFirstDrawValidated = false;
 int  g_fxaaErrorCount = 0;
 bool g_underwaterBuildAttempted = false;
 bool g_underwaterRuntimeFailed = false;
+bool g_underwaterFirstDrawValidated = false;
 
 struct FxaaFrameStats {
     bool requested{};
@@ -1431,14 +1497,34 @@ bool BuildFxaaProgram() {
         glGetUniformLocation(s.fxaaProgram, "uUnderwater");
     s.fxaaWaterDepthUniform =
         glGetUniformLocation(s.fxaaProgram, "uWaterDepth");
+    s.fxaaMobileColorModeUniform =
+        glGetUniformLocation(s.fxaaProgram, "uMobileColorMode");
+    s.fxaaContrastMultUniform =
+        glGetUniformLocation(s.fxaaProgram, "uContrastMult");
+    s.fxaaContrastAddUniform =
+        glGetUniformLocation(s.fxaaProgram, "uContrastAdd");
+    s.fxaaRedGradeUniform =
+        glGetUniformLocation(s.fxaaProgram, "uRedGrade");
+    s.fxaaGreenGradeUniform =
+        glGetUniformLocation(s.fxaaProgram, "uGreenGrade");
+    s.fxaaBlueGradeUniform =
+        glGetUniformLocation(s.fxaaProgram, "uBlueGrade");
     glGenVertexArrays(1, &s.fxaaVertexArray);
     glGenSamplers(1, &s.fxaaSampler);
     if (s.fxaaTextureUniform < 0 || s.fxaaInverseSizeUniform < 0 ||
         s.fxaaUnderwaterUniform < 0 || s.fxaaWaterDepthUniform < 0 ||
+        s.fxaaMobileColorModeUniform < 0 ||
+        s.fxaaContrastMultUniform < 0 || s.fxaaContrastAddUniform < 0 ||
+        s.fxaaRedGradeUniform < 0 || s.fxaaGreenGradeUniform < 0 ||
+        s.fxaaBlueGradeUniform < 0 ||
         s.fxaaVertexArray == 0 || s.fxaaSampler == 0) {
-        LOGE("[fxaa] program resources invalid tex=%d inv=%d water=%d depth=%d vao=%u sampler=%u",
+        LOGE("[fxaa] program resources invalid tex=%d inv=%d water=%d depth=%d "
+             "mobile=%d mult=%d add=%d grade=%d/%d/%d vao=%u sampler=%u",
              s.fxaaTextureUniform, s.fxaaInverseSizeUniform,
              s.fxaaUnderwaterUniform, s.fxaaWaterDepthUniform,
+             s.fxaaMobileColorModeUniform, s.fxaaContrastMultUniform,
+             s.fxaaContrastAddUniform, s.fxaaRedGradeUniform,
+             s.fxaaGreenGradeUniform, s.fxaaBlueGradeUniform,
              s.fxaaVertexArray, s.fxaaSampler);
         if (s.fxaaSampler != 0) glDeleteSamplers(1, &s.fxaaSampler);
         if (s.fxaaVertexArray != 0) glDeleteVertexArrays(1, &s.fxaaVertexArray);
@@ -1450,6 +1536,12 @@ bool BuildFxaaProgram() {
         s.fxaaInverseSizeUniform = -1;
         s.fxaaUnderwaterUniform = -1;
         s.fxaaWaterDepthUniform = -1;
+        s.fxaaMobileColorModeUniform = -1;
+        s.fxaaContrastMultUniform = -1;
+        s.fxaaContrastAddUniform = -1;
+        s.fxaaRedGradeUniform = -1;
+        s.fxaaGreenGradeUniform = -1;
+        s.fxaaBlueGradeUniform = -1;
         ++g_fxaaErrorCount;
         LOGE("[fxaa] exact linear blit fallback active");
         return false;
@@ -1501,14 +1593,39 @@ bool BuildUnderwaterCopyProgram() {
         glGetUniformLocation(s.underwaterProgram, "uUnderwater");
     s.underwaterDepthUniform =
         glGetUniformLocation(s.underwaterProgram, "uWaterDepth");
+    s.underwaterMobileColorModeUniform =
+        glGetUniformLocation(s.underwaterProgram, "uMobileColorMode");
+    s.underwaterContrastMultUniform =
+        glGetUniformLocation(s.underwaterProgram, "uContrastMult");
+    s.underwaterContrastAddUniform =
+        glGetUniformLocation(s.underwaterProgram, "uContrastAdd");
+    s.underwaterRedGradeUniform =
+        glGetUniformLocation(s.underwaterProgram, "uRedGrade");
+    s.underwaterGreenGradeUniform =
+        glGetUniformLocation(s.underwaterProgram, "uGreenGrade");
+    s.underwaterBlueGradeUniform =
+        glGetUniformLocation(s.underwaterProgram, "uBlueGrade");
     glGenVertexArrays(1, &s.underwaterVertexArray);
     glGenSamplers(1, &s.underwaterSampler);
     if (s.underwaterTextureUniform < 0 ||
         s.underwaterAmountUniform < 0 || s.underwaterDepthUniform < 0 ||
+        s.underwaterMobileColorModeUniform < 0 ||
+        s.underwaterContrastMultUniform < 0 ||
+        s.underwaterContrastAddUniform < 0 ||
+        s.underwaterRedGradeUniform < 0 ||
+        s.underwaterGreenGradeUniform < 0 ||
+        s.underwaterBlueGradeUniform < 0 ||
         s.underwaterVertexArray == 0 || s.underwaterSampler == 0) {
-        LOGE("[underwater] copy resources invalid tex=%d amount=%d depth=%d vao=%u sampler=%u",
+        LOGE("[mobile.color] copy resources invalid tex=%d water=%d depth=%d "
+             "mobile=%d mult=%d add=%d grade=%d/%d/%d vao=%u sampler=%u",
              s.underwaterTextureUniform, s.underwaterAmountUniform,
              s.underwaterDepthUniform,
+             s.underwaterMobileColorModeUniform,
+             s.underwaterContrastMultUniform,
+             s.underwaterContrastAddUniform,
+             s.underwaterRedGradeUniform,
+             s.underwaterGreenGradeUniform,
+             s.underwaterBlueGradeUniform,
              s.underwaterVertexArray, s.underwaterSampler);
         if (s.underwaterSampler != 0)
             glDeleteSamplers(1, &s.underwaterSampler);
@@ -1521,13 +1638,19 @@ bool BuildUnderwaterCopyProgram() {
         s.underwaterTextureUniform = -1;
         s.underwaterAmountUniform = -1;
         s.underwaterDepthUniform = -1;
+        s.underwaterMobileColorModeUniform = -1;
+        s.underwaterContrastMultUniform = -1;
+        s.underwaterContrastAddUniform = -1;
+        s.underwaterRedGradeUniform = -1;
+        s.underwaterGreenGradeUniform = -1;
+        s.underwaterBlueGradeUniform = -1;
         return false;
     }
     glSamplerParameteri(s.underwaterSampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glSamplerParameteri(s.underwaterSampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glSamplerParameteri(s.underwaterSampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glSamplerParameteri(s.underwaterSampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    LOGI("[underwater] one-sample graded copy ready");
+    LOGI("[mobile.color] one-sample colour/underwater resolve ready");
     return true;
 }
 
@@ -1900,9 +2023,28 @@ bool DrawHudComposite(GLuint sourceTexture,int targetWidth,int targetHeight,
     return true;
 }
 
+void UploadMobileColorUniforms(const MobileColorState& colour,
+                               GLint modeUniform,
+                               GLint contrastMultUniform,
+                               GLint contrastAddUniform,
+                               GLint redGradeUniform,
+                               GLint greenGradeUniform,
+                               GLint blueGradeUniform) {
+    glUniform1i(modeUniform, colour.mode);
+    if (colour.mode == 1) {
+        glUniform3fv(contrastMultUniform, 1, colour.contrastMult);
+        glUniform3fv(contrastAddUniform, 1, colour.contrastAdd);
+    } else if (colour.mode == 2) {
+        glUniform4fv(redGradeUniform, 1, colour.redGrade);
+        glUniform4fv(greenGradeUniform, 1, colour.greenGrade);
+        glUniform4fv(blueGradeUniform, 1, colour.blueGrade);
+    }
+}
+
 bool DrawEyeFxaa(GLuint sourceTexture, int sourceWidth, int sourceHeight,
                  int targetWidth, int targetHeight,
                  float underWaterness, float waterDepth,
+                 const MobileColorState& mobileColor,
                  const FxaaGlState& restoreState, FxaaFrameStats& stats) {
     if (sourceTexture == 0 || sourceWidth <= 0 || sourceHeight <= 0 ||
         !BuildFxaaProgram() || g_fxaaRuntimeFailed) {
@@ -1947,6 +2089,11 @@ bool DrawEyeFxaa(GLuint sourceTexture, int sourceWidth, int sourceHeight,
                     std::clamp(underWaterness, 0.0f, 1.0f));
         glUniform1f(s.fxaaWaterDepthUniform,
                     std::clamp(waterDepth, 0.0f, 100.0f));
+        UploadMobileColorUniforms(
+            mobileColor, s.fxaaMobileColorModeUniform,
+            s.fxaaContrastMultUniform, s.fxaaContrastAddUniform,
+            s.fxaaRedGradeUniform, s.fxaaGreenGradeUniform,
+            s.fxaaBlueGradeUniform);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         if (!g_fxaaFirstDrawValidated) {
             const GLenum error = glGetError();
@@ -1992,29 +2139,65 @@ bool DrawEyeFxaa(GLuint sourceTexture, int sourceWidth, int sourceHeight,
 bool DrawEyeUnderwaterCopy(GLuint sourceTexture,
                            int targetWidth, int targetHeight,
                            float underWaterness, float waterDepth,
+                           const MobileColorState& mobileColor,
                            const FxaaGlState& restoreState) {
     if (sourceTexture == 0 || targetWidth <= 0 || targetHeight <= 0 ||
-        underWaterness <= 0.001f || !BuildUnderwaterCopyProgram() ||
+        (underWaterness <= 0.001f && mobileColor.mode == 0) ||
+        !BuildUnderwaterCopyProgram() ||
         g_underwaterRuntimeFailed) {
         return false;
     }
 
-    for (int i = 0; i < 8 && glGetError() != GL_NO_ERROR; ++i) {}
+    bool drawOk = true;
+    if (!g_underwaterFirstDrawValidated) {
+        GLenum stale = GL_NO_ERROR;
+        for (int i = 0; i < 8; ++i) {
+            const GLenum error = glGetError();
+            if (error == GL_NO_ERROR) break;
+            stale = error;
+        }
+        if (stale != GL_NO_ERROR)
+            LOGW("[mobile.color] cleared pre-existing GL error 0x%x", stale);
+        const GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            LOGE("[mobile.color] swapchain draw FBO incomplete: 0x%x", status);
+            drawOk = false;
+        }
+    }
 
-    glViewport(0, 0, targetWidth, targetHeight);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glUseProgram(s.underwaterProgram);
-    glBindVertexArray(s.underwaterVertexArray);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, sourceTexture);
-    glBindSampler(0, s.underwaterSampler);
-    glUniform1i(s.underwaterTextureUniform, 0);
-    glUniform1f(s.underwaterAmountUniform,
-                std::clamp(underWaterness, 0.0f, 1.0f));
-    glUniform1f(s.underwaterDepthUniform,
-                std::clamp(waterDepth, 0.0f, 100.0f));
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    const GLenum error = glGetError();
+    if (drawOk) {
+        glViewport(0, 0, targetWidth, targetHeight);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glUseProgram(s.underwaterProgram);
+        glBindVertexArray(s.underwaterVertexArray);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, sourceTexture);
+        glBindSampler(0, s.underwaterSampler);
+        glUniform1i(s.underwaterTextureUniform, 0);
+        glUniform1f(s.underwaterAmountUniform,
+                    std::clamp(underWaterness, 0.0f, 1.0f));
+        glUniform1f(s.underwaterDepthUniform,
+                    std::clamp(waterDepth, 0.0f, 100.0f));
+        UploadMobileColorUniforms(
+            mobileColor, s.underwaterMobileColorModeUniform,
+            s.underwaterContrastMultUniform,
+            s.underwaterContrastAddUniform,
+            s.underwaterRedGradeUniform, s.underwaterGreenGradeUniform,
+            s.underwaterBlueGradeUniform);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (!g_underwaterFirstDrawValidated) {
+            const GLenum error = glGetError();
+            if (error != GL_NO_ERROR) {
+                LOGE("[mobile.color] first copy draw failed: GL error 0x%x",
+                     error);
+                drawOk = false;
+            } else {
+                g_underwaterFirstDrawValidated = true;
+                LOGI("[mobile.color] first copy draw validated target=%dx%d",
+                     targetWidth, targetHeight);
+            }
+        }
+    }
 
     glActiveTexture(GL_TEXTURE0);
     glBindSampler(0, static_cast<GLuint>(restoreState.sampler0));
@@ -2025,10 +2208,9 @@ bool DrawEyeUnderwaterCopy(GLuint sourceTexture,
     glColorMask(restoreState.colorMask[0], restoreState.colorMask[1],
                 restoreState.colorMask[2], restoreState.colorMask[3]);
 
-    if (error != GL_NO_ERROR) {
+    if (!drawOk) {
         g_underwaterRuntimeFailed = true;
-        LOGE("[underwater] graded copy failed GL error=0x%x; linear blit retained",
-             error);
+        LOGE("[mobile.color] graded copy disabled; linear blit retained");
         return false;
     }
     return true;
@@ -2819,6 +3001,11 @@ void ResetStereoEyeTextures() {
         value.store(0.0f, std::memory_order_relaxed);
     g_pendingUnderWaterness.store(0.0f, std::memory_order_relaxed);
     g_pendingWaterDepth.store(0.0f, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_headPoseMutex);
+        g_pendingMobileColor = {};
+        for (auto& colour : g_stereoMobileColor) colour = {};
+    }
     g_stereoSeq.store(-1, std::memory_order_release);
 }
 
@@ -2842,6 +3029,49 @@ void SetUnderwaterState(float underWaterness, float waterDepth) {
              underwater ? 1 : 0,
              static_cast<double>(underWaterness),
              static_cast<double>(waterDepth));
+    }
+}
+
+void SetMobileColorState(const MobileColorState& state) {
+    MobileColorState next = state;
+    if (next.mode != 1 && next.mode != 2) next = {};
+
+    const auto finiteBounded = [](float value) {
+        return std::isfinite(value) && std::abs(value) <= 8.0f;
+    };
+    bool valid = true;
+    float signal = 0.0f;
+    if (next.mode == 1) {
+        for (int i = 0; i < 3; ++i) {
+            valid = valid && finiteBounded(next.contrastMult[i]) &&
+                finiteBounded(next.contrastAdd[i]);
+            signal += std::abs(next.contrastMult[i]);
+        }
+    } else if (next.mode == 2) {
+        for (int i = 0; i < 4; ++i) {
+            valid = valid && finiteBounded(next.redGrade[i]) &&
+                finiteBounded(next.greenGrade[i]) &&
+                finiteBounded(next.blueGrade[i]);
+            signal += std::abs(next.redGrade[i]) +
+                std::abs(next.greenGrade[i]) +
+                std::abs(next.blueGrade[i]);
+        }
+    }
+    if (!valid || (next.mode != 0 && signal < 0.05f)) {
+        LOGW("[mobile.color] rejected invalid retail parameters mode=%d",
+             next.mode);
+        next = {};
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_headPoseMutex);
+        g_pendingMobileColor = next;
+    }
+    static std::atomic<int> lastMode{-1};
+    const int prior = lastMode.exchange(next.mode, std::memory_order_acq_rel);
+    if (prior != next.mode) {
+        LOGI("[mobile.color] compositor mode=%d (0=off 1=contrast 2=grading)",
+             next.mode);
     }
 }
 
@@ -3097,6 +3327,7 @@ void SetStereoEyeTextures(const unsigned int* tex, const unsigned int* depth,
         g_stereoTwoHandVisualState[ws] = g_twoHandVisualState;
         g_stereoScopeState[ws] = scopeaim::Snapshot();
         g_stereoDrivingWheelState[ws] = drivingWheel;
+        g_stereoMobileColor[ws] = g_pendingMobileColor;
         g_stereoThrowableTrajectory[ws][0] = g_throwableTrajectory[0];
         g_stereoThrowableTrajectory[ws][1] = g_throwableTrajectory[1];
         laserHand = g_weaponHand.load(std::memory_order_relaxed);
@@ -3509,6 +3740,16 @@ void PanelText(const char* text, int centreX, int y, int scale,
                         for (int px = 0; px < scale; ++px)
                             PanelPixel(x + col * scale + px, y + row * scale + py, r, gr, b, 255);
     }
+}
+
+// Like PanelText, but drops the glyph scale until the line fits the panel
+// width (long strings such as URLs would otherwise run off both edges).
+void PanelTextFit(const char* text, int centreX, int y, int maxScale,
+                  unsigned char r, unsigned char gr, unsigned char b) {
+    const int len = static_cast<int>(std::strlen(text));
+    int scale = maxScale;
+    while (scale > 1 && len * 6 * scale > kPanelW - 8) --scale;
+    PanelText(text, centreX, y, scale, r, gr, b);
 }
 
 // Rebuild the profiler from the same approximately-1Hz aggregates written to the
@@ -3932,36 +4173,36 @@ void BuildAboutMenu() {
     PanelClear();
     const int cx = kPanelW / 2;
     const bool firstRun = g_aboutFirstRun.load(std::memory_order_relaxed);
-    PanelText(firstRun ? "WELCOME TO SAN ANDREAS VR"
-                       : "ABOUT SAN ANDREAS VR",
-              cx, 22, 4, 100, 225, 255);
+    PanelTextFit(firstRun ? "WELCOME TO SAN ANDREAS VR"
+                          : "ABOUT SAN ANDREAS VR",
+                 cx, 22, 3, 100, 225, 255);
     char versionLine[64];
     std::snprintf(versionLine, sizeof(versionLine),
-                  "VERSION %s ALPHA - NOT FOR SALE", kModVersion);
-    PanelText(versionLine, cx, 58, 2, 170, 190, 210);
+                  "VERSION %s ALPHA - NOT FOR SALE", kModVersionShown);
+    PanelTextFit(versionLine, cx, 54, 2, 170, 190, 210);
     static const char* const kLines[] = {
-        "OPEN THE VR MENU: HOLD BOTH GRIPS + MENU (OR Y)",
-        "BUTTON REMAP + CONTROL TIPS LIVE IN MENU > CONTROLS",
-        "CHOOSE IMMERSIVE DRIVING IN VEHICLE SETTINGS",
-        "CALIBRATE WEAPONS IF A MODEL OR GRIP IS MISALIGNED",
-        "PROMPTS: TAP R2 = YES   L2 = NO   HOLD R2 = TAP-AND-HOLD",
-        "RECRUIT GANG: LOOK AT A GROVE PED AND HOLD R2",
-        "RECRUITING NEEDS RESPECT - EARN IT OR USE THE CHEAT",
+        "VR MENU: HOLD BOTH GRIPS + MENU (OR Y)",
+        "BUTTON REMAP AND TIPS: MENU > CONTROLS",
+        "IMMERSIVE DRIVING: VEHICLE SETTINGS",
+        "CALIBRATE WEAPONS IF A GRIP LOOKS OFF",
+        "PROMPTS: TAP R2 YES  L2 NO  HOLD R2",
+        "RECRUIT: LOOK AT GROVE PED + HOLD R2",
+        "RECRUITING NEEDS RESPECT (OR CHEAT)",
         "L3+R3 RECENTERS THE VIEW",
-        "THE MOD IS IN ACTIVE DEVELOPMENT - EXPECT ROUGH EDGES",
+        "ACTIVE DEVELOPMENT - EXPECT ROUGH EDGES",
         "DISCUSSION: FLAT2VR DISCORD",
         "discord.com/channels/747967102895390741/1540234546182750228",
         "PRESS ANY BUTTON TO CLOSE",
     };
     const int count = static_cast<int>(sizeof(kLines) / sizeof(kLines[0]));
-    const int top = 100, rowH = 34;
+    const int top = 92, rowH = 32;
     for (int i = 0; i < count; ++i) {
         const bool close = i == count - 1;
         const bool link = i == count - 2;
-        PanelText(kLines[i], cx, top + i * rowH, 2,
-                  close ? 255 : (link ? 140 : 210),
-                  close ? 205 : (link ? 200 : 225),
-                  close ? 80 : (link ? 255 : 235));
+        PanelTextFit(kLines[i], cx, top + i * rowH, 2,
+                     close ? 255 : (link ? 140 : 210),
+                     close ? 205 : (link ? 200 : 225),
+                     close ? 80 : (link ? 255 : 235));
     }
 }
 
@@ -3987,10 +4228,11 @@ void BuildControlsTipsMenu() {
         "RECRUITING NEEDS RESPECT (MISSIONS OR",
         "  THE MAX RESPECT CHEAT)",
         "HORN: PRESS PALM ON THE WHEEL HUB",
+        "ANSWER PHONE: BOTH GRIPS + R2",
         "L3+R3 RECENTER   GRIPS+R3 CAMERA VIEW",
     };
     const int count = static_cast<int>(sizeof(kTips) / sizeof(kTips[0]));
-    const int top = 56, rowH = 26;
+    const int top = 48, rowH = 23;
     for (int i = 0; i < count; ++i)
         PanelText(kTips[i], cx, top + i * rowH, 2, 210, 225, 235);
     PanelText("A / B BACK", cx, kPanelH - 18, 2, 150, 185, 150);
@@ -4000,8 +4242,8 @@ void BuildControlsMenu() {
     PanelClear();
     const int cx = kPanelW / 2;
     PanelText("CONTROLS", cx, 20, 5, 100, 225, 255);
-    PanelText("ON FOOT ONLY - VEHICLES KEEP THE SHIPPED LAYOUT",
-              cx, 56, 2, 150, 185, 150);
+    PanelTextFit("ON FOOT ONLY - VEHICLES KEEP DEFAULTS",
+                 cx, 56, 2, 150, 185, 150);
     char rows[7][64];
     std::snprintf(rows[0], sizeof(rows[0]), "LAYOUT  < %s >",
                   locomotion::ControlsLayoutName());
@@ -4029,23 +4271,15 @@ void BuildMainMenu() {
     const int cx = kPanelW / 2;
     PanelText("VR MENU", cx, 20, 5, 100, 225, 255);
     char versionLine[32];
-    std::snprintf(versionLine, sizeof(versionLine), "VERSION %s", kModVersion);
+    std::snprintf(versionLine, sizeof(versionLine), "VERSION %s", kModVersionShown);
     PanelText(versionLine, cx, 52, 2, 120, 190, 210);
-    char laserRow[40];
-    std::snprintf(laserRow, sizeof(laserRow), "WEAPON LASER   < %s >",
-                  calib::LaserEnabled() ? "ON" : "OFF");
-    char markerRow[48];
-    std::snprintf(markerRow, sizeof(markerRow), "HOLSTER MARKERS   < %s >",
-                  holster::GripMarkersEnabled() ? "ON" : "OFF");
     char handSkinRow[48];
     std::snprintf(handSkinRow, sizeof(handSkinRow), "HAND SKIN   < %s >",
                   appearance::HandSkinName());
     const char* kItems[] = {
-        laserRow,
         "WEAPON CALIBRATION",
         "HOLSTER CALIBRATION",
         "HOLSTER LOADOUT",
-        markerRow,
         "VEHICLE SETTINGS",
         "LOCOMOTION",
         "HUD",
@@ -4056,14 +4290,14 @@ void BuildMainMenu() {
         "ABOUT",
         "CLOSE"
     };
-    const int N   = 14;
+    const int N   = 12;
     const int sel = g_mainSel.load(std::memory_order_relaxed);
     const int top = 82, rowH = 34;
     for (int i = 0; i < N; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
-        const bool submenu=i==1||i==2||i==3||i==5||i==6||i==7||
-                           i==9||i==10||i==11||i==12;
+        const bool submenu=i==0||i==1||i==2||i==3||i==4||i==5||
+                           i==7||i==8||i==9||i==10;
         if (submenu)
             PanelText(kItems[i],cx,y,2,i==sel?255:100,
                       i==sel?235:225,i==sel?120:255);
@@ -4125,8 +4359,8 @@ void BuildHolsterMenu() {
     PanelText("HOLSTER LOADOUT", cx, 14, 4, 100, 225, 255);
     PanelText("OWNED + UNASSIGNED CATEGORIES ONLY", cx, 48, 2, 150, 190, 210);
     const int sel = g_holsterMenuSel.load(std::memory_order_relaxed);
-    const int rows = holster::PointCount() + 3;
-    const int top = 82, rowH = 46;
+    const int rows = holster::PointCount() + 4;
+    const int top = 74, rowH = 38;
     for (int i = 0; i < rows; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(18, y - 4, kPanelW - 18, y + 20, 120, 40, 110, 235);
@@ -4139,6 +4373,9 @@ void BuildHolsterMenu() {
             std::snprintf(row, sizeof(row), "GRIP LOCK   < %s >",
                           holster::GripLockEnabled() ? "ON" : "OFF");
         } else if (i == holster::PointCount() + 2) {
+            std::snprintf(row, sizeof(row), "HOLSTER MARKERS   < %s >",
+                          holster::GripMarkersEnabled() ? "ON" : "OFF");
+        } else if (i == holster::PointCount() + 3) {
             std::snprintf(row, sizeof(row), "BACK");
         } else {
             const int slot = holster::PointSlot(i);
@@ -4149,7 +4386,7 @@ void BuildHolsterMenu() {
         PanelText(row, cx, y, 2, c, c, (i == sel) ? 120 : c);
     }
     const char* hint = "L2/R2 CHOOSE   A CLEAR POINT   B BACK";
-    if (sel == holster::PointCount() || sel == holster::PointCount() + 1)
+    if (sel >= holster::PointCount() && sel <= holster::PointCount() + 2)
         hint = "A/B BACK";
     else if (holster::IsPointFixed(sel))
         hint = "THROWABLE IS FIXED   B BACK";
@@ -4166,18 +4403,20 @@ void BuildGraphicsMenu() {
     const int sel = g_gfxSel.load(std::memory_order_relaxed);
     const int cpu = g_cpuPerfIdx.load(std::memory_order_relaxed);
     const int gpu = g_gpuPerfIdx.load(std::memory_order_relaxed);
-    char rows[7][64];
+    char rows[8][64];
     std::snprintf(rows[0], sizeof(rows[0]), "RENDER SCALE  < %d%% >",
                   vrcam::GetRenderScalePercent());
     std::snprintf(rows[1], sizeof(rows[1]), "CPU  < %s >", kPerfNames[cpu]);
     std::snprintf(rows[2], sizeof(rows[2]), "GPU  < %s >", kPerfNames[gpu]);
     std::snprintf(rows[3], sizeof(rows[3]), "NEON SIGNS  < %s >",
                   vrcam::AreNeonSignsEnabled() ? "ON" : "OFF");
-    std::snprintf(rows[4], sizeof(rows[4]), "DRAW DISTANCES");
-    std::snprintf(rows[5], sizeof(rows[5]), "RESET DEFAULTS");
-    std::snprintf(rows[6], sizeof(rows[6]), "BACK");
-    const int top = 82, rowH = 55;
-    for (int i = 0; i < 7; ++i) {
+    std::snprintf(rows[4], sizeof(rows[4]), "COLOR GRADING  < %s >",
+                  vrcam::IsColorGradingEnabled() ? "ON" : "OFF");
+    std::snprintf(rows[5], sizeof(rows[5]), "DRAW DISTANCES");
+    std::snprintf(rows[6], sizeof(rows[6]), "RESET DEFAULTS");
+    std::snprintf(rows[7], sizeof(rows[7]), "BACK");
+    const int top = 82, rowH = 48;
+    for (int i = 0; i < 8; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
         const int c = (i == sel) ? 255 : 200;
@@ -4692,9 +4931,9 @@ void BuildCalibMenu() {
     PanelText(hdr, cx, 44, 2, 255, 200, 120);
     PanelText("LEFT USES THE SAME MIRRORED PROFILE", cx, 64, 2, 145, 185, 205);
 
-    // 22 rows (0..21) in a scrolling window that keeps the selection centred, so the
+    // 23 rows (0..22) in a scrolling window that keeps the selection centred, so the
     // fixed panel stays readable at arm's length instead of shrinking the font.
-    constexpr int kRows = 22, kWin = 9;
+    constexpr int kRows = 23, kWin = 9;
     int start = sel - kWin / 2;
     if (start < 0)              start = 0;
     if (start > kRows - kWin)   start = kRows - kWin;
@@ -4707,14 +4946,17 @@ void BuildCalibMenu() {
         if (r == sel) PanelFillRect(18, y - 3, kPanelW - 18, y + 18, 120, 40, 110, 235);
         const int c = (r == sel) ? 255 : 200;
         char row[64];
-        if (r == 21) {
+        if (r == 22) {
             std::snprintf(row, sizeof(row), "BACK");
-        } else if (r == 20) {
+        } else if (r == 21) {
             std::snprintf(row, sizeof(row), "SAVE LASER   < %s >",
                           savr::calib::LaserLocked(type) ? "SAVED" : "PRESS A");
-        } else if (r == 19) {
+        } else if (r == 20) {
             std::snprintf(row, sizeof(row), "LASER BEAM   < %s >",
                           savr::calib::LaserModeName(type));
+        } else if (r == 19) {
+            std::snprintf(row, sizeof(row), "WEAPON LASER   < %s >",
+                          savr::calib::LaserEnabled() ? "ON" : "OFF");
         } else {
             const int field = r;                           // 0..18
             if (field == savr::calib::F_SUP_STYLE) {
@@ -4751,9 +4993,13 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
     const bool graphicsDistanceMenu =
         g_gfxDistanceActive.load(std::memory_order_relaxed);
     const bool cheatMenu = g_menuVisible.load(std::memory_order_relaxed);
+    const bool controlsMenuA = g_controlsMenuActive.load(std::memory_order_relaxed);
+    const bool controlsTipsA = g_controlsTipsActive.load(std::memory_order_relaxed);
+    const bool aboutMenuA = g_aboutActive.load(std::memory_order_relaxed);
     const bool profilerPanel = !(mainMenu || calibMenu || holsterCalibMenu ||
         holsterMenu || drivingMenu || drivingCalibMenu || locomotionMenu || hudMenu ||
-        graphicsMenu || graphicsDistanceMenu || cheatMenu);
+        graphicsMenu || graphicsDistanceMenu || cheatMenu ||
+        controlsMenuA || controlsTipsA || aboutMenuA);
 
     std::uint64_t contentRevision = 0;
     if (profilerPanel) {
@@ -6920,9 +7166,6 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
     const float waterDepth = std::clamp(
         g_stereoWaterDepth[set].load(std::memory_order_relaxed),
         0.0f, 100.0f);
-    const bool shaderCopyMayRun =
-        fxaaStats.requested || underWaterness > 0.001f;
-
     // The pose these pixels were rendered at — the quad is anchored here so the
     // compositor can reproject to the live head pose (kills rotation ghosting).
     XrPosef rp{};
@@ -6931,6 +7174,7 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
     TwoHandVisualState bakedTwoHand{};
     scopeaim::VisualState bakedScope{};
     driving::WheelVisualState drivingWheel{};
+    MobileColorState mobileColor{};
     ThrowableTrajectory throwableTrajectory[2]{};
     unsigned int bakedWeaponHandMask = 0;
     bool haveRenderPose = false;
@@ -6944,10 +7188,13 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
         bakedTwoHand   = g_stereoTwoHandVisualState[set];
         bakedScope     = g_stereoScopeState[set];
         drivingWheel   = g_stereoDrivingWheelState[set];
+        mobileColor    = g_stereoMobileColor[set];
         throwableTrajectory[0] = g_stereoThrowableTrajectory[set][0];
         throwableTrajectory[1] = g_stereoThrowableTrajectory[set][1];
         bakedWeaponHandMask = g_stereoWeaponHandMask[set];
     }
+    const bool shaderCopyMayRun = fxaaStats.requested ||
+        underWaterness > 0.001f || mobileColor.mode != 0;
     // A projection layer MUST carry the pose its pixels were rendered at, or the
     // reprojection is wrong (this was the old "projection layer trembles" bug).
     // Until we have one, fall back to the theater screen rather than guess.
@@ -7017,10 +7264,12 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
             g_stereoEyeTex[set][e].load(std::memory_order_relaxed);
         const bool usedFxaa = fxaaStats.requested &&
             DrawEyeFxaa(sourceTexture, ew, eh, chain.width, chain.height,
-                        underWaterness, waterDepth, fxaaGlState, fxaaStats);
+                        underWaterness, waterDepth, mobileColor,
+                        fxaaGlState, fxaaStats);
         const bool usedUnderwaterCopy = !usedFxaa &&
             DrawEyeUnderwaterCopy(sourceTexture, chain.width, chain.height,
-                                  underWaterness, waterDepth, fxaaGlState);
+                                  underWaterness, waterDepth, mobileColor,
+                                  fxaaGlState);
         // Bind the source only after FXAA has finished sampling it. This keeps
         // the shader path free of attached-texture ambiguity while preserving
         // the proven complete READ FBO required by the late-hand depth copy.
@@ -7180,10 +7429,24 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
 
     SyncInput(frameState.predictedDisplayTime);
 
-    // The grips+A FPS/debug profiler chord is DISABLED for players: the
-    // panel is a developer tool and the chord was too easy to hit by
-    // accident. The rendering machinery stays; re-enable here for profiling.
+#ifdef SAVR_DEV
+    // Developer builds: the Vice City grips+A chord toggles the FPS panel.
+    {
+        InputState in{};
+        GetInput(in);
+        const bool chord = in.grip[0] >= 0.75f && in.grip[1] >= 0.75f && in.a;
+        static bool chordDown = false;
+        if (chord && !chordDown) {
+            s.debugVisible = !s.debugVisible;
+            LOGI("[vr] debug panel %s", s.debugVisible ? "ON" : "OFF");
+        }
+        chordDown = chord;
+    }
+#else
+    // Player builds: the FPS/debug panel is a developer tool; the chord was
+    // too easy to hit by accident. The rendering machinery stays for dev use.
     s.debugVisible = false;
+#endif
 
     // Turn the GameThread frame counter into a rate every half second (using the
     // predicted display time as a monotonic clock in nanoseconds).
@@ -7341,7 +7604,10 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
              g_locomotionActive.load(std::memory_order_relaxed) ||
              g_hudActive.load(std::memory_order_relaxed) ||
              g_gfxActive.load(std::memory_order_relaxed) ||
-             g_gfxDistanceActive.load(std::memory_order_relaxed)) && PresentDebugPanel(debugQuad)) {
+             g_gfxDistanceActive.load(std::memory_order_relaxed) ||
+             g_controlsMenuActive.load(std::memory_order_relaxed) ||
+             g_controlsTipsActive.load(std::memory_order_relaxed) ||
+             g_aboutActive.load(std::memory_order_relaxed)) && PresentDebugPanel(debugQuad)) {
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&debugQuad);
         }
     }

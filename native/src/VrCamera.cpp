@@ -215,10 +215,15 @@ constexpr float kAircraftLodSupplementalMaxRadiusM =
     kAircraftLodMaxGroundRadiusM;
 constexpr int kAircraftLodSupplementalSectorLimit = 320;
 // Stock ScanBig stamps a root before deciding whether its heading is eligible
-// for streaming. Capture a wider bounded set so entries that stock itself did
-// request can be compacted away before the radial pass. Actual new requests
-// remain limited by the smaller per-frame budget below.
-constexpr int kAircraftLodPendingCaptureLimit = 32;
+// for streaming.  A flat first-N array therefore inherits stock's HMD order:
+// roots behind the pilot reach the later radial pass only after the forward
+// entries have occupied the capture buffer.  Keep one pending cheap authored
+// root per world-space angular/radial cell instead.  The request budget below
+// is unchanged; only its coverage becomes yaw independent.
+constexpr int kAircraftLodPendingAngularBins = 12;
+constexpr int kAircraftLodPendingRadialBins = 3;
+constexpr int kAircraftLodPendingCaptureLimit =
+    kAircraftLodPendingAngularBins * kAircraftLodPendingRadialBins;
 constexpr int kAircraftLodSupplementalRequestBudget = 4;
 constexpr int kAircraftLodSupplementalQueueLimit = 8;
 constexpr float kAircraftBigSectorM = 200.0f;
@@ -333,13 +338,19 @@ constexpr float kAircraftOrdinaryPromotionThresholdEpsilonM = 2.0f;
 // slots inside the same fixed inner quota.
 constexpr float kAircraftOrdinaryFallbackBuildingMinBoundRadiusM = 5.0f;
 // At altitude, retail's 100 m streaming-priority sphere leaves many otherwise
-// eligible rootless building models non-resident inside the 300 m ordinary
-// footprint. Capture only substantial forward BUILDING leaves already seen by
-// retail, then issue at most two asynchronous requests after authored roots had
-// first claim on the global queue. This never force-renders an unloaded model.
+// eligible rootless building models non-resident. Capture substantial BUILDING
+// leaves from both retail and the already-bounded ordinary radial enumeration,
+// distribute them across world-space cells, then issue at most two asynchronous
+// requests after authored roots had first claim on the global queue. This never
+// force-renders an unloaded model and does not increase the request budget.
 constexpr float kAircraftOrdinaryPrefetchMinGroundDistanceM = 150.0f;
-constexpr int kAircraftOrdinaryPrefetchCaptureLimit = 32;
+constexpr int kAircraftOrdinaryPrefetchAngularBins = 12;
+constexpr int kAircraftOrdinaryPrefetchRadialBins = 3;
+constexpr int kAircraftOrdinaryPrefetchCaptureLimit =
+    kAircraftOrdinaryPrefetchAngularBins *
+    kAircraftOrdinaryPrefetchRadialBins;
 constexpr int kAircraftOrdinaryPrefetchRequestBudget = 2;
+constexpr int kAircraftOrdinaryOmniPrefetchRequestBudget = 1;
 constexpr int kAircraftOrdinaryPrefetchQueueLimit = 8;
 // A one-child authored parent forced by the aircraft root shell can otherwise
 // coexist with its fully opaque detail child in the ordinary render list.  On
@@ -415,6 +426,12 @@ static_assert(kAircraftRetainedRootCaptureLimit <=
               kRetailVisiblePointerCapacity);
 static_assert(kAircraftLodPendingCaptureLimit >=
               kAircraftLodSupplementalRequestBudget);
+static_assert(kAircraftLodPendingCaptureLimit == 36);
+static_assert(kAircraftOrdinaryPrefetchCaptureLimit == 36);
+static_assert(kAircraftOrdinaryPrefetchCaptureLimit >=
+              kAircraftOrdinaryPrefetchRequestBudget);
+static_assert(kAircraftOrdinaryOmniPrefetchRequestBudget <=
+              kAircraftOrdinaryPrefetchRequestBudget);
 
 // FOV 105 makes retail 2.11 store GenerationDistMultiplier=0.583. Traffic is
 // then spawned at 160*G (~93 m), while off-screen ambient cars can take a hard
@@ -515,6 +532,7 @@ std::mutex g_graphicsSettingsSaveMutex;
 std::array<std::atomic<int>, GFXDIST_COUNT> g_graphicsDistanceChoice{};
 std::atomic<int> g_requestedRenderScaleIndex{kDefaultRenderScaleIndex};
 std::atomic<bool> g_neonSignsEnabled{true};
+std::atomic<bool> g_colorGradingEnabled{true};
 std::atomic<std::uint32_t> g_neonSignsSeenMask{0};
 int g_currentRenderScaleIndex = kDefaultRenderScaleIndex;
 
@@ -546,6 +564,7 @@ int NearestDistanceChoice(int field, int metres) {
 void LoadGraphicsSettings() {
     int renderScale = kDefaultRenderScaleIndex;
     bool neonSigns = true;
+    bool colorGrading = true;
     std::array<int, GFXDIST_COUNT> choices{};
     for (int i = 0; i < GFXDIST_COUNT; ++i)
         choices[i] = kGraphicsDistanceSpecs[i].defaultChoice;
@@ -564,6 +583,10 @@ void LoadGraphicsSettings() {
                 neonSigns = value != 0;
                 continue;
             }
+            if (std::strcmp(key, "ColorGrading") == 0) {
+                colorGrading = value != 0;
+                continue;
+            }
             for (int i = 0; i < GFXDIST_COUNT; ++i) {
                 if (std::strcmp(key, kGraphicsDistanceSpecs[i].key) == 0) {
                     choices[i] = NearestDistanceChoice(i, value);
@@ -578,6 +601,7 @@ void LoadGraphicsSettings() {
     g_currentRenderScaleIndex = renderScale;
     g_requestedRenderScaleIndex.store(renderScale, std::memory_order_release);
     g_neonSignsEnabled.store(neonSigns, std::memory_order_release);
+    g_colorGradingEnabled.store(colorGrading, std::memory_order_release);
     for (int i = 0; i < GFXDIST_COUNT; ++i) {
         g_graphicsDistanceChoice[i].store(
             ClampDistanceChoice(i, choices[i]), std::memory_order_release);
@@ -636,6 +660,9 @@ void SaveGraphicsSettings() {
         bool ok = std::fprintf(file, "RenderScale=%d\n", renderScale) >= 0;
         ok = std::fprintf(file, "Neon=%d\n",
                           g_neonSignsEnabled.load(std::memory_order_acquire)
+                              ? 1 : 0) >= 0 && ok;
+        ok = std::fprintf(file, "ColorGrading=%d\n",
+                          g_colorGradingEnabled.load(std::memory_order_acquire)
                               ? 1 : 0) >= 0 && ok;
         for (int i = 0; i < GFXDIST_COUNT; ++i) {
             ok = std::fprintf(file, "%s=%d\n", kGraphicsDistanceSpecs[i].key,
@@ -5034,6 +5061,7 @@ struct AircraftOrdinaryHorizonCounters {
     int resultStream{};
     int resultOther{};
     int unloadedRootlessForward{};
+    int unloadedRootlessOmni{};
     int prefetchCandidates{};
     int prefetchUnique{};
     int prefetchDedupes{};
@@ -5045,6 +5073,9 @@ struct AircraftOrdinaryHorizonCounters {
     int prefetchBudgetLimited{};
     int prefetchResidentBeforeRequest{};
     int prefetchStateAnomalies{};
+    int prefetchOmniRequestCalls{};
+    int prefetchOmniEnqueues{};
+    int prefetchOmniBudgetLimited{};
 };
 thread_local AircraftOrdinaryHorizonCounters
     g_aircraftOrdinaryHorizon{};
@@ -5208,11 +5239,21 @@ thread_local std::array<AircraftOrdinarySectorStampSnapshot,
 struct AircraftOrdinaryPrefetchCandidate {
     int modelId{-1};
     float horizontalDistanceM{};
+    float boundRadiusM{};
+    float rawDrawDistanceM{};
+    std::uint8_t angularBin{};
+    std::uint8_t radialBin{};
+    bool stockObserved{};
+    bool radialObserved{};
 };
 thread_local std::array<AircraftOrdinaryPrefetchCandidate,
                         kAircraftOrdinaryPrefetchCaptureLimit>
     g_aircraftOrdinaryPrefetchCandidates{};
 thread_local int g_aircraftOrdinaryPrefetchCandidateCount = 0;
+// The world-space cursor survives frame resets. Even when only one streaming
+// slot is free, consecutive frames therefore continue around the aircraft
+// instead of restarting in the sector that retail happened to visit first.
+thread_local int g_aircraftOrdinaryPrefetchRequestCursor = 0;
 struct AircraftSingleChildHandoffCounters {
     int roots{};
     int forced{};
@@ -5254,9 +5295,24 @@ thread_local int g_aircraftOpaqueChildNearSkips = 0;
 thread_local int g_aircraftOpaqueChildFadeSkips = 0;
 thread_local float g_aircraftOpaqueChildCutoverM =
     kAircraftOpaqueChildMinimumExclusiveDistanceM;
-thread_local std::array<int, kAircraftLodPendingCaptureLimit>
-    g_aircraftLodPendingModels{};
+struct AircraftLodPendingRequest {
+    int modelId{-1};
+    float distanceSq{};
+    std::uint8_t angularBin{};
+    std::uint8_t radialBin{};
+    bool supplementalObserved{};
+};
+thread_local std::array<AircraftLodPendingRequest,
+                        kAircraftLodPendingCaptureLimit>
+    g_aircraftLodPendingRequests{};
 thread_local int g_aircraftLodPendingModelCount = 0;
+// This persistent cursor walks all 12 azimuths x 3 rings while keeping the
+// established four RequestModel calls per frame.  Every successful request
+// advances it, so even one free streaming slot cannot repeatedly restart at
+// the same forward cells while the aircraft is moving.
+thread_local int g_aircraftLodPendingRequestCursor = 0;
+thread_local float g_aircraftLodPendingGroundRadiusM =
+    kAircraftLodBaseGroundRadiusM;
 std::atomic<bool> g_linkedLodPrefetchActive{false};
 std::atomic<bool> g_vehicleLodSampleHookActive{false};
 std::atomic<bool> g_vehicleLodOverrideActive{false};
@@ -6799,7 +6855,7 @@ bool DescribeAircraftOrdinaryRadialCandidate(
         AircraftOrdinaryRadialCandidateInfo* infoOut) {
     if (!entity || !modelInfo || !infoOut || !timeInRange ||
         !g_aircraftOrdinaryHorizonScanActive || !IsKnownCullOwnerThread() ||
-        !g.TheCamera || !g.CModelInfo_ms_modelInfoPtrs ||
+        !g.LoadBase || !g.TheCamera || !g.CModelInfo_ms_modelInfoPtrs ||
         !std::isfinite(g_aircraftOrdinaryRadialMaxGroundM) ||
         g_aircraftOrdinaryRadialMaxGroundM <= 0.0f ||
         !std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) ||
@@ -7227,11 +7283,15 @@ AircraftOrdinaryHorizonClass ClassifyAircraftOrdinaryOuter(
 }
 
 void CaptureAircraftOrdinaryPrefetchCandidate(
-        const void* entity, const void* modelInfo, bool timeInRange) {
+        const void* entity, const void* modelInfo, bool timeInRange,
+        bool directRadialScan) {
+    const bool stockPhase =
+        g_visibilityScanPhase == 1 || g_visibilityScanPhase == 2;
     if (!g_aircraftOrdinaryHorizonScanActive || !entity || !modelInfo ||
         !timeInRange || !IsKnownCullOwnerThread() ||
-        (g_visibilityScanPhase != 1 && g_visibilityScanPhase != 2) ||
-        !g.TheCamera || !g.CModelInfo_ms_modelInfoPtrs ||
+        (!directRadialScan && !stockPhase) ||
+        (directRadialScan && !g_aircraftOrdinaryRadialSelectionActive) ||
+        !g.LoadBase || !g.TheCamera || !g.CModelInfo_ms_modelInfoPtrs ||
         !g.CStreaming_ms_aInfoForModel) {
         return;
     }
@@ -7262,7 +7322,12 @@ void CaptureAircraftOrdinaryPrefetchCandidate(
     }
     const auto* const modelBytes =
         static_cast<const std::uint8_t*>(modelInfo);
-    if (*reinterpret_cast<void* const*>(modelBytes + 0x40) != nullptr) {
+    const std::uintptr_t modelVptr =
+        *reinterpret_cast<const std::uintptr_t*>(modelBytes);
+    if (NeonSignModelBit(modelId) >= 0 ||
+        modelVptr == g.LoadBase + kRetailTimeModelInfoVptrOffset ||
+        modelVptr == g.LoadBase + kRetailLodTimeModelInfoVptrOffset ||
+        *reinterpret_cast<void* const*>(modelBytes + 0x40) != nullptr) {
         return;
     }
     const float rawDrawDistance = *reinterpret_cast<const float*>(
@@ -7290,23 +7355,36 @@ void CaptureAircraftOrdinaryPrefetchCandidate(
     const float horizontalDistance = std::hypot(dx, dy);
     const float slantDistance = std::sqrt(std::max(
         0.0f, dx * dx + dy * dy + dz * dz));
+    float maximumGroundDistance =
+        kAircraftOrdinaryHorizonMaxGroundDistanceM;
+    if (g_aircraftOrdinaryRadialSelectionActive &&
+        std::isfinite(g_aircraftOrdinaryRadialMaxGroundM)) {
+        maximumGroundDistance = std::clamp(
+            g_aircraftOrdinaryRadialMaxGroundM,
+            kAircraftOrdinaryHorizonMaxGroundDistanceM,
+            kAircraftOrdinaryOuterMaxGroundDistanceM);
+    }
     if (!std::isfinite(horizontalDistance) ||
         !std::isfinite(slantDistance) ||
         horizontalDistance + boundRadius <
             kAircraftOrdinaryPrefetchMinGroundDistanceM ||
         horizontalDistance - boundRadius >
-            kAircraftOrdinaryHorizonMaxGroundDistanceM ||
+            maximumGroundDistance ||
         slantDistance + boundRadius <
             kAircraftOrdinaryHorizonMinSlantDistanceM ||
         !std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) ||
         g_aircraftOrdinaryHorizonMaxSlantM <= 0.0f ||
         slantDistance - boundRadius >
             g_aircraftOrdinaryHorizonMaxSlantM ||
-        !AircraftHorizontalConeAllows(dx, dy, boundRadius)) {
+        (!directRadialScan &&
+         !AircraftHorizontalConeAllows(dx, dy, boundRadius))) {
         return;
     }
 
-    ++g_aircraftOrdinaryHorizon.unloadedRootlessForward;
+    if (directRadialScan)
+        ++g_aircraftOrdinaryHorizon.unloadedRootlessOmni;
+    else
+        ++g_aircraftOrdinaryHorizon.unloadedRootlessForward;
     ++g_aircraftOrdinaryHorizon.prefetchCandidates;
     constexpr std::size_t kStreamingInfoStride = 0x14;
     constexpr std::size_t kStreamingStateOffset = 0x10;
@@ -7322,45 +7400,77 @@ void CaptureAircraftOrdinaryPrefetchCandidate(
         return;
     }
 
-    for (int i = 0; i < g_aircraftOrdinaryPrefetchCandidateCount; ++i) {
-        auto& candidate = g_aircraftOrdinaryPrefetchCandidates[
-            static_cast<std::size_t>(i)];
+    for (AircraftOrdinaryPrefetchCandidate& candidate :
+         g_aircraftOrdinaryPrefetchCandidates) {
         if (candidate.modelId != modelId) continue;
         candidate.horizontalDistanceM = std::min(
             candidate.horizontalDistanceM, horizontalDistance);
+        candidate.boundRadiusM = std::max(
+            candidate.boundRadiusM, boundRadius);
+        candidate.rawDrawDistanceM = std::max(
+            candidate.rawDrawDistanceM, rawDrawDistance);
+        candidate.stockObserved =
+            candidate.stockObserved || !directRadialScan;
+        candidate.radialObserved =
+            candidate.radialObserved || directRadialScan;
         ++g_aircraftOrdinaryHorizon.prefetchDedupes;
         return;
     }
-    ++g_aircraftOrdinaryHorizon.prefetchUnique;
-    if (g_aircraftOrdinaryPrefetchCandidateCount <
-            kAircraftOrdinaryPrefetchCaptureLimit) {
-        g_aircraftOrdinaryPrefetchCandidates[
-            static_cast<std::size_t>(
-                g_aircraftOrdinaryPrefetchCandidateCount++)] = {
-                    .modelId = modelId,
-                    .horizontalDistanceM = horizontalDistance,
-                };
-        return;
-    }
 
-    ++g_aircraftOrdinaryHorizon.prefetchCaptureLimit;
-    int farthestIndex = 0;
-    for (int i = 1; i < g_aircraftOrdinaryPrefetchCandidateCount; ++i) {
-        if (g_aircraftOrdinaryPrefetchCandidates[
-                static_cast<std::size_t>(i)].horizontalDistanceM >
-            g_aircraftOrdinaryPrefetchCandidates[
-                static_cast<std::size_t>(farthestIndex)].horizontalDistanceM) {
-            farthestIndex = i;
-        }
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kTau = 2.0f * kPi;
+    float angle = std::atan2(dy, dx) + kPi;
+    if (!std::isfinite(angle)) return;
+    if (angle >= kTau) angle = std::nextafter(kTau, 0.0f);
+    const int angularBin = std::clamp(
+        static_cast<int>(angle / kTau *
+            kAircraftOrdinaryPrefetchAngularBins),
+        0, kAircraftOrdinaryPrefetchAngularBins - 1);
+    const float radialSpan = std::max(
+        1.0f, maximumGroundDistance -
+            kAircraftOrdinaryPrefetchMinGroundDistanceM);
+    const int radialBin = std::clamp(
+        static_cast<int>((horizontalDistance -
+            kAircraftOrdinaryPrefetchMinGroundDistanceM) / radialSpan *
+            kAircraftOrdinaryPrefetchRadialBins),
+        0, kAircraftOrdinaryPrefetchRadialBins - 1);
+    const int cell = angularBin * kAircraftOrdinaryPrefetchRadialBins +
+        radialBin;
+    AircraftOrdinaryPrefetchCandidate& candidate =
+        g_aircraftOrdinaryPrefetchCandidates[static_cast<std::size_t>(cell)];
+
+    ++g_aircraftOrdinaryHorizon.prefetchUnique;
+    if (candidate.modelId < 0) {
+        ++g_aircraftOrdinaryPrefetchCandidateCount;
+    } else {
+        ++g_aircraftOrdinaryHorizon.prefetchCaptureLimit;
+        // The original HMD-directed witness owns a cell whenever one exists.
+        // The supplemental 360-degree scan may fill only otherwise empty cells;
+        // it must not evict the proven forward prefetch just for being larger.
+        const bool sourcePreferred = !directRadialScan &&
+            !candidate.stockObserved;
+        const bool sourceRejected = directRadialScan &&
+            candidate.stockObserved;
+        const bool betterCoverage = sourcePreferred ||
+            (!sourceRejected &&
+             (boundRadius > candidate.boundRadiusM ||
+              (boundRadius == candidate.boundRadiusM &&
+               rawDrawDistance > candidate.rawDrawDistanceM) ||
+              (boundRadius == candidate.boundRadiusM &&
+               rawDrawDistance == candidate.rawDrawDistanceM &&
+               horizontalDistance < candidate.horizontalDistanceM)));
+        if (!betterCoverage) return;
     }
-    if (horizontalDistance < g_aircraftOrdinaryPrefetchCandidates[
-            static_cast<std::size_t>(farthestIndex)].horizontalDistanceM) {
-        g_aircraftOrdinaryPrefetchCandidates[
-            static_cast<std::size_t>(farthestIndex)] = {
-                .modelId = modelId,
-                .horizontalDistanceM = horizontalDistance,
-            };
-    }
+    candidate = {
+        .modelId = modelId,
+        .horizontalDistanceM = horizontalDistance,
+        .boundRadiusM = boundRadius,
+        .rawDrawDistanceM = rawDrawDistance,
+        .angularBin = static_cast<std::uint8_t>(angularBin),
+        .radialBin = static_cast<std::uint8_t>(radialBin),
+        .stockObserved = !directRadialScan,
+        .radialObserved = directRadialScan,
+    };
 }
 
 void RequestAircraftOrdinaryPrefetchCandidates() {
@@ -7368,41 +7478,68 @@ void RequestAircraftOrdinaryPrefetchCandidates() {
         g_aircraftOrdinaryPrefetchCandidateCount, 0,
         kAircraftOrdinaryPrefetchCaptureLimit);
     if (candidateCount <= 0) return;
-    std::sort(g_aircraftOrdinaryPrefetchCandidates.begin(),
-              g_aircraftOrdinaryPrefetchCandidates.begin() + candidateCount,
-              [](const AircraftOrdinaryPrefetchCandidate& lhs,
-                 const AircraftOrdinaryPrefetchCandidate& rhs) {
-                  return lhs.horizontalDistanceM < rhs.horizontalDistanceM;
-              });
-
     if (!g.CStreaming_RequestModel || !g.CModelInfo_ms_modelInfoPtrs ||
         !g.CStreaming_ms_aInfoForModel ||
         !g.CStreaming_ms_numModelsRequested ||
         !g.CStreaming_ms_disableStreaming ||
         *g.CStreaming_ms_disableStreaming) {
         g_aircraftOrdinaryHorizon.prefetchQueueBlocked += candidateCount;
+        g_aircraftOrdinaryPrefetchCandidates.fill({});
         g_aircraftOrdinaryPrefetchCandidateCount = 0;
         return;
     }
 
     constexpr std::size_t kStreamingInfoStride = 0x14;
     constexpr std::size_t kStreamingStateOffset = 0x10;
-    for (int i = 0; i < candidateCount; ++i) {
+    constexpr std::array<int, kAircraftOrdinaryPrefetchAngularBins>
+        kAngularServiceOrder{
+            0, 6, 3, 9,
+            1, 7, 4, 10,
+            2, 8, 5, 11,
+        };
+    const int cursor = std::clamp(
+        g_aircraftOrdinaryPrefetchRequestCursor, 0,
+        kAircraftOrdinaryPrefetchCaptureLimit - 1);
+    int nextCursor = cursor;
+    int requestedThisPass = 0;
+    int omniRequests = 0;
+    int omniBudgetSkips = 0;
+    bool cursorAdvanced = false;
+    bool stoppedForBudget = false;
+    bool stoppedForQueue = false;
+    for (int step = 0; step < kAircraftOrdinaryPrefetchCaptureLimit; ++step) {
         if (g_aircraftOrdinaryHorizon.prefetchRequestCalls >=
                 kAircraftOrdinaryPrefetchRequestBudget) {
-            g_aircraftOrdinaryHorizon.prefetchBudgetLimited +=
-                candidateCount - i;
+            stoppedForBudget = true;
             break;
         }
         if (*g.CStreaming_ms_numModelsRequested >=
                 kAircraftOrdinaryPrefetchQueueLimit) {
-            g_aircraftOrdinaryHorizon.prefetchQueueBlocked +=
-                candidateCount - i;
+            stoppedForQueue = true;
             break;
         }
-        const int modelId = g_aircraftOrdinaryPrefetchCandidates[
-            static_cast<std::size_t>(i)].modelId;
-        if (modelId < 0 || modelId >= 20000) {
+        const int ordinal =
+            (cursor + step) % kAircraftOrdinaryPrefetchCaptureLimit;
+        const int radialBin =
+            ordinal / kAircraftOrdinaryPrefetchAngularBins;
+        const int angularBin = kAngularServiceOrder[
+            static_cast<std::size_t>(
+                ordinal % kAircraftOrdinaryPrefetchAngularBins)];
+        const int cell = angularBin * kAircraftOrdinaryPrefetchRadialBins +
+            radialBin;
+        const AircraftOrdinaryPrefetchCandidate& pending =
+            g_aircraftOrdinaryPrefetchCandidates[
+                static_cast<std::size_t>(cell)];
+        const int modelId = pending.modelId;
+        if (modelId < 0) continue;
+        const bool omniOnly = pending.radialObserved &&
+            !pending.stockObserved;
+        if (omniOnly && omniRequests >=
+                kAircraftOrdinaryOmniPrefetchRequestBudget) {
+            ++omniBudgetSkips;
+            continue;
+        }
+        if (modelId >= 20000) {
             ++g_aircraftOrdinaryHorizon.prefetchStateAnomalies;
             continue;
         }
@@ -7430,12 +7567,37 @@ void RequestAircraftOrdinaryPrefetchCandidates() {
         }
 
         ++g_aircraftOrdinaryHorizon.prefetchRequestCalls;
+        ++requestedThisPass;
+        if (omniOnly) {
+            ++omniRequests;
+            ++g_aircraftOrdinaryHorizon.prefetchOmniRequestCalls;
+        }
         const int requestedBefore = *g.CStreaming_ms_numModelsRequested;
         g.CStreaming_RequestModel(modelId, 0);
         const int requestedAfter = *g.CStreaming_ms_numModelsRequested;
-        if (requestedAfter > requestedBefore)
+        if (requestedAfter > requestedBefore) {
             ++g_aircraftOrdinaryHorizon.prefetchEnqueues;
+            if (omniOnly)
+                ++g_aircraftOrdinaryHorizon.prefetchOmniEnqueues;
+        }
+        nextCursor = (ordinal + 1) %
+            kAircraftOrdinaryPrefetchCaptureLimit;
+        cursorAdvanced = true;
     }
+    const int unserviced = std::max(0, candidateCount - requestedThisPass);
+    const int unservicedAfterOmniBudget = std::max(
+        0, unserviced - omniBudgetSkips);
+    if (stoppedForQueue)
+        g_aircraftOrdinaryHorizon.prefetchQueueBlocked +=
+            unservicedAfterOmniBudget;
+    else if (stoppedForBudget)
+        g_aircraftOrdinaryHorizon.prefetchBudgetLimited +=
+            unservicedAfterOmniBudget;
+    g_aircraftOrdinaryHorizon.prefetchBudgetLimited += omniBudgetSkips;
+    g_aircraftOrdinaryHorizon.prefetchOmniBudgetLimited += omniBudgetSkips;
+    if (cursorAdvanced)
+        g_aircraftOrdinaryPrefetchRequestCursor = nextCursor;
+    g_aircraftOrdinaryPrefetchCandidates.fill({});
     g_aircraftOrdinaryPrefetchCandidateCount = 0;
 }
 
@@ -8095,38 +8257,39 @@ void QueueAircraftSupplementalLodRequest(void* entity, void* modelInfo,
 
 void CompactAircraftPendingLodRequests() {
     if (!g.CStreaming_ms_aInfoForModel) {
+        g_aircraftLodPendingRequests.fill({});
         g_aircraftLodPendingModelCount = 0;
         return;
     }
     constexpr std::size_t kStreamingInfoStride = 0x14;
     constexpr std::size_t kStreamingStateOffset = 0x10;
-    const int sourceCount = std::clamp(
-        g_aircraftLodPendingModelCount, 0,
-        kAircraftLodPendingCaptureLimit);
-    int writeIndex = 0;
-    for (int i = 0; i < sourceCount; ++i) {
-        const int modelId =
-            g_aircraftLodPendingModels[static_cast<std::size_t>(i)];
+    int retainedCount = 0;
+    for (int i = 0; i < kAircraftLodPendingCaptureLimit; ++i) {
+        AircraftLodPendingRequest& pending =
+            g_aircraftLodPendingRequests[static_cast<std::size_t>(i)];
+        const int modelId = pending.modelId;
         if (modelId < 0 || modelId >= 20000 ||
             g.CStreaming_ms_aInfoForModel[
                 static_cast<std::size_t>(modelId) *
                     kStreamingInfoStride + kStreamingStateOffset] != 0) {
+            pending = {};
             continue;
         }
         bool duplicate = false;
-        for (int j = 0; j < writeIndex; ++j) {
-            if (g_aircraftLodPendingModels[static_cast<std::size_t>(j)] ==
-                modelId) {
+        for (int j = 0; j < i; ++j) {
+            if (g_aircraftLodPendingRequests[static_cast<std::size_t>(j)]
+                    .modelId == modelId) {
                 duplicate = true;
                 break;
             }
         }
-        if (!duplicate) {
-            g_aircraftLodPendingModels[
-                static_cast<std::size_t>(writeIndex++)] = modelId;
+        if (duplicate) {
+            pending = {};
+            continue;
         }
+        ++retainedCount;
     }
-    g_aircraftLodPendingModelCount = writeIndex;
+    g_aircraftLodPendingModelCount = retainedCount;
 }
 
 int OnSetupBigBuildingVisibility(void* entity, float* distanceOut) {
@@ -8319,10 +8482,6 @@ void QueueAircraftSupplementalLodRequest(void* entity, void* modelInfo,
         return;
     }
     CompactAircraftPendingLodRequests();
-    if (g_aircraftLodPendingModelCount >=
-            kAircraftLodPendingCaptureLimit) {
-        return;
-    }
 
     const auto* const entityBytes = static_cast<const std::uint8_t*>(entity);
     const auto* const modelBytes = static_cast<const std::uint8_t*>(modelInfo);
@@ -8345,12 +8504,79 @@ void QueueAircraftSupplementalLodRequest(void* entity, void* modelInfo,
             kStreamingStateOffset] != 0) {
         return;
     }
-    for (int i = 0; i < g_aircraftLodPendingModelCount; ++i) {
-        if (g_aircraftLodPendingModels[static_cast<std::size_t>(i)] == modelId)
-            return;
+
+    // A model can be shared by roots in several cells. One request loads all
+    // of them, so dedupe globally before assigning the spatial witness.
+    for (AircraftLodPendingRequest& pending :
+         g_aircraftLodPendingRequests) {
+        if (pending.modelId != modelId) continue;
+        pending.supplementalObserved =
+            pending.supplementalObserved ||
+            g_aircraftSupplementalLodScanActive;
+        return;
     }
-    g_aircraftLodPendingModels[
-        static_cast<std::size_t>(g_aircraftLodPendingModelCount++)] = modelId;
+
+    int angularBin = modelId % kAircraftLodPendingAngularBins;
+    int radialBin = (modelId / kAircraftLodPendingAngularBins) %
+        kAircraftLodPendingRadialBins;
+    float distanceSq = std::numeric_limits<float>::infinity();
+    V3 world{};
+    const float* const camera = g.CRenderer_ms_vecCameraPosition;
+    if (camera && ReadEntityWorldPosition(entity, &world) &&
+        std::isfinite(camera[0]) && std::isfinite(camera[1])) {
+        const float dx = world.x - camera[0];
+        const float dy = world.y - camera[1];
+        const float measuredDistanceSq = dx * dx + dy * dy;
+        if (std::isfinite(measuredDistanceSq)) {
+            distanceSq = measuredDistanceSq;
+            constexpr float kPi = 3.14159265358979323846f;
+            constexpr float kTau = 2.0f * kPi;
+            float angle = std::atan2(dy, dx) + kPi;
+            if (std::isfinite(angle)) {
+                if (angle >= kTau)
+                    angle = std::nextafter(kTau, 0.0f);
+                angularBin = std::clamp(
+                    static_cast<int>(angle / kTau *
+                        kAircraftLodPendingAngularBins),
+                    0, kAircraftLodPendingAngularBins - 1);
+            }
+            const float groundRadius = std::clamp(
+                g_aircraftLodPendingGroundRadiusM,
+                kAircraftLodBaseGroundRadiusM,
+                kAircraftLodMaxGroundRadiusM);
+            radialBin = std::clamp(
+                static_cast<int>(std::sqrt(measuredDistanceSq) /
+                    groundRadius * kAircraftLodPendingRadialBins),
+                0, kAircraftLodPendingRadialBins - 1);
+        }
+    }
+
+    const int cell = angularBin * kAircraftLodPendingRadialBins + radialBin;
+    AircraftLodPendingRequest& pending =
+        g_aircraftLodPendingRequests[static_cast<std::size_t>(cell)];
+    if (pending.modelId < 0) {
+        pending = {
+            modelId,
+            distanceSq,
+            static_cast<std::uint8_t>(angularBin),
+            static_cast<std::uint8_t>(radialBin),
+            g_aircraftSupplementalLodScanActive,
+        };
+        ++g_aircraftLodPendingModelCount;
+        return;
+    }
+
+    // One closest state-0 authored root represents each cell this frame. Once
+    // requested, compaction frees the cell and the next root gets its turn.
+    if (distanceSq < pending.distanceSq) {
+        pending = {
+            modelId,
+            distanceSq,
+            static_cast<std::uint8_t>(angularBin),
+            static_cast<std::uint8_t>(radialBin),
+            g_aircraftSupplementalLodScanActive,
+        };
+    }
 }
 
 void* OnRenderVehicleHiDetailAlpha(void* atomic) {
@@ -8578,7 +8804,7 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             ++g_aircraftOrdinaryHorizon.unloaded;
             if (!aircraftOrdinaryOuterCall) {
                 CaptureAircraftOrdinaryPrefetchCandidate(
-                    entity, modelInfo, timeInRange);
+                    entity, modelInfo, timeInRange, false);
             }
             break;
         case AircraftOrdinaryHorizonClass::Range:
@@ -8980,6 +9206,10 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             g_aircraftOrdinaryRadialSelectionActive &&
             !g_aircraftOrdinaryRadialAdmissionActive &&
             (g_visibilityScanPhase == 1 || g_visibilityScanPhase == 2);
+        const bool deterministicRadialReplay =
+            aircraftOrdinaryRadialReplayCall &&
+            g_aircraftOrdinaryRadialAdmissionActive &&
+            g_visibilityScanPhase == 6;
         const bool radialFallbackPromotion =
             (aircraftOrdinaryRadialReplayCall && radialReplayCandidate &&
              radialReplayCandidate->fallbackEligible) ||
@@ -9010,6 +9240,7 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             distance - boundRadius <=
                 g_aircraftOrdinaryHorizonMaxSlantM;
         if (promotionCandidateWithoutPriority && !promotionPriorityAllows &&
+            !deterministicRadialReplay &&
             (phase1Priority || aircraftOrdinaryPersistentRosterCall)) {
             if (aircraftOrdinaryOuterBand) {
                 ++g_aircraftOrdinaryOuter.phase1OuterPromotionStops;
@@ -9021,14 +9252,19 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
                 ++g_aircraftOrdinaryOuter.phase1InnerPromotionStops;
             }
         } else if (promotionCandidateWithoutPriority &&
+                   !deterministicRadialReplay &&
                    !promotionPriorityAllows && outerPriorityPhase) {
             if (aircraftOrdinaryOuterFarBand)
                 ++g_aircraftOrdinaryOuter.farPromotionStops;
             else
                 ++g_aircraftOrdinaryOuter.nearPromotionStops;
         }
-        const bool promotionCandidate =
-            promotionCandidateWithoutPriority && promotionPriorityAllows;
+        // Phase 6 has already paid the spatial near/far quota in the radial
+        // selector. Charging the same bucket again after stock phase-1 work
+        // rejected exactly the remaining selected cells in dense city rows.
+        // Keep the global range/forced/capacity limits below authoritative.
+        const bool promotionCandidate = promotionCandidateWithoutPriority &&
+            (promotionPriorityAllows || deterministicRadialReplay);
         if (promotionCandidate) {
             const float effectiveDrawDistance =
                 setupDrawDistanceOverride ? drawDistance : rawDrawDistance;
@@ -13743,17 +13979,44 @@ AircraftLodDiskStats ScanAircraftCoarseLodDisk(
         ? std::max(0, *g.CStreaming_ms_numModelsRequested) : -1;
 
     if (!savedDisableStreaming && g.CStreaming_ms_numModelsRequested) {
-        for (int i = 0; i < g_aircraftLodPendingModelCount; ++i) {
-            if (stats.requested >=
-                    kAircraftLodSupplementalRequestBudget ||
-                *g.CStreaming_ms_numModelsRequested >=
-                    kAircraftLodSupplementalQueueLimit) {
-                break;
-            }
-            const int modelId =
-                g_aircraftLodPendingModels[static_cast<std::size_t>(i)];
-            constexpr std::size_t kStreamingInfoStride = 0x14;
-            constexpr std::size_t kStreamingStateOffset = 0x10;
+        constexpr std::size_t kStreamingInfoStride = 0x14;
+        constexpr std::size_t kStreamingStateOffset = 0x10;
+        constexpr std::array<int, kAircraftLodPendingAngularBins>
+            kAngularServiceOrder{
+                0, 3, 6, 9,
+                1, 4, 7, 10,
+                2, 5, 8, 11,
+            };
+        const int cursor = std::clamp(
+            g_aircraftLodPendingRequestCursor, 0,
+            kAircraftLodPendingCaptureLimit - 1);
+        int nextCursor = cursor;
+        bool cursorAdvanced = false;
+        const auto canRequest = [&] {
+            return stats.requested <
+                    kAircraftLodSupplementalRequestBudget &&
+                *g.CStreaming_ms_numModelsRequested <
+                    kAircraftLodSupplementalQueueLimit;
+        };
+
+        // The ordinal is persistent; the physical cell mapping prioritises the
+        // nearest ring, but distributes each group of four requests roughly
+        // ninety degrees apart. Empty/water cells are skipped without spending
+        // the budget, and a full queue leaves the cursor untouched.
+        for (int step = 0;
+             step < kAircraftLodPendingCaptureLimit && canRequest(); ++step) {
+            const int ordinal =
+                (cursor + step) % kAircraftLodPendingCaptureLimit;
+            const int radialBin =
+                ordinal / kAircraftLodPendingAngularBins;
+            const int angularBin = kAngularServiceOrder[
+                static_cast<std::size_t>(
+                    ordinal % kAircraftLodPendingAngularBins)];
+            const int cell = angularBin * kAircraftLodPendingRadialBins +
+                radialBin;
+            AircraftLodPendingRequest& pending =
+                g_aircraftLodPendingRequests[static_cast<std::size_t>(cell)];
+            const int modelId = pending.modelId;
             if (!g.CStreaming_ms_aInfoForModel || modelId < 0 ||
                 modelId >= 20000 ||
                 g.CStreaming_ms_aInfoForModel[
@@ -13763,6 +14026,11 @@ AircraftLodDiskStats ScanAircraftCoarseLodDisk(
             }
             g.CStreaming_RequestModel(modelId, 0);
             ++stats.requested;
+            nextCursor = (ordinal + 1) % kAircraftLodPendingCaptureLimit;
+            cursorAdvanced = true;
+        }
+        if (cursorAdvanced) {
+            g_aircraftLodPendingRequestCursor = nextCursor;
         }
     }
     stats.queueAfter = g.CStreaming_ms_numModelsRequested
@@ -13843,6 +14111,8 @@ bool EnumerateAircraftOrdinaryStaticList(
                 *reinterpret_cast<const std::int16_t*>(entityBytes + 0x32));
             void* const modelInfo = modelId >= 0 && modelId < 20000
                 ? g.CModelInfo_ms_modelInfoPtrs[modelId] : nullptr;
+            CaptureAircraftOrdinaryPrefetchCandidate(
+                entity, modelInfo, true, true);
             AircraftOrdinaryRadialCandidateInfo info{};
             if (DescribeAircraftOrdinaryRadialCandidate(
                     entity, modelInfo, true, &info)) {
@@ -14950,10 +15220,15 @@ bool ReplayAircraftOrdinarySector(int sectorX, int sectorY,
 
 void SelectAndReplayAircraftOrdinaryRadialShell(
         const AircraftCoarseLodProfile& profile) {
+    const auto discardPrefetchAfterRadialFault = [] {
+        g_aircraftOrdinaryPrefetchCandidates.fill({});
+        g_aircraftOrdinaryPrefetchCandidateCount = 0;
+    };
     if (g_aircraftOrdinaryRadialCaptureOverflow) {
         ++g_aircraftOrdinaryOuter.faults;
         g_aircraftOrdinaryOuterSessionDisabled = true;
         ClearAircraftOrdinaryPersistentRoster();
+        discardPrefetchAfterRadialFault();
         return;
     }
     if (!profile.active || !g_aircraftOrdinaryRadialSelectionActive ||
@@ -14971,6 +15246,7 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
         ++g_aircraftOrdinaryOuter.faults;
         if (g_aircraftOrdinaryRadialCaptureOverflow)
             g_aircraftOrdinaryOuterSessionDisabled = true;
+        discardPrefetchAfterRadialFault();
         return;
     }
     if (!SelectAircraftOrdinaryRadialCandidates()) {
@@ -14978,6 +15254,7 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
             0.0, perf::ThreadCpuMs() - cpuStart);
         g_aircraftOrdinaryOuter.wallMs += std::max(
             0.0, NowMs() - wallStart);
+        discardPrefetchAfterRadialFault();
         return;
     }
 
@@ -15003,6 +15280,7 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
             ++g_aircraftOrdinaryOuter.radialSectorOverflow;
             ++g_aircraftOrdinaryOuter.faults;
             g_aircraftOrdinaryOuterSessionDisabled = true;
+            discardPrefetchAfterRadialFault();
             return;
         }
         replaySectors[static_cast<std::size_t>(replaySectorCount++)] = key;
@@ -15016,6 +15294,7 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
     if (currentScanCode == 0u) {
         ++g_aircraftOrdinaryOuter.faults;
         g_aircraftOrdinaryOuterSessionDisabled = true;
+        discardPrefetchAfterRadialFault();
         return;
     }
     const bool savedDisableStreaming = *g.CStreaming_ms_disableStreaming;
@@ -15087,8 +15366,10 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
     if (structuralReplayFault || incompleteReplay) {
         ++g_aircraftOrdinaryOuter.faults;
     }
-    if (structuralReplayFault || replayStreamResult)
+    if (structuralReplayFault || replayStreamResult) {
         g_aircraftOrdinaryOuterSessionDisabled = true;
+        discardPrefetchAfterRadialFault();
+    }
     if (!g_aircraftOrdinaryOuterSessionDisabled && !structuralReplayFault)
         CommitAircraftOrdinaryPersistentRoster();
     else
@@ -16954,6 +17235,9 @@ void OnRenderScene(bool underwater) {
         .aircraftOrdinaryUnloadedRootlessForward =
             g_aircraftOrdinaryHorizonFrameActive
                 ? g_aircraftOrdinaryHorizon.unloadedRootlessForward : 0,
+        .aircraftOrdinaryUnloadedRootlessOmni =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryHorizon.unloadedRootlessOmni : 0,
         .aircraftOrdinaryPrefetchCandidates =
             g_aircraftOrdinaryHorizonFrameActive
                 ? g_aircraftOrdinaryHorizon.prefetchCandidates : 0,
@@ -16978,6 +17262,15 @@ void OnRenderScene(bool underwater) {
         .aircraftOrdinaryPrefetchStateAnomalies =
             g_aircraftOrdinaryHorizonFrameActive
                 ? g_aircraftOrdinaryHorizon.prefetchStateAnomalies : 0,
+        .aircraftOrdinaryPrefetchOmniRequestCalls =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryHorizon.prefetchOmniRequestCalls : 0,
+        .aircraftOrdinaryPrefetchOmniEnqueues =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryHorizon.prefetchOmniEnqueues : 0,
+        .aircraftOrdinaryPrefetchOmniBudgetLimited =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryHorizon.prefetchOmniBudgetLimited : 0,
         .aircraftOrdinaryOuterActive =
             g_aircraftOrdinaryHorizonFrameActive &&
             g_aircraftOrdinaryOuter.active,
@@ -17807,7 +18100,11 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
                     g_aircraftOrdinaryOuter.phase1InnerAdmissions <
                         g_aircraftOrdinaryInnerPriorityLimit;
             }
-            if (!admissionPriorityAllows) {
+            // The deterministic phase-6 roster already owns a bounded spatial
+            // slot. Do not charge its local near/far bucket twice; the shared
+            // forced-visible and render-list capacity gates immediately below
+            // still cap the complete ordinary shell at the established limit.
+            if (!admissionPriorityAllows && !deterministicRadialReplay) {
                 if (phase1Priority || deterministicPersistentRoster) {
                     if (aircraftOrdinaryOuterBand) {
                         ++g_aircraftOrdinaryOuter.phase1OuterAdmissionStops;
@@ -18143,6 +18440,7 @@ void OnScanWorld() {
     g_aircraftOrdinaryOuter = {};
     if (g_aircraftOrdinaryOuterSessionDisabled)
         g_aircraftOrdinaryOuter.faults = 1;
+    g_aircraftOrdinaryPrefetchCandidates.fill({});
     g_aircraftOrdinaryPrefetchCandidateCount = 0;
     g_aircraftOrdinaryHorizonFrameActive = aircraftScanLod.active;
     g_aircraftOrdinaryHorizonAltitudeM = aircraftScanLod.active
@@ -18255,7 +18553,9 @@ void OnScanWorld() {
                        configuredBuildingDetailM)
             : kAircraftOpaqueChildMinimumExclusiveDistanceM;
         g_aircraftOpaqueChildCaptureActive = true;
+        g_aircraftLodPendingRequests.fill({});
         g_aircraftLodPendingModelCount = 0;
+        g_aircraftLodPendingGroundRadiusM = aircraftScanLod.groundRadiusM;
         g_aircraftCoarseLodVisibilityFarM = aircraftScanLod.farClipM;
         g_aircraftCoarseLodRootLowLodScale = aircraftScanLod.lowLodScale;
         g_aircraftStandaloneHorizonGroundRadiusM =
@@ -18284,6 +18584,8 @@ void OnScanWorld() {
         aircraftDiskStats = ScanAircraftCoarseLodDisk(aircraftScanLod);
         g_aircraftSupplementalLodScanActive = false;
         g_aircraftCoarseLodScanActive = false;
+        g_aircraftLodPendingGroundRadiusM =
+            kAircraftLodBaseGroundRadiusM;
         g_aircraftCoarseLodVisibilityFarM = 0.0f;
         g_aircraftCoarseLodRootLowLodScale = 1.0f;
         g_aircraftStandaloneHorizonGroundRadiusM = 0.0f;
@@ -18386,8 +18688,9 @@ void OnScanWorld() {
                  "%d/%d/%d/%d/%d/%d "
                  "occ=test/stock/bypass/unconsumed=%d/%d/%d/%d "
                  "result=v/c/s/o=%d/%d/%d/%d "
-                 "prefetch=u/c/u/d/x=%d/%d/%d/%d/%d "
-                 "req=call/enq/pend/q/b/res/anom=%d/%d/%d/%d/%d/%d/%d "
+                 "prefetch=forward/omni/c/u/d/x=%d/%d/%d/%d/%d/%d "
+                 "req=call/enq/omni_call/omni_enq/pend/q/b/omni_b/res/anom="
+                 "%d/%d/%d/%d/%d/%d/%d/%d/%d/%d "
                  "cfg=alt%.0f inner=slant%.0fm outer=ground%.0fm "
                  "slantMax%.0f cone=%.0f "
                  "cap=%d resident_only=1",
@@ -18423,15 +18726,19 @@ void OnScanWorld() {
                  g_aircraftOrdinaryHorizon.resultStream,
                  g_aircraftOrdinaryHorizon.resultOther,
                  g_aircraftOrdinaryHorizon.unloadedRootlessForward,
+                 g_aircraftOrdinaryHorizon.unloadedRootlessOmni,
                  g_aircraftOrdinaryHorizon.prefetchCandidates,
                  g_aircraftOrdinaryHorizon.prefetchUnique,
                  g_aircraftOrdinaryHorizon.prefetchDedupes,
                  g_aircraftOrdinaryHorizon.prefetchCaptureLimit,
                  g_aircraftOrdinaryHorizon.prefetchRequestCalls,
                  g_aircraftOrdinaryHorizon.prefetchEnqueues,
+                 g_aircraftOrdinaryHorizon.prefetchOmniRequestCalls,
+                 g_aircraftOrdinaryHorizon.prefetchOmniEnqueues,
                  g_aircraftOrdinaryHorizon.prefetchAlreadyPending,
                  g_aircraftOrdinaryHorizon.prefetchQueueBlocked,
                  g_aircraftOrdinaryHorizon.prefetchBudgetLimited,
+                 g_aircraftOrdinaryHorizon.prefetchOmniBudgetLimited,
                  g_aircraftOrdinaryHorizon.prefetchResidentBeforeRequest,
                  g_aircraftOrdinaryHorizon.prefetchStateAnomalies,
                  static_cast<double>(
@@ -20155,6 +20462,21 @@ void SetNeonSignsEnabled(bool enabled) {
     LOGI("[graphics.neon] enabled=%d", enabled ? 1 : 0);
 }
 
+bool IsColorGradingEnabled() {
+    EnsureGraphicsSettingsLoaded();
+    return g_colorGradingEnabled.load(std::memory_order_acquire);
+}
+
+void SetColorGradingEnabled(bool enabled) {
+    EnsureGraphicsSettingsLoaded();
+    if (g_colorGradingEnabled.exchange(enabled, std::memory_order_acq_rel) ==
+        enabled) {
+        return;
+    }
+    SaveGraphicsSettings();
+    LOGI("[graphics.grade] enabled=%d", enabled ? 1 : 0);
+}
+
 const char* GetGraphicsDistanceSettingName(int field) {
     if (field < 0 || field >= GFXDIST_COUNT) return "UNKNOWN";
     return kGraphicsDistanceSpecs[field].label;
@@ -20196,6 +20518,7 @@ void ResetGraphicsDefaults() {
     g_requestedRenderScaleIndex.store(
         kDefaultRenderScaleIndex, std::memory_order_release);
     g_neonSignsEnabled.store(true, std::memory_order_release);
+    g_colorGradingEnabled.store(true, std::memory_order_release);
     for (int i = 0; i < GFXDIST_COUNT; ++i) {
         g_graphicsDistanceChoice[i].store(
             kGraphicsDistanceSpecs[i].defaultChoice,

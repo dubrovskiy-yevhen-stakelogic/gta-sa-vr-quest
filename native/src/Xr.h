@@ -176,6 +176,20 @@ void SetStereoEyeTextures(const unsigned int* tex, const unsigned int* depth,
 // the exact frame whose world pixels it presents.
 void SetUnderwaterState(float underWaterness, float waterDepth);
 
+// Retail Android's final MobileRender colour transform for the current game
+// frame. The GameThread publishes it before the matching eye-texture pair; the
+// compositor applies it inside the existing resolve (no extra full-screen pass).
+// mode: 0 = identity, 1 = ContrastMult/Add, 2 = RGB grading rows.
+struct MobileColorState {
+    int mode{};
+    float contrastMult[3]{1.0f, 1.0f, 1.0f};
+    float contrastAdd[3]{};
+    float redGrade[4]{1.0f, 0.0f, 0.0f, 0.0f};
+    float greenGrade[4]{0.0f, 1.0f, 0.0f, 0.0f};
+    float blueGrade[4]{0.0f, 0.0f, 1.0f, 0.0f};
+};
+void SetMobileColorState(const MobileColorState& state);
+
 // The half-tangents of the (symmetric) frustum the game rendered the eyes with.
 // The compositor builds each projection view's fov from these so the presented
 // projection layer matches the render exactly (no scale/stretch). Published by

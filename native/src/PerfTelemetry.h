@@ -481,6 +481,7 @@ struct StereoFrameSample {
     int    aircraftOrdinaryOcclusionUnconsumed{};
     int    aircraftOrdinaryInnerSlantRejects{};
     int    aircraftOrdinaryUnloadedRootlessForward{};
+    int    aircraftOrdinaryUnloadedRootlessOmni{};
     int    aircraftOrdinaryPrefetchCandidates{};
     int    aircraftOrdinaryPrefetchUnique{};
     int    aircraftOrdinaryPrefetchRequestCalls{};
@@ -489,6 +490,9 @@ struct StereoFrameSample {
     int    aircraftOrdinaryPrefetchQueueBlocked{};
     int    aircraftOrdinaryPrefetchBudgetLimited{};
     int    aircraftOrdinaryPrefetchStateAnomalies{};
+    int    aircraftOrdinaryPrefetchOmniRequestCalls{};
+    int    aircraftOrdinaryPrefetchOmniEnqueues{};
+    int    aircraftOrdinaryPrefetchOmniBudgetLimited{};
     bool   aircraftOrdinaryOuterActive{};
     double aircraftOrdinaryOuterRadiusM{};
     int    aircraftOrdinaryOuterCandidateSectors{};

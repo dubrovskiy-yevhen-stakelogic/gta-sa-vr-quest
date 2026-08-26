@@ -591,6 +591,7 @@ struct GameWindow {
     Series aircraftOrdinaryOcclusionUnconsumed;
     Series aircraftOrdinaryInnerSlantRejects;
     Series aircraftOrdinaryUnloadedRootlessForward;
+    Series aircraftOrdinaryUnloadedRootlessOmni;
     Series aircraftOrdinaryPrefetchCandidates;
     Series aircraftOrdinaryPrefetchUnique;
     Series aircraftOrdinaryPrefetchRequestCalls;
@@ -599,6 +600,9 @@ struct GameWindow {
     Series aircraftOrdinaryPrefetchQueueBlocked;
     Series aircraftOrdinaryPrefetchBudgetLimited;
     Series aircraftOrdinaryPrefetchStateAnomalies;
+    Series aircraftOrdinaryPrefetchOmniRequestCalls;
+    Series aircraftOrdinaryPrefetchOmniEnqueues;
+    Series aircraftOrdinaryPrefetchOmniBudgetLimited;
     Series aircraftOrdinaryOuterActive;
     Series aircraftOrdinaryOuterRadiusM;
     Series aircraftOrdinaryOuterCandidateSectors;
@@ -818,6 +822,7 @@ FILE* OpenGameCsv() {
         "aircraft_ordinary_occlusion_unconsumed_avg,"
         "aircraft_ordinary_inner_slant_reject_avg,"
         "aircraft_ordinary_unloaded_rootless_forward_avg,"
+        "aircraft_ordinary_unloaded_rootless_omni_avg,"
         "aircraft_ordinary_prefetch_candidates_avg,"
         "aircraft_ordinary_prefetch_unique_avg,"
         "aircraft_ordinary_prefetch_request_calls_avg,"
@@ -826,6 +831,9 @@ FILE* OpenGameCsv() {
         "aircraft_ordinary_prefetch_queue_blocked_avg,"
         "aircraft_ordinary_prefetch_budget_limited_avg,"
         "aircraft_ordinary_prefetch_state_anomalies_avg,"
+        "aircraft_ordinary_prefetch_omni_request_calls_avg,"
+        "aircraft_ordinary_prefetch_omni_enqueues_avg,"
+        "aircraft_ordinary_prefetch_omni_budget_limited_avg,"
         "aircraft_ordinary_outer_active_avg,"
         "aircraft_ordinary_outer_radius_m_avg,"
         "aircraft_ordinary_outer_candidate_sectors_avg,"
@@ -2081,6 +2089,7 @@ void EmitGameWindow(double endMs) {
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
             "%.2f,%.2f,%.2f,%.2f,"
+            "%.2f,%.2f,%.2f,%.2f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
             "%.2f,%.2f,%.2f,%.2f,"
@@ -2107,6 +2116,7 @@ void EmitGameWindow(double endMs) {
             w.aircraftOrdinaryOcclusionUnconsumed.Average(),
             w.aircraftOrdinaryInnerSlantRejects.Average(),
             w.aircraftOrdinaryUnloadedRootlessForward.Average(),
+            w.aircraftOrdinaryUnloadedRootlessOmni.Average(),
             w.aircraftOrdinaryPrefetchCandidates.Average(),
             w.aircraftOrdinaryPrefetchUnique.Average(),
             w.aircraftOrdinaryPrefetchRequestCalls.Average(),
@@ -2115,6 +2125,9 @@ void EmitGameWindow(double endMs) {
             w.aircraftOrdinaryPrefetchQueueBlocked.Average(),
             w.aircraftOrdinaryPrefetchBudgetLimited.Average(),
             w.aircraftOrdinaryPrefetchStateAnomalies.Average(),
+            w.aircraftOrdinaryPrefetchOmniRequestCalls.Average(),
+            w.aircraftOrdinaryPrefetchOmniEnqueues.Average(),
+            w.aircraftOrdinaryPrefetchOmniBudgetLimited.Average(),
             w.aircraftOrdinaryOuterActive.Average(),
             w.aircraftOrdinaryOuterRadiusM.Average(),
             w.aircraftOrdinaryOuterCandidateSectors.Average(),
@@ -3471,6 +3484,8 @@ void SubmitGameFrame(const GameFrameSample& sample) {
                 g_latestStereo.aircraftOrdinaryInnerSlantRejects);
             w.aircraftOrdinaryUnloadedRootlessForward.Add(
                 g_latestStereo.aircraftOrdinaryUnloadedRootlessForward);
+            w.aircraftOrdinaryUnloadedRootlessOmni.Add(
+                g_latestStereo.aircraftOrdinaryUnloadedRootlessOmni);
             w.aircraftOrdinaryPrefetchCandidates.Add(
                 g_latestStereo.aircraftOrdinaryPrefetchCandidates);
             w.aircraftOrdinaryPrefetchUnique.Add(
@@ -3487,6 +3502,12 @@ void SubmitGameFrame(const GameFrameSample& sample) {
                 g_latestStereo.aircraftOrdinaryPrefetchBudgetLimited);
             w.aircraftOrdinaryPrefetchStateAnomalies.Add(
                 g_latestStereo.aircraftOrdinaryPrefetchStateAnomalies);
+            w.aircraftOrdinaryPrefetchOmniRequestCalls.Add(
+                g_latestStereo.aircraftOrdinaryPrefetchOmniRequestCalls);
+            w.aircraftOrdinaryPrefetchOmniEnqueues.Add(
+                g_latestStereo.aircraftOrdinaryPrefetchOmniEnqueues);
+            w.aircraftOrdinaryPrefetchOmniBudgetLimited.Add(
+                g_latestStereo.aircraftOrdinaryPrefetchOmniBudgetLimited);
             w.aircraftOrdinaryOuterActive.Add(
                 g_latestStereo.aircraftOrdinaryOuterActive ? 1.0 : 0.0);
             w.aircraftOrdinaryOuterRadiusM.Add(

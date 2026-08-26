@@ -1000,58 +1000,51 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
 
         switch (menuPage) {
         case PG_MAIN: {
-            // Laser, weapon/holster setup, driving, HUD, hand appearance,
-            // cheats, graphics and close.
-            const int N = 14;
+            // Weapon/holster setup, driving, HUD, hand appearance, cheats,
+            // graphics, controls, about and close.
+            const int N = 12;
             if (navUp)   mainSel = (mainSel - 1 + N) % N;
             if (navDown) mainSel = (mainSel + 1) % N;
-            if (mainSel == 0) {
-                if (minus) savr::calib::SetLaserEnabled(false);
-                if (plus)  savr::calib::SetLaserEnabled(true);
-                if (enter) savr::calib::ToggleLaser();
-            } else if (mainSel == 4) {
-                if (minus) savr::holster::SetGripMarkersEnabled(false);
-                if (plus)  savr::holster::SetGripMarkersEnabled(true);
-                if (enter) savr::holster::ToggleGripMarkers();
-            } else if (mainSel == 8) {
+            if (mainSel == 6) {
                 if (minus) savr::appearance::SetHandSkin(savr::appearance::HAND_SKIN_LIGHT);
                 if (plus)  savr::appearance::SetHandSkin(savr::appearance::HAND_SKIN_DARK);
                 if (enter) savr::appearance::CycleHandSkin();
             }
             if (enter) {
-                if      (mainSel == 1) {
+                if      (mainSel == 0) {
                     calibWeaponType = savr::calib::ActiveWeapon();
                     menuPage = PG_CALIB;
                     calibSel = 0;
                 }
-                else if (mainSel == 2) {
+                else if (mainSel == 1) {
                     savr::holster::BeginCalibrationPreview();
                     menuPage = PG_HOLSTER_CALIB;
                     holsterCalibSel = 0;
                 }
-                else if (mainSel == 3) { menuPage = PG_HOLSTERS; holsterSel = 0; }
-                else if (mainSel == 5) {
+                else if (mainSel == 2) { menuPage = PG_HOLSTERS; holsterSel = 0; }
+                else if (mainSel == 3) {
                     const int activeType=savr::driving::GetActiveVehicleType();
                     if (activeType!=savr::driving::VEHICLE_NONE)
                         drivingVehicleType=activeType;
                     menuPage = PG_DRIVING; drivingSel = 0;
                 }
-                else if (mainSel == 6) { menuPage = PG_LOCOMOTION; locomotionSel = 0; }
-                else if (mainSel == 7) { menuPage = PG_HUD;      hudSel = 0; }
-                else if (mainSel == 9) {
+                else if (mainSel == 4) { menuPage = PG_LOCOMOTION; locomotionSel = 0; }
+                else if (mainSel == 5) { menuPage = PG_HUD;      hudSel = 0; }
+                else if (mainSel == 7) {
                     menuPage = PG_CHEATS; cheatCategory = -1; cheatSel = 0;
                 }
-                else if (mainSel == 10) { menuPage = PG_GRAPHICS; gfxSel = 0; }
-                else if (mainSel == 11) { menuPage = PG_CONTROLS; controlsSel = 0; }
-                else if (mainSel == 12) { menuPage = PG_ABOUT; aboutFirstRun = false; aboutArmed = false; }
-                else if (mainSel == 13)  menuPage = PG_NONE;
+                else if (mainSel == 8) { menuPage = PG_GRAPHICS; gfxSel = 0; }
+                else if (mainSel == 9) { menuPage = PG_CONTROLS; controlsSel = 0; }
+                else if (mainSel == 10) { menuPage = PG_ABOUT; aboutFirstRun = false; aboutArmed = false; }
+                else if (mainSel == 11)  menuPage = PG_NONE;
             }
             if (back) menuPage = PG_NONE;
             break;
         }
         case PG_CALIB: {
-            // 22 rows: 0..18 fields, 19 LASER BEAM mode, 20 LOCK LASER, 21 BACK.
-            constexpr int ROWS = 22;
+            // 23 rows: 0..18 fields, 19 WEAPON LASER (global), 20 LASER BEAM
+            // mode, 21 LOCK LASER, 22 BACK.
+            constexpr int ROWS = 23;
             if (navUp)   calibSel = (calibSel - 1 + ROWS) % ROWS;
             if (navDown) calibSel = (calibSel + 1) % ROWS;
             const int type = calibWeaponType;
@@ -1069,13 +1062,16 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             const int  mult      = (calAdjHeld < 45) ? 1 : (calAdjHeld < 105) ? 3 : 10;  // x1/x3/x10
             const bool firstTick = fire && calAdjHeld == 1;
 
-            if (calibSel == 21) {                                  // BACK
+            if (calibSel == 22) {                                  // BACK
                 if (enter || firstTick || back) { savr::calib::Save(); menuPage = PG_MAIN; }
-            } else if (calibSel == 20) {                           // explicit persistent lock
+            } else if (calibSel == 21) {                           // explicit persistent lock
                 if (enter || firstTick) savr::calib::LockLaser(type);
-            } else if (calibSel == 19) {                           // per-weapon beam override
+            } else if (calibSel == 20) {                           // per-weapon beam override
                 if (enter) savr::calib::CycleLaserModeForWeapon(type, +1);
                 else if (firstTick) savr::calib::CycleLaserModeForWeapon(type, dir);
+            } else if (calibSel == 19) {                           // global laser toggle
+                if (enter) savr::calib::ToggleLaser();
+                else if (firstTick) savr::calib::SetLaserEnabled(dir > 0);
             } else if (calibSel == savr::calib::F_SUP_STYLE) {     // SUPPORT STYLE toggle
                 if (enter || firstTick) {
                     const int cur = savr::calib::GetField(1, type, savr::calib::F_SUP_STYLE);
@@ -1113,8 +1109,9 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_HOLSTERS: {
-            // Points, GRAB REACH, GRIP LOCK, BACK — matching BuildHolsterMenu.
-            const int rows = savr::holster::PointCount() + 3;
+            // Points, GRAB REACH, GRIP LOCK, HOLSTER MARKERS, BACK — matching
+            // BuildHolsterMenu.
+            const int rows = savr::holster::PointCount() + 4;
             if (navUp)   holsterSel = (holsterSel - 1 + rows) % rows;
             if (navDown) holsterSel = (holsterSel + 1) % rows;
             if (holsterSel < savr::holster::PointCount()) {
@@ -1129,6 +1126,10 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 if (plus)  savr::holster::AdjustGrabRadiusCm(+1);
             } else if (holsterSel == savr::holster::PointCount() + 1) {
                 if (minus || plus || enter) savr::holster::ToggleGripLock();
+            } else if (holsterSel == savr::holster::PointCount() + 2) {
+                if (minus) savr::holster::SetGripMarkersEnabled(false);
+                if (plus)  savr::holster::SetGripMarkersEnabled(true);
+                if (enter) savr::holster::ToggleGripMarkers();
             } else if (enter) {
                 menuPage = PG_MAIN;
             }
@@ -1398,7 +1399,8 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_GRAPHICS: {
-            const int N = 7; // scale, CPU, GPU, neon, distances, defaults, Back
+            // scale, CPU, GPU, neon, grading, distances, defaults, Back
+            const int N = 8;
             if (navUp)   gfxSel = (gfxSel - 1 + N) % N;
             if (navDown) gfxSel = (gfxSel + 1) % N;
             const int step = minus ? -1 : (plus ? 1 : 0);
@@ -1411,16 +1413,20 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 xr::SetPerfLevels(cpu, gpu);
             } else if (step && gfxSel == 3) {
                 vrcam::SetNeonSignsEnabled(step > 0);
+            } else if (step && gfxSel == 4) {
+                vrcam::SetColorGradingEnabled(step > 0);
             }
             if (enter && !step && gfxSel == 3) {
                 vrcam::SetNeonSignsEnabled(!vrcam::AreNeonSignsEnabled());
-            } else if (enter && gfxSel == 4) {
+            } else if (enter && !step && gfxSel == 4) {
+                vrcam::SetColorGradingEnabled(!vrcam::IsColorGradingEnabled());
+            } else if (enter && gfxSel == 5) {
                 menuPage = PG_GRAPHICS_DISTANCES;
                 gfxDistanceSel = 0;
-            } else if (enter && gfxSel == 5) {
+            } else if (enter && gfxSel == 6) {
                 vrcam::ResetGraphicsDefaults();
                 xr::SetPerfLevels(3, 3);
-            } else if (enter && gfxSel == 6) {
+            } else if (enter && gfxSel == 7) {
                 menuPage = PG_MAIN;
             }
             if (back) menuPage = PG_MAIN;

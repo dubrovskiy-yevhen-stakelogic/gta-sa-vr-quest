@@ -71,6 +71,7 @@ using RpClumpForAllAtomicsFn = void* (*)(
     void*, RpAtomicCallbackFn, void*);
 using RpGeometryForAllMaterialsFn = void* (*)(
     void*, RpMaterialCallbackFn, void*);
+using MobileRenderFn = void (*)();
 
 struct Functions {
     VoidFn definedState{};
@@ -152,6 +153,17 @@ bool g_embeddedCanopyHideReady = false;
 bool g_lampGroundPoolsReady = false;
 bool g_wetReflectionsReady = false;
 bool g_underwaterStateReady = false;
+std::atomic<bool> g_mobileColorResolveAttempted{false};
+bool g_mobileColorReady = false;
+MobileRenderFn g_mobileRender{};
+std::uint8_t* g_mobileCctv{};
+std::uint8_t* g_mobileUsingGrading{};
+float* g_mobileContrastMult{};
+float* g_mobileContrastAdd{};
+float* g_mobileRedGrade{};
+float* g_mobileGreenGrade{};
+float* g_mobileBlueGrade{};
+float* g_mobileGradeBlur{};
 std::atomic<bool> g_skyResolveAttempted{false};
 bool g_skyStateReady = false;
 void** g_skyCoronaTextures = nullptr;
@@ -2101,6 +2113,184 @@ void PublishUnderwaterState(int eye) {
     xr::SetUnderwaterState(underWaterness, waterDepth);
 }
 
+bool ResolveMobileColorState() {
+    if (g_mobileColorResolveAttempted.exchange(true,
+                                                std::memory_order_acq_rel)) {
+        return g_mobileColorReady;
+    }
+
+    void* const handle = dlopen("libGame.so", RTLD_NOLOAD | RTLD_NOW);
+    if (!handle) {
+        LOGE("[mobile.color] libGame.so unavailable: %s", dlerror());
+        return false;
+    }
+
+    const MobileRenderFn mobileRender = Resolve<MobileRenderFn>(
+        handle, "_ZN12CPostEffects12MobileRenderEv");
+    auto* const cctv = Resolve<std::uint8_t*>(
+        handle, "_ZN12CPostEffects7m_bCCTVE");
+    auto* const usingGrading = Resolve<std::uint8_t*>(handle, "usingGrading");
+    auto* const contrastMult = Resolve<float*>(handle, "contrastMult");
+    auto* const contrastAdd = Resolve<float*>(handle, "contrastAdd");
+    auto* const gradeBlur = Resolve<float*>(handle, "gradeBlur");
+
+    Dl_info info{};
+    if (!mobileRender || !cctv || !usingGrading || !contrastMult ||
+        !contrastAdd || !gradeBlur ||
+        dladdr(reinterpret_cast<void*>(mobileRender), &info) == 0 ||
+        !info.dli_fbase) {
+        LOGW("[mobile.color] disabled: missing retail symbols");
+        return false;
+    }
+    const auto base = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+    const bool offsetsMatch =
+        reinterpret_cast<std::uintptr_t>(mobileRender) - base == 0x5e2c9cu &&
+        reinterpret_cast<std::uintptr_t>(cctv) - base == 0xc90460u &&
+        reinterpret_cast<std::uintptr_t>(usingGrading) - base == 0xd0e520u &&
+        reinterpret_cast<std::uintptr_t>(contrastMult) - base == 0x885b54u &&
+        reinterpret_cast<std::uintptr_t>(contrastAdd) - base == 0xd0e510u &&
+        reinterpret_cast<std::uintptr_t>(gradeBlur) - base == 0xd0e524u;
+
+    static constexpr std::uint32_t kMobileEntry[4] = {
+        0xd10303ffu, 0x6d0823e9u, 0xa9097bfdu, 0xa90a57f6u,
+    };
+    static constexpr std::uint32_t kMobileDecision[3] = {
+        0xb9401108u, 0x7100091fu, 0x5400020cu,
+    };
+    std::uint32_t observedEntry[4]{};
+    std::uint32_t observedDecision[3]{};
+    std::memcpy(observedEntry, reinterpret_cast<const void*>(mobileRender),
+                sizeof(observedEntry));
+    std::memcpy(observedDecision,
+                reinterpret_cast<const void*>(base + 0x5e36d8u),
+                sizeof(observedDecision));
+    const bool layoutMatch = offsetsMatch &&
+        std::memcmp(observedEntry, kMobileEntry, sizeof(observedEntry)) == 0 &&
+        std::memcmp(observedDecision, kMobileDecision,
+                    sizeof(observedDecision)) == 0 &&
+        *reinterpret_cast<const std::uint32_t*>(base + 0x5e3718u) ==
+            0x9408a5d2u &&
+        *reinterpret_cast<const std::uint32_t*>(base + 0x5e372cu) ==
+            0x9408a5d1u &&
+        *reinterpret_cast<const std::uint32_t*>(base + 0x5e3748u) ==
+            0x9408a5ceu;
+    if (!layoutMatch) {
+        LOGW("[mobile.color] disabled: retail 2.11 layout mismatch "
+             "offsets=%d", offsetsMatch ? 1 : 0);
+        return false;
+    }
+
+    g_mobileRender = mobileRender;
+    g_mobileCctv = cctv;
+    g_mobileUsingGrading = usingGrading;
+    g_mobileContrastMult = contrastMult;
+    g_mobileContrastAdd = contrastAdd;
+    // The retail grading setter stores three consecutive RQVector rows directly
+    // after contrastMult. These RVAs are covered by the setter-tail fingerprint.
+    g_mobileRedGrade = reinterpret_cast<float*>(base + 0x885b64u);
+    g_mobileGreenGrade = reinterpret_cast<float*>(base + 0x885b74u);
+    g_mobileBlueGrade = reinterpret_cast<float*>(base + 0x885b84u);
+    g_mobileGradeBlur = gradeBlur;
+    g_mobileColorReady = true;
+    LOGI("[mobile.color] retail capture ready render=%p contrast=%p/%p "
+         "grading=%p/%p/%p blur=%p",
+         reinterpret_cast<void*>(mobileRender), contrastMult, contrastAdd,
+         g_mobileRedGrade, g_mobileGreenGrade, g_mobileBlueGrade, gradeBlur);
+    return true;
+}
+
+void PublishMobileColorState(int eye) {
+    if (eye != 0) return;
+    // Menu toggle: with grading off the resolve keeps the plain-blit look, so
+    // players can A/B the mobile colour pipeline from the graphics menu.
+    if (!vrcam::IsColorGradingEnabled()) {
+        xr::SetMobileColorState({});
+        return;
+    }
+    if (!ResolveMobileColorState()) {
+        xr::SetMobileColorState({});
+        return;
+    }
+
+    // When SAVR owns the hidden flat RenderEffects call, MobileRender would no
+    // longer run at all. Let retail calculate its exact timecycle/brightness
+    // parameters once, at eye 0 where the original timestep is still active.
+    // CCTV is its only normal draw call; suppress that one transiently so this
+    // parameter capture cannot paint a flat fullscreen overlay into one eye.
+    const bool ownsFlatPass = Profile() > 0 &&
+        g_flatPassSuppressed.load(std::memory_order_acquire) &&
+        vrcam::IsStereoActive();
+    xr::MobileColorState state{};
+    float capturedBlur = 0.0f;
+    const auto snapshotMobileColor = [&]() {
+        state.mode = *g_mobileUsingGrading ? 2 : 1;
+        std::memcpy(state.contrastMult, g_mobileContrastMult,
+                    sizeof(state.contrastMult));
+        std::memcpy(state.contrastAdd, g_mobileContrastAdd,
+                    sizeof(state.contrastAdd));
+        std::memcpy(state.redGrade, g_mobileRedGrade,
+                    sizeof(state.redGrade));
+        std::memcpy(state.greenGrade, g_mobileGreenGrade,
+                    sizeof(state.greenGrade));
+        std::memcpy(state.blueGrade, g_mobileBlueGrade,
+                    sizeof(state.blueGrade));
+        capturedBlur = *g_mobileGradeBlur;
+    };
+
+    bool cctvWasEnabled = false;
+    if (ownsFlatPass) {
+        const std::uint8_t savedCctv = *g_mobileCctv;
+        const std::uint8_t savedUsingGrading = *g_mobileUsingGrading;
+        // contrastMult is an RQVector immediately followed by the three
+        // grading rows. Preserve all four components of every backend vector,
+        // not only the RGB components copied into the eye shader.
+        float savedContrastAndGrades[16]{};
+        float savedContrastAdd[4]{};
+        std::memcpy(savedContrastAndGrades, g_mobileContrastMult,
+                    sizeof(savedContrastAndGrades));
+        std::memcpy(savedContrastAdd, g_mobileContrastAdd,
+                    sizeof(savedContrastAdd));
+        const float savedGradeBlur = *g_mobileGradeBlur;
+
+        cctvWasEnabled = savedCctv != 0;
+        *g_mobileCctv = 0;
+        g_mobileRender();
+
+        // Capture the exact retail result, then restore the hidden flat
+        // backend. Otherwise its later flush could grade/blur an invisible
+        // target and charge the GPU for work that only the eye resolve needs.
+        snapshotMobileColor();
+        *g_mobileUsingGrading = savedUsingGrading;
+        std::memcpy(g_mobileContrastMult, savedContrastAndGrades,
+                    sizeof(savedContrastAndGrades));
+        std::memcpy(g_mobileContrastAdd, savedContrastAdd,
+                    sizeof(savedContrastAdd));
+        *g_mobileGradeBlur = savedGradeBlur;
+        *g_mobileCctv = savedCctv;
+    } else {
+        // The original flat pass still owns MobileRender (theater/cutscene),
+        // so merely mirror its current backend values without invoking it.
+        snapshotMobileColor();
+    }
+
+    xr::SetMobileColorState(state);
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOGI("[mobile.color] first snapshot mode=%d invoked=%d cctv_skip=%d "
+             "blur_ignored=%.3f mult=%.3f/%.3f/%.3f add=%.3f/%.3f/%.3f",
+             state.mode, ownsFlatPass ? 1 : 0, cctvWasEnabled ? 1 : 0,
+             static_cast<double>(capturedBlur),
+             static_cast<double>(state.contrastMult[0]),
+             static_cast<double>(state.contrastMult[1]),
+             static_cast<double>(state.contrastMult[2]),
+             static_cast<double>(state.contrastAdd[0]),
+             static_cast<double>(state.contrastAdd[1]),
+             static_cast<double>(state.contrastAdd[2]));
+    }
+}
+
 bool InstallLampGroundPools(void* handle) {
     if (!g_coronaBillboardReady || !g_coronaArray) {
         LOGW("[gfxfx.lamp] disabled: corona state unavailable");
@@ -3576,6 +3766,10 @@ void RenderEye(void* rwCamera, int eye) {
     // compositor, not in the recorded eye passes, and profile 0 (the default
     // whenever the debug.savr.effects property is unset) must not kill it.
     PublishUnderwaterState(eye);
+    // Mobile Original colour is also a compositor resolve, independent of the
+    // optional geometry-effects profile. Publish it before this frame's stereo
+    // ring slot is sealed by SetStereoEyeTextures.
+    PublishMobileColorState(eye);
     if (profile == 0 || !rwCamera || (eye != 0 && eye != 1)) return;
 
     const bool symbolsReady = ResolveFunctions();
