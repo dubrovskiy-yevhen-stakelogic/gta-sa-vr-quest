@@ -3062,6 +3062,11 @@ std::atomic<bool> g_inputBlocked{false};
 using TouchQueryVecFn = bool (*)(int widgetId, void* outTouchPos, int touchIndex);
 TouchQueryVecFn g_origWidgetReleased = nullptr;
 constexpr int kParachuteDeployWidget = 187;
+// widget_phone. Disasm-verified: CTouchInterface::DrawHelpIcon resolves the
+// "~widget_phone~" help token to id 8 (mov w8,#8 @0x502b80 in 2.11), and
+// mainV1.scm polls widget 8 via opcode 0A52 right beside the
+// ANSWER0..ANSWER5 / CELSKIP GXT keys — the incoming-call answer flow.
+constexpr int kPhoneAnswerWidget = 8;
 // Latched once our deploy press goes through: freefall controls (dive) end
 // and the physical riser toggles take over. Cleared when the ped leaves the
 // parachute state (landed / vehicle / weapon change).
@@ -3103,6 +3108,18 @@ bool ParachuteDeployChordActive() {
     return in.a;   // A opens the canopy (right trigger is the dive)
 }
 
+// Both grips + right trigger answers an incoming cell-phone call. The widget
+// is only polled while the phone is actually ringing, so the chord cannot
+// misfire in normal play; the VR menu keeps its own grips chord because the
+// menu consumes the triggers for value adjustment.
+bool PhoneAnswerChordActive() {
+    if (g_inputBlocked.load(std::memory_order_relaxed)) return false;
+    xr::InputState in{};
+    xr::GetInput(in);
+    return in.grip[0] >= 0.75f && in.grip[1] >= 0.75f &&
+           in.triggers[1] >= 0.70f;
+}
+
 // Accept/decline prompt bridge. Mobile yes/no prompts poll a PAIR of touch
 // widgets every frame via IsReleased; the ids vary per prompt, so track the
 // distinct ids polled in the last half second (excluding the pause and
@@ -3130,8 +3147,16 @@ bool OnWidgetReleased(int widgetId, void* outTouchPos, int touchIndex) {
         ParachuteStateActive() && ParachuteScriptDeployReady())
         g_parachuteCanopyOpen.store(true, std::memory_order_relaxed);
 
+    // Incoming call: the phone widget is polled only while it rings, so a
+    // held chord simply answers on the next script poll.
+    if (widgetId == kPhoneAnswerWidget && !original &&
+        PhoneAnswerChordActive()) {
+        LOGI("[vr.touch] phone answered (grips + right trigger)");
+        return true;
+    }
+
     if (widgetId != 161 && widgetId != kParachuteDeployWidget &&
-        widgetId != 175) {
+        widgetId != 175 && widgetId != kPhoneAnswerWidget) {
         const double nowMs = NowMs();
         int slot = -1;
         for (int i = 0; i < 4; ++i) {

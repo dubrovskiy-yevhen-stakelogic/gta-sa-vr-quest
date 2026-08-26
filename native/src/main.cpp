@@ -951,6 +951,21 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         if (recenterChord && !recenterPrev) vrcam::RequestRecenter();
         recenterPrev = recenterChord;
 
+        // Both grips + R3: quick first/third person toggle for the CURRENT
+        // vehicle, no VR-menu trip. Only in a vehicle; L3+R3 keeps priority
+        // (recenter); the Rhino is skipped — its view is forced third-person
+        // and the toggle would silently flip the shared car setting instead.
+        static bool viewChordPrev = false;
+        const bool viewChord = grips && in.r3 && !in.l3;
+        if (viewChord && !viewChordPrev && menuPage == PG_NONE) {
+            const int vehicleType = savr::driving::GetActiveVehicleType();
+            if (vehicleType >= 0 &&
+                savr::driving::GetActiveVehicleModelId() != 432) {
+                savr::driving::CycleCameraView(vehicleType, +1);
+            }
+        }
+        viewChordPrev = viewChord;
+
         const bool openChord = grips && (in.menu || in.y);
         if (openChord && !openPrev) {
             if (menuPage == PG_HOLSTER_CALIB) savr::holster::EndCalibrationPreview();
