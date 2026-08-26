@@ -60,6 +60,10 @@ AUDIO_SENTINELS = (
     "SFX/GENRL.osw",
     "STREAMS/CUTSCENE.osw",
 )
+SUPPORTED_AUDIO_ARCHIVE = "gta-sa-ps2-style-mod-pack_1786856007_737162.7z"
+SUPPORTED_AUDIO_PAGE = (
+    "https://libertycity.net/files/gta-san-andreas-ios-android/241069-gta-sa-classic-avanced-mod-pack.html"
+)
 HAND_FILES = (
     "BigHandLeft.uxrh",
     "BigHandRight.uxrh",
@@ -823,9 +827,8 @@ def validate_audio(source: Path, work: Path, build_root: Path) -> AudioTree:
     except KitError as error:
         raise KitError(
             f"{error}\nRequired sound archive: "
-            "gta-sa-ps2-style-mod-pack_1786856007_737162.7z. "
-            "Download it from https://libertycity.net/files/gta-san-andreas-ios-android/"
-            "241069-gta-sa-classic-avanced-mod-pack.html and choose Original plan mod pack "
+            f"{SUPPORTED_AUDIO_ARCHIVE}. "
+            f"Download it from {SUPPORTED_AUDIO_PAGE} and choose Original plan mod pack "
             "(16 August 2026, 1.41 GB), not CLASSIC ADVANCED v1.0."
         ) from error
     reference = load_audio_reference()
@@ -858,14 +861,14 @@ def validate_audio(source: Path, work: Path, build_root: Path) -> AudioTree:
             raise KitError(
                 f"audio size mismatch: {spec['path']} ({size} != {spec['size']}). "
                 "This is not the supported Original plan mod pack. Use "
-                "gta-sa-ps2-style-mod-pack_1786856007_737162.7z, not CLASSIC ADVANCED v1.0."
+                f"{SUPPORTED_AUDIO_ARCHIVE}, not CLASSIC ADVANCED v1.0."
             )
         digest = sha256_file(path)
         if digest != spec["sha256"].upper():
             raise KitError(
                 f"audio hash mismatch: {spec['path']} ({digest}). "
                 "This is not the supported Original plan mod pack. Use "
-                "gta-sa-ps2-style-mod-pack_1786856007_737162.7z, not CLASSIC ADVANCED v1.0."
+                f"{SUPPORTED_AUDIO_ARCHIVE}, not CLASSIC ADVANCED v1.0."
             )
         verified.append(
             {
