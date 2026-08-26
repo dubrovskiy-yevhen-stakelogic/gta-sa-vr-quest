@@ -49,7 +49,7 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.1.0.12";  // internal build id (4th digit)
+constexpr char kModVersion[] = "0.1.0.13";  // internal build id (4th digit)
 #ifdef SAVR_DEV
 constexpr const char* kModVersionShown = kModVersion;
 #else
@@ -4385,7 +4385,7 @@ void BuildHolsterMenu() {
         }
         PanelText(row, cx, y, 2, c, c, (i == sel) ? 120 : c);
     }
-    const char* hint = "L2/R2 CHOOSE   A CLEAR POINT   B BACK";
+    const char* hint = "L2/R2 CHOOSE (EMPTY CLEARS)   B BACK";
     if (sel >= holster::PointCount() && sel <= holster::PointCount() + 2)
         hint = "A/B BACK";
     else if (holster::IsPointFixed(sel))

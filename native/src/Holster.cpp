@@ -188,7 +188,8 @@ void LoadSettings() {
 
     // Reject duplicate configured slots deterministically. EMPTY may occur more
     // than once. The dedicated throwable point is never configurable.
-    bool used[9] = {};
+    // Sized for the highest selectable slot (9, the gadget category).
+    bool used[10] = {};
     used[kCenterThrowableSlot] = true;
     proposed[CHEST_CENTER] = kCenterThrowableSlot;
     for (int point = 0; point < POINT_COUNT; ++point) {
@@ -342,17 +343,19 @@ int CyclePointSlot(int point, int direction) {
 
     const int current = gPointSlots[point].load(std::memory_order_acquire);
     const int step = direction < 0 ? -1 : 1;
-    // There are seven configurable categories. Start after the current value
-    // and stop after one full pass. This keeps EMPTY out of the cycle and also
-    // avoids silently stealing/swapping a category assigned to another point.
-    static constexpr int kCycle[8] = {1, 2, 3, 4, 5, 6, 7, 9};
-    int startIndex = step > 0 ? -1 : 8;
-    for (int i = 0; i < 8; ++i)
+    // Start after the current value and stop after one full pass. EMPTY is part
+    // of the ring so clearing a point is an explicit, reversible cycle choice;
+    // categories assigned to another point are never silently stolen/swapped.
+    static constexpr int kCycle[9] = {1, 2, 3, 4, 5, 6, 7, 9, kEmptySlot};
+    int startIndex = step > 0 ? -1 : 9;
+    for (int i = 0; i < 9; ++i)
         if (kCycle[i] == current) { startIndex = i; break; }
-    for (int attempt = 1; attempt <= 8; ++attempt) {
-        const int selected = kCycle[(startIndex + step * attempt + 16) % 8];
-        if (WeaponTypeInSlot(ped, selected) == 0) continue;
-        if (FindPointForSlot(selected) >= 0) continue;
+    for (int attempt = 1; attempt <= 9; ++attempt) {
+        const int selected = kCycle[(startIndex + step * attempt + 18) % 9];
+        if (selected != kEmptySlot) {
+            if (WeaponTypeInSlot(ped, selected) == 0) continue;
+            if (FindPointForSlot(selected) >= 0) continue;
+        }
         SetPointSlot(point, selected);
         break;
     }

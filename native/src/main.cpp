@@ -1117,10 +1117,10 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             if (holsterSel < savr::holster::PointCount()) {
                 if (minus) savr::holster::CyclePointSlot(holsterSel, -1);
                 if (plus) savr::holster::CyclePointSlot(holsterSel, +1);
-                // A is edge-triggered above, so clearing a configured point is
-                // always a separate, deliberate action and can never happen
-                // while the player is merely cycling available categories.
-                if (enter) savr::holster::ClearPointSlot(holsterSel);
+                // A cycles too: players read A as "confirm", and an instant
+                // clear on that press kept stranding categories. EMPTY is an
+                // explicit stop in the cycle ring instead.
+                if (enter) savr::holster::CyclePointSlot(holsterSel, +1);
             } else if (holsterSel == savr::holster::PointCount()) {
                 if (minus) savr::holster::AdjustGrabRadiusCm(-1);
                 if (plus)  savr::holster::AdjustGrabRadiusCm(+1);

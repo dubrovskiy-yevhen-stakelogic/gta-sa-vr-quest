@@ -4320,6 +4320,10 @@ struct LodHandoffCounters {
     int modelDrawBatchApplied{};
     int modelDrawBatchConflicts{};
     int modelDrawBatchOverflows{};
+    int aircraftAlphaShellTests{};
+    int aircraftAlphaShellRescues{};
+    int aircraftAlphaShellCovered{};
+    int aircraftAlphaShellApplyFaults{};
     int propModelId{-1};
     int propResult{-1};
     float propDistance{};
@@ -5148,6 +5152,9 @@ struct AircraftOrdinaryOuterCounters {
     int radialReplayOther{};
     int radialCaptureOverflow{};
     int radialSectorOverflow{};
+    int radialAlphaRetained{};
+    int radialFadeSafeQueued{};
+    int radialFadeSafeCapped{};
     int rosterPrevious{};
     int rosterPrepared{};
     int rosterMatches{};
@@ -5208,6 +5215,143 @@ thread_local bool g_aircraftOrdinaryRadialSelectionActive = false;
 thread_local bool g_aircraftOrdinaryRadialAdmissionActive = false;
 thread_local float g_aircraftOrdinaryRadialMaxGroundM =
     kAircraftOrdinaryHorizonMaxGroundDistanceM;
+struct AircraftOrdinaryRenderTarget {
+    void* entity{};
+    std::uint64_t identityHash{};
+    std::int16_t modelId{-1};
+    float fadeSafeRawDrawDistance{};
+    std::uint8_t opaqueEyeMask{};
+    std::uint8_t alphaEyeMask{};
+    std::uint8_t atomicEyeMask{};
+};
+constexpr std::size_t kAircraftOrdinaryRenderTargetHashSize = 256u;
+struct AircraftOrdinaryRenderWitnessFrame {
+    bool active{};
+    bool overflow{};
+    float altitudeM{};
+    float headForwardZ{};
+    int selectedCount{};
+    int exactCount{};
+    std::uint64_t selectedHash{};
+    std::uint64_t exactHash{};
+    int targetCount{};
+    std::array<AircraftOrdinaryRenderTarget,
+               kAircraftOrdinaryHorizonForcedLimitMax> targets{};
+    std::array<void*, kAircraftOrdinaryRenderTargetHashSize> targetHashKeys{};
+    std::array<std::uint8_t, kAircraftOrdinaryRenderTargetHashSize>
+        targetHashIndices{};
+};
+thread_local AircraftOrdinaryRenderWitnessFrame
+    g_aircraftOrdinaryRenderWitness{};
+
+std::uint64_t AircraftOrdinaryStableIdentityHash(
+        const AircraftOrdinaryRadialCandidate& candidate) {
+    if (!std::isfinite(candidate.worldX) ||
+        !std::isfinite(candidate.worldY) ||
+        !std::isfinite(candidate.worldZ)) {
+        return 0u;
+    }
+    const auto quantize = [](float value) {
+        return static_cast<std::int32_t>(std::lround(value * 4.0f));
+    };
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto append = [&](std::uint32_t value) {
+        for (int byte = 0; byte < 4; ++byte) {
+            hash ^= static_cast<std::uint8_t>(value >> (byte * 8));
+            hash *= 1099511628211ULL;
+        }
+    };
+    append(static_cast<std::uint32_t>(
+        static_cast<std::int32_t>(candidate.modelId)));
+    append(static_cast<std::uint32_t>(quantize(candidate.worldX)));
+    append(static_cast<std::uint32_t>(quantize(candidate.worldY)));
+    append(static_cast<std::uint32_t>(quantize(candidate.worldZ)));
+    return hash;
+}
+
+AircraftOrdinaryRenderTarget* FindAircraftOrdinaryRenderTarget(
+        const void* entity) {
+    if (!entity || !g_aircraftOrdinaryRenderWitness.active) return nullptr;
+    std::uintptr_t hash = reinterpret_cast<std::uintptr_t>(entity) >> 4u;
+    hash ^= hash >> 17u;
+    hash *= static_cast<std::uintptr_t>(0x9e3779b1u);
+    const std::size_t mask = kAircraftOrdinaryRenderTargetHashSize - 1u;
+    std::size_t slot = static_cast<std::size_t>(hash) & mask;
+    for (std::size_t probe = 0;
+         probe < kAircraftOrdinaryRenderTargetHashSize; ++probe) {
+        void* const key =
+            g_aircraftOrdinaryRenderWitness.targetHashKeys[slot];
+        if (!key) return nullptr;
+        if (key == entity) {
+            const std::uint8_t encoded =
+                g_aircraftOrdinaryRenderWitness.targetHashIndices[slot];
+            if (encoded == 0u || encoded >
+                    g_aircraftOrdinaryRenderWitness.targetCount) {
+                return nullptr;
+            }
+            return &g_aircraftOrdinaryRenderWitness.targets[
+                static_cast<std::size_t>(encoded - 1u)];
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return nullptr;
+}
+
+bool RegisterAircraftOrdinaryRenderTarget(int targetIndex) {
+    if (targetIndex < 0 || targetIndex >=
+            g_aircraftOrdinaryRenderWitness.targetCount ||
+        targetIndex >= 255) {
+        return false;
+    }
+    void* const entity = g_aircraftOrdinaryRenderWitness.targets[
+        static_cast<std::size_t>(targetIndex)].entity;
+    if (!entity) return false;
+    std::uintptr_t hash = reinterpret_cast<std::uintptr_t>(entity) >> 4u;
+    hash ^= hash >> 17u;
+    hash *= static_cast<std::uintptr_t>(0x9e3779b1u);
+    const std::size_t mask = kAircraftOrdinaryRenderTargetHashSize - 1u;
+    std::size_t slot = static_cast<std::size_t>(hash) & mask;
+    for (std::size_t probe = 0;
+         probe < kAircraftOrdinaryRenderTargetHashSize; ++probe) {
+        void*& key = g_aircraftOrdinaryRenderWitness.targetHashKeys[slot];
+        if (!key || key == entity) {
+            key = entity;
+            g_aircraftOrdinaryRenderWitness.targetHashIndices[slot] =
+                static_cast<std::uint8_t>(targetIndex + 1);
+            return true;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return false;
+}
+
+void MarkAircraftOrdinaryRenderDispatch(void* entity, bool alpha) {
+    if (g_renderingStereoEyeIndex != 0 &&
+        g_renderingStereoEyeIndex != 1) {
+        return;
+    }
+    AircraftOrdinaryRenderTarget* const target =
+        FindAircraftOrdinaryRenderTarget(entity);
+    if (!target) return;
+    const std::uint8_t bit = static_cast<std::uint8_t>(
+        1u << static_cast<unsigned int>(g_renderingStereoEyeIndex));
+    if (alpha)
+        target->alphaEyeMask |= bit;
+    else
+        target->opaqueEyeMask |= bit;
+}
+
+void MarkAircraftOrdinaryAtomicDispatch(void* entity) {
+    if (g_renderingStereoEyeIndex != 0 &&
+        g_renderingStereoEyeIndex != 1) {
+        return;
+    }
+    AircraftOrdinaryRenderTarget* const target =
+        FindAircraftOrdinaryRenderTarget(entity);
+    if (!target) return;
+    target->atomicEyeMask |= static_cast<std::uint8_t>(
+        1u << static_cast<unsigned int>(g_renderingStereoEyeIndex));
+}
 struct AircraftOrdinaryPersistentEntry {
     void* entity{};
     float worldX{};
@@ -5420,6 +5564,167 @@ void QueueStereoModelDrawDistance(float* address, float observed,
             .replacementBits = replacementBits,
         };
     ++g_lodHandoffCounters.modelDrawBatchUnique;
+}
+
+void AccumulateAircraftOrdinaryIdentityHash(
+        std::uint64_t* aggregate, std::uint64_t identity) {
+    if (!aggregate) return;
+    // An order-independent avalanche keeps the hash stable when the sector
+    // enumerator visits the same selected set in a different order.
+    identity ^= identity >> 33u;
+    identity *= 0xff51afd7ed558ccdULL;
+    identity ^= identity >> 33u;
+    identity *= 0xc4ceb9fe1a85ec53ULL;
+    identity ^= identity >> 33u;
+    *aggregate += identity;
+}
+
+float AircraftOrdinaryFadeSafeRawDrawDistance(
+        float currentRawDrawDistance, float distance, float cameraLod,
+        float boundRadius, float stereoFarClip, bool* capped) {
+    if (capped) *capped = false;
+    if (!std::isfinite(currentRawDrawDistance) ||
+        currentRawDrawDistance <= 0.0f || !std::isfinite(distance) ||
+        distance < 0.0f || !std::isfinite(cameraLod) ||
+        cameraLod <= 0.01f || !std::isfinite(boundRadius) ||
+        boundRadius < 0.0f) {
+        return 0.0f;
+    }
+
+    // CalculateFadingAtomicAlpha re-reads the shared model draw distance while
+    // each eye is rendered. Merely admitting an entity at distance+2 leaves a
+    // large model partly (and sometimes almost fully) transparent because its
+    // fade band grows with draw distance. Solve the retail fade equation for
+    // alpha=255, while keeping the same aircraft far-clip ceiling.
+    const float multiplier = std::min(1.0f, cameraLod);
+    const float denominator =
+        1.0f - multiplier / (15.0f * cameraLod);
+    float requiredRadius =
+        distance + kAircraftOrdinaryPromotionThresholdEpsilonM;
+    if (distance > 10.0f && std::isfinite(denominator) &&
+        denominator > 0.05f) {
+        requiredRadius = std::max(
+            requiredRadius,
+            (distance - 10.0f) / denominator +
+                kAircraftOrdinaryPromotionThresholdEpsilonM);
+    }
+    const float maxEffectiveRadius = stereoFarClip + boundRadius;
+    if (std::isfinite(maxEffectiveRadius) && maxEffectiveRadius > 0.0f &&
+        requiredRadius > maxEffectiveRadius) {
+        requiredRadius = maxEffectiveRadius;
+        if (capped) *capped = true;
+    }
+    const float requiredRaw = requiredRadius / cameraLod;
+    return std::isfinite(requiredRaw) && requiredRaw > 0.0f
+        ? std::max(currentRawDrawDistance, requiredRaw)
+        : 0.0f;
+}
+
+void PublishAircraftOrdinaryRenderWitnessAndFadeQueue(
+        bool active, float altitudeM, float farClipM) {
+    g_aircraftOrdinaryRenderWitness = {};
+    if (!active) return;
+
+    AircraftOrdinaryRenderWitnessFrame& frame =
+        g_aircraftOrdinaryRenderWitness;
+    frame.active = true;
+    frame.altitudeM = altitudeM;
+    frame.headForwardZ = g_aircraftOrdinaryHorizonHeadForwardZ;
+    const float cameraLod = g.TheCamera
+        ? *reinterpret_cast<const float*>(
+              static_cast<const std::uint8_t*>(g.TheCamera) +
+              kOffLodMultiplier)
+        : 0.0f;
+
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+        const AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        if (!candidate.selected) continue;
+        const std::uint64_t identity =
+            AircraftOrdinaryStableIdentityHash(candidate);
+        ++frame.selectedCount;
+        AccumulateAircraftOrdinaryIdentityHash(
+            &frame.selectedHash, identity);
+
+        const bool exact = candidate.retained || candidate.replayCompleted;
+        if (!exact) continue;
+        ++frame.exactCount;
+        AccumulateAircraftOrdinaryIdentityHash(&frame.exactHash, identity);
+        if (frame.targetCount >=
+            static_cast<int>(frame.targets.size())) {
+            frame.overflow = true;
+            continue;
+        }
+
+        const int targetIndex = frame.targetCount++;
+        AircraftOrdinaryRenderTarget& target =
+            frame.targets[static_cast<std::size_t>(targetIndex)];
+        target.entity = candidate.entity;
+        target.identityHash = identity;
+        target.modelId = candidate.modelId;
+        if (!RegisterAircraftOrdinaryRenderTarget(targetIndex))
+            frame.overflow = true;
+
+        if (!g.CModelInfo_ms_modelInfoPtrs || candidate.modelId < 0 ||
+            candidate.modelId >= 20000) {
+            continue;
+        }
+        void* const modelInfo =
+            g.CModelInfo_ms_modelInfoPtrs[candidate.modelId];
+        if (!modelInfo) continue;
+        float* const drawDistanceAddress = reinterpret_cast<float*>(
+            static_cast<std::uint8_t*>(modelInfo) + 0x38);
+        const float observedRaw = *drawDistanceAddress;
+        bool capped = false;
+        const float fadeSafeRaw = AircraftOrdinaryFadeSafeRawDrawDistance(
+            observedRaw, candidate.slantDistanceM, cameraLod,
+            candidate.boundRadiusM, farClipM, &capped);
+        target.fadeSafeRawDrawDistance = fadeSafeRaw;
+        if (capped) ++g_aircraftOrdinaryOuter.radialFadeSafeCapped;
+        if (g_visibilityScanPhase != 0 && std::isfinite(fadeSafeRaw) &&
+            fadeSafeRaw > observedRaw) {
+            QueueStereoModelDrawDistance(
+                drawDistanceAddress, observedRaw, fadeSafeRaw);
+            ++g_aircraftOrdinaryOuter.radialFadeSafeQueued;
+        }
+    }
+}
+
+struct AircraftOrdinaryRenderEyeStats {
+    int dispatch{};
+    int opaque{};
+    int alpha{};
+    int atomic{};
+    std::uint64_t dispatchHash{};
+    std::uint64_t atomicHash{};
+};
+
+AircraftOrdinaryRenderEyeStats SummarizeAircraftOrdinaryRenderEye(int eye) {
+    AircraftOrdinaryRenderEyeStats stats{};
+    if (eye != 0 && eye != 1) return stats;
+    const std::uint8_t bit = static_cast<std::uint8_t>(
+        1u << static_cast<unsigned int>(eye));
+    for (int i = 0; i < g_aircraftOrdinaryRenderWitness.targetCount; ++i) {
+        const AircraftOrdinaryRenderTarget& target =
+            g_aircraftOrdinaryRenderWitness.targets[
+                static_cast<std::size_t>(i)];
+        const bool opaque = (target.opaqueEyeMask & bit) != 0u;
+        const bool alpha = (target.alphaEyeMask & bit) != 0u;
+        const bool atomic = (target.atomicEyeMask & bit) != 0u;
+        if (opaque) ++stats.opaque;
+        if (alpha) ++stats.alpha;
+        if (opaque || alpha) {
+            ++stats.dispatch;
+            AccumulateAircraftOrdinaryIdentityHash(
+                &stats.dispatchHash, target.identityHash);
+        }
+        if (atomic) {
+            ++stats.atomic;
+            AccumulateAircraftOrdinaryIdentityHash(
+                &stats.atomicHash, target.identityHash);
+        }
+    }
+    return stats;
 }
 
 class ScopedStereoModelDrawDistances {
@@ -9411,6 +9716,12 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
          observeAircraftOrdinaryRadialRetention)
             ? ReadAircraftLodCapacity()
             : AircraftLodCapacitySnapshot{};
+    std::uint64_t aircraftOrdinaryFlagsBefore = 0u;
+    if (aircraftOrdinaryRangePromotion) {
+        std::memcpy(&aircraftOrdinaryFlagsBefore,
+                    static_cast<const std::uint8_t*>(entity) + 0x28,
+                    sizeof(aircraftOrdinaryFlagsBefore));
+    }
     if (useDrawDistanceBridge) {
         result = SavrSetupMapEntityVisibilityWithDrawDistance(
             entity, modelInfo, distance, timeInRange, drawDistance,
@@ -9450,6 +9761,20 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
              observeAircraftOrdinaryRadialRetention)
                 ? ReadAircraftLodCapacity()
                 : AircraftLodCapacitySnapshot{};
+        std::uint64_t aircraftOrdinaryFlagsAfter = 0u;
+        std::memcpy(&aircraftOrdinaryFlagsAfter,
+                    static_cast<const std::uint8_t*>(entity) + 0x28,
+                    sizeof(aircraftOrdinaryFlagsAfter));
+        constexpr std::uint64_t kDistanceFadeFlag = 1ull << 15u;
+        // In retail SetupMap the only 0->1 transition of m_bDistanceFade in
+        // this call occurs immediately before AddEntityToRenderList. That path
+        // returns 0, so the old visible/scratch-only capacity witness missed it.
+        // The transition is an O(1) synchronous proof and avoids walking all
+        // alpha lists up to 80 times per aircraft frame.
+        const bool aircraftOrdinaryRetainedInStereoAlpha =
+            aircraftOrdinaryRangePromotion && result == 0 &&
+            (aircraftOrdinaryFlagsBefore & kDistanceFadeFlag) == 0u &&
+            (aircraftOrdinaryFlagsAfter & kDistanceFadeFlag) != 0u;
         // A rootless ordinary entity returns VISIBLE and is appended by its
         // caller. A linked child of a multi-child parent can instead be
         // appended to retail's LOD scratch list inside SetupMap and return 0.
@@ -9464,8 +9789,13 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
                     aircraftOrdinaryCapacityBefore.visibleEntities ||
               aircraftOrdinaryCapacityAfter.visibleLods >
                      aircraftOrdinaryCapacityBefore.visibleLods);
+        const bool aircraftOrdinaryRetainedForStereo =
+            aircraftOrdinaryRetainedInSetupMap ||
+            aircraftOrdinaryRetainedInStereoAlpha;
+        if (aircraftOrdinaryRetainedInStereoAlpha)
+            ++g_aircraftOrdinaryOuter.radialAlphaRetained;
         if (aircraftOrdinaryPersistentRosterCall && persistentRosterEntry &&
-            (result == 1 || aircraftOrdinaryRetainedInSetupMap) &&
+            (result == 1 || aircraftOrdinaryRetainedForStereo) &&
             !persistentRosterEntry->retainedThisFrame) {
             persistentRosterEntry->retainedThisFrame = true;
             ++g_aircraftOrdinaryOuter.rosterRetained;
@@ -9492,7 +9822,7 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             savedOrdinaryPersistentContext;
         if (aircraftOrdinaryRangePromotion &&
             aircraftOrdinaryRangePromotionAccepted &&
-            (result == 1 || aircraftOrdinaryRetainedInSetupMap) &&
+            (result == 1 || aircraftOrdinaryRetainedForStereo) &&
             setupDrawDistanceOverride) {
             QueueStereoModelDrawDistance(
                 reinterpret_cast<float*>(
@@ -9530,7 +9860,7 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         if (observeAircraftOrdinaryRadialRetention) {
             ObserveAircraftOrdinaryRadialCandidate(
                 entity, modelInfo, timeInRange, result,
-                result == 1 || aircraftOrdinaryRetainedInSetupMap,
+                result == 1 || aircraftOrdinaryRetainedForStereo,
                 aircraftOrdinaryScreenTested,
                 aircraftOrdinaryScreenVisible);
         }
@@ -9880,6 +10210,8 @@ void* OnAtomicDefaultRender(void* atomic) {
         }
     }
     void* const rendered = g_origAtomicDefaultRender(atomic);
+    if (rendered == atomic)
+        MarkAircraftOrdinaryAtomicDispatch(entity);
     if (trafficProbeActive) {
         if (ownedByTrafficVehicle) {
             if (rendered == atomic) {
@@ -9895,6 +10227,7 @@ void* OnAtomicDefaultRender(void* atomic) {
 }
 
 void OnRenderOneNonRoad(void* entity) {
+    MarkAircraftOrdinaryRenderDispatch(entity, false);
     const traffic_census::AtomicRenderProbe atomicProbe =
         MarkTrafficVehicleRendered(entity);
     if (VisibilityWitnessEnabled()) TraceEntityRender(entity, "opaque");
@@ -9927,6 +10260,7 @@ void OnRenderOneNonRoad(void* entity) {
 }
 
 void OnRenderAlphaEntity(void* entity, float distance) {
+    MarkAircraftOrdinaryRenderDispatch(entity, true);
     if (VisibilityWitnessEnabled()) TraceEntityRender(entity, "alpha");
     if (!g_origRenderAlphaEntity) return;
 
@@ -9943,15 +10277,23 @@ void OnRenderAlphaEntity(void* entity, float distance) {
     const bool targetedShortVegetation = vegetationStock > 0.0f;
     const bool targetedStreetProp = targetedSilhouette ||
         targetedShortVegetation || StreetPropStockDrawDistance(modelId) > 0.0f;
-    ScopedModelDrawDistance alphaDrawDistanceScope;
-    ScopedRendererFarClipPlane alphaFarScope;
-    if (bytes && g_stereoActive.load(std::memory_order_relaxed) &&
+    AircraftOrdinaryRenderTarget* const aircraftTarget =
+        FindAircraftOrdinaryRenderTarget(entity);
+    const bool aircraftAlphaTarget = aircraftTarget && bytes &&
+        (g_renderingStereoEyeIndex == 0 ||
+         g_renderingStereoEyeIndex == 1) && !linkedLod &&
+        (entityType == 1 || entityType == 4 || entityType == 5);
+    const bool targetedProfileAlpha = bytes &&
+        g_stereoActive.load(std::memory_order_relaxed) &&
         PhoneDistanceProfileEnabled() && IsKnownCullOwnerThread() &&
         !linkedLod && (entityType == 1 || entityType == 4 || entityType == 5) &&
         (IsLargeVegetationModel(modelId) ||
          IsRoadsideVisibilityModel(modelId) || IsTallPoleModel(modelId) ||
          IsTrafficSignalModel(modelId) || IsSmallPostModel(modelId) ||
-         targetedStreetProp) &&
+         targetedStreetProp);
+    ScopedModelDrawDistance alphaDrawDistanceScope;
+    ScopedRendererFarClipPlane alphaFarScope;
+    if ((aircraftAlphaTarget || targetedProfileAlpha) &&
         g.CRenderer_ms_fFarClipPlane && g.CModelInfo_ms_modelInfoPtrs &&
         modelId >= 0 && modelId < 20000) {
         const bool farClipSymbolFingerprint = g.LoadBase &&
@@ -9977,33 +10319,65 @@ void OnRenderAlphaEntity(void* entity, float distance) {
                 : 0.0f;
             if (std::isfinite(cameraLod) && cameraLod > 0.0f) {
                 float requestedRaw = drawDistance;
-                const float requestedRadius = LargeVegetationSafetyM();
-                if (IsLargeVegetationModel(modelId) &&
-                    std::isfinite(requestedRadius) && requestedRadius > 0.0f) {
-                    requestedRaw = std::max(
-                        requestedRaw, requestedRadius / cameraLod);
+                bool aircraftNeedsRescue = false;
+                if (aircraftAlphaTarget) {
+                    ++g_lodHandoffCounters.aircraftAlphaShellTests;
+                    const bool targetValid = aircraftTarget->modelId == modelId &&
+                        std::isfinite(
+                            aircraftTarget->fadeSafeRawDrawDistance) &&
+                        aircraftTarget->fadeSafeRawDrawDistance > 0.0f;
+                    if (!targetValid) {
+                        ++g_lodHandoffCounters
+                            .aircraftAlphaShellApplyFaults;
+                    } else if (drawDistance + 0.001f >=
+                               aircraftTarget->fadeSafeRawDrawDistance) {
+                        ++g_lodHandoffCounters.aircraftAlphaShellCovered;
+                    } else {
+                        requestedRaw = std::max(
+                            requestedRaw,
+                            aircraftTarget->fadeSafeRawDrawDistance);
+                        aircraftNeedsRescue = true;
+                    }
+                }
+                if (targetedProfileAlpha) {
+                    const float requestedRadius = LargeVegetationSafetyM();
+                    if (IsLargeVegetationModel(modelId) &&
+                        std::isfinite(requestedRadius) &&
+                        requestedRadius > 0.0f) {
+                        requestedRaw = std::max(
+                            requestedRaw, requestedRadius / cameraLod);
+                    }
+
+                    float propFloor = StreetPropFloorM();
+                    if (IsTrafficSignalModel(modelId))
+                        propFloor = TrafficSignalFloorM();
+                    else if (IsTallPoleModel(modelId))
+                        propFloor = SilhouettePropFloorM();
+                    else if (IsSmallPostModel(modelId))
+                        propFloor = SmallPostFloorM();
+                    else if (targetedSilhouette)
+                        propFloor = SilhouettePropFloorM();
+                    else if (targetedShortVegetation)
+                        propFloor = ShortVegetationFloorM();
+                    if (targetedStreetProp && std::isfinite(propFloor) &&
+                        propFloor > 0.0f) {
+                        requestedRaw = std::max(requestedRaw, propFloor);
+                    }
                 }
 
-                float propFloor = StreetPropFloorM();
-                if (IsTrafficSignalModel(modelId))
-                    propFloor = TrafficSignalFloorM();
-                else if (IsTallPoleModel(modelId))
-                    propFloor = SilhouettePropFloorM();
-                else if (IsSmallPostModel(modelId))
-                    propFloor = SmallPostFloorM();
-                else if (targetedSilhouette)
-                    propFloor = SilhouettePropFloorM();
-                else if (targetedShortVegetation)
-                    propFloor = ShortVegetationFloorM();
-                if (targetedStreetProp && std::isfinite(propFloor) &&
-                    propFloor > 0.0f) {
-                    requestedRaw = std::max(requestedRaw, propFloor);
-                }
-
-                if (std::isfinite(requestedRaw) && requestedRaw > drawDistance &&
-                    alphaDrawDistanceScope.TryApply(
-                        drawDistanceAddress, drawDistance, requestedRaw)) {
-                    drawDistance = requestedRaw;
+                if (std::isfinite(requestedRaw) &&
+                    requestedRaw > drawDistance) {
+                    const bool applied = alphaDrawDistanceScope.TryApply(
+                        drawDistanceAddress, drawDistance, requestedRaw);
+                    if (applied) {
+                        drawDistance = requestedRaw;
+                        if (aircraftNeedsRescue)
+                            ++g_lodHandoffCounters
+                                .aircraftAlphaShellRescues;
+                    } else if (aircraftNeedsRescue) {
+                        ++g_lodHandoffCounters
+                            .aircraftAlphaShellApplyFaults;
+                    }
                 }
             }
             if (std::isfinite(drawDistance) && drawDistance > 0.0f &&
@@ -10031,7 +10405,11 @@ void OnRenderAlphaEntity(void* entity, float distance) {
                     }
                 }
             }
+        } else if (aircraftAlphaTarget) {
+            ++g_lodHandoffCounters.aircraftAlphaShellApplyFaults;
         }
+    } else if (aircraftAlphaTarget) {
+        ++g_lodHandoffCounters.aircraftAlphaShellApplyFaults;
     }
 
     ScopedEntityBigBuildingBypass bigBuildingScope;
@@ -15370,10 +15748,18 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
         g_aircraftOrdinaryOuterSessionDisabled = true;
         discardPrefetchAfterRadialFault();
     }
-    if (!g_aircraftOrdinaryOuterSessionDisabled && !structuralReplayFault)
+    if (!g_aircraftOrdinaryOuterSessionDisabled && !structuralReplayFault) {
         CommitAircraftOrdinaryPersistentRoster();
-    else
+        // Selection/replay has now resolved exact list membership. Queue the
+        // full-fade draw distance for every selected cheap silhouette, including
+        // result-0 entities living in an alpha list, and retain pointer-level
+        // witnesses until both eye passes have finished.
+        PublishAircraftOrdinaryRenderWitnessAndFadeQueue(
+            profile.active, profile.altitudeM, profile.farClipM);
+    } else {
         ClearAircraftOrdinaryPersistentRoster();
+        g_aircraftOrdinaryRenderWitness = {};
+    }
     g_aircraftOrdinaryOuter.cpuMs += std::max(
         0.0, perf::ThreadCpuMs() - cpuStart);
     g_aircraftOrdinaryOuter.wallMs += std::max(
@@ -16884,14 +17270,53 @@ void OnRenderScene(bool underwater) {
                         g_profCull.dynamicVisible);
     if ((g_recordCounter % 72) == 0) {
         LOGI("[lod.alpha-batch] candidates=%d unique/applied=%d/%d "
-             "conflict/overflow/restore_fault=%d/%d/%d",
+             "conflict/overflow/restore_fault=%d/%d/%d "
+             "air_shell=test/rescue/covered/fault=%d/%d/%d/%d",
              g_lodHandoffCounters.modelDrawBatchCandidates,
              g_lodHandoffCounters.modelDrawBatchUnique,
              g_lodHandoffCounters.modelDrawBatchApplied,
              g_lodHandoffCounters.modelDrawBatchConflicts,
              g_lodHandoffCounters.modelDrawBatchOverflows,
-             g_lodHandoffCounters.modelDrawRestoreFaults);
+             g_lodHandoffCounters.modelDrawRestoreFaults,
+             g_lodHandoffCounters.aircraftAlphaShellTests,
+             g_lodHandoffCounters.aircraftAlphaShellRescues,
+             g_lodHandoffCounters.aircraftAlphaShellCovered,
+             g_lodHandoffCounters.aircraftAlphaShellApplyFaults);
     }
+    if ((g_recordCounter % 72) == 0 &&
+        g_aircraftOrdinaryRenderWitness.active) {
+        const AircraftOrdinaryRenderEyeStats left =
+            SummarizeAircraftOrdinaryRenderEye(0);
+        const AircraftOrdinaryRenderEyeStats right =
+            SummarizeAircraftOrdinaryRenderEye(1);
+        LOGI("[lod.air.identity] alt=%.1f headz=%.3f "
+             "selected=%d/%016llx exact=%d/%016llx targets=%d overflow=%d",
+             static_cast<double>(
+                 g_aircraftOrdinaryRenderWitness.altitudeM),
+             static_cast<double>(
+                 g_aircraftOrdinaryRenderWitness.headForwardZ),
+             g_aircraftOrdinaryRenderWitness.selectedCount,
+             static_cast<unsigned long long>(
+                 g_aircraftOrdinaryRenderWitness.selectedHash),
+             g_aircraftOrdinaryRenderWitness.exactCount,
+             static_cast<unsigned long long>(
+                 g_aircraftOrdinaryRenderWitness.exactHash),
+             g_aircraftOrdinaryRenderWitness.targetCount,
+             g_aircraftOrdinaryRenderWitness.overflow ? 1 : 0);
+        LOGI("[lod.air.draw] "
+             "L=d/o/a/atom=%d/%d/%d/%d hash=%016llx/%016llx "
+             "R=d/o/a/atom=%d/%d/%d/%d hash=%016llx/%016llx",
+             left.dispatch, left.opaque, left.alpha, left.atomic,
+             static_cast<unsigned long long>(left.dispatchHash),
+             static_cast<unsigned long long>(left.atomicHash),
+             right.dispatch, right.opaque, right.alpha, right.atomic,
+             static_cast<unsigned long long>(right.dispatchHash),
+             static_cast<unsigned long long>(right.atomicHash));
+    }
+    // The selected pointers and fade policy belong to this one render-list
+    // transaction. Both eyes are complete; do not let an additional large
+    // RenderScene without a fresh ScanWorld inherit stale entities.
+    g_aircraftOrdinaryRenderWitness = {};
     if ((g_recordCounter % 360) == 0 &&
         g_neonSignsSeenMask.load(std::memory_order_relaxed) != 0) {
         LOGI("[graphics.neon] enabled=%d seen=0x%08x "
@@ -18412,6 +18837,7 @@ void OnScanWorld() {
     g_aircraftOrdinaryRadialSelectionActive = false;
     g_aircraftOrdinaryRadialAdmissionActive = false;
     g_aircraftOrdinaryRadialCandidateCount = 0;
+    g_aircraftOrdinaryRenderWitness = {};
     g_aircraftOrdinaryRadialCandidateHashKeys.fill(nullptr);
     g_aircraftOrdinaryRadialCaptureOverflow = false;
     g_aircraftOrdinaryRadialMaxGroundM =
@@ -18769,6 +19195,7 @@ void OnScanWorld() {
                   "replay=req/visit/done/miss/sec=%d/%d/%d/%d/%d "
                   "out=v/c/s/o=%d/%d/%d/%d "
                   "overflow=c/s=%d/%d "
+                  "fade=alpha/queue/cap=%d/%d/%d "
                   "roster=prev/next/match/rej/prom/admit/keep/miss="
                   "%d/%d/%d/%d/%d/%d/%d/%d "
                   "time=wall/cpu=%.3f/%.3fms",
@@ -18842,6 +19269,9 @@ void OnScanWorld() {
                  g_aircraftOrdinaryOuter.radialReplayOther,
                   g_aircraftOrdinaryOuter.radialCaptureOverflow,
                   g_aircraftOrdinaryOuter.radialSectorOverflow,
+                  g_aircraftOrdinaryOuter.radialAlphaRetained,
+                  g_aircraftOrdinaryOuter.radialFadeSafeQueued,
+                  g_aircraftOrdinaryOuter.radialFadeSafeCapped,
                   g_aircraftOrdinaryOuter.rosterPrevious,
                   g_aircraftOrdinaryOuter.rosterPrepared,
                   g_aircraftOrdinaryOuter.rosterMatches,
@@ -20758,12 +21188,17 @@ bool Install() {
     // position-independent stack/register instructions in retail 2.11.
     const bool trafficRenderWitnessRequested =
         g_trafficTerminalScavengerActive.load(std::memory_order_acquire);
+    // The aircraft shell publishes at most 80 exact pointers. Keep the three
+    // final render witnesses installed even when verbose visibility tracing is
+    // disabled, otherwise a zero eye/atomic mask would be ambiguous.
+    constexpr bool aircraftRenderWitnessRequested = true;
     const bool renderWitnessRequested = VisibilityWitnessEnabled() ||
-        trafficRenderWitnessRequested;
+        trafficRenderWitnessRequested || aircraftRenderWitnessRequested;
     const bool targetedAlphaPolicyRequested =
         TargetedBigLodBypassEnabled();
     const bool alphaHookRequested =
-        VisibilityWitnessEnabled() || targetedAlphaPolicyRequested;
+        VisibilityWitnessEnabled() || targetedAlphaPolicyRequested ||
+        aircraftRenderWitnessRequested;
     const bool renderHookRequested =
         renderWitnessRequested || targetedAlphaPolicyRequested;
     bool renderWitnessFingerprint = renderHookRequested && g.LoadBase &&
@@ -20816,10 +21251,11 @@ bool Install() {
         targetedAlphaPolicyRequested && alphaHookInstalledThisCall,
         std::memory_order_release);
     LOGI("[vis.render] witness opaque=%d alpha=%d requested=%d "
-         "targeted_alpha_policy=%d fingerprint=%d",
+         "aircraft=%d targeted_alpha_policy=%d fingerprint=%d",
          g_origRenderOneNonRoad ? 1 : 0,
          g_origRenderAlphaEntity ? 1 : 0,
          renderWitnessRequested ? 1 : 0,
+         aircraftRenderWitnessRequested ? 1 : 0,
          targetedAlphaPolicyRequested ? 1 : 0,
          renderWitnessFingerprint ? 1 : 0);
     // AtomicDefaultRenderCallBack is the last common CPU submission point
@@ -20828,7 +21264,7 @@ bool Install() {
     // to identify a downstream fade/LOD gate. Attribute only eye zero and only
     // while one of the two audited entity wrappers is active.
     const bool atomicWitnessRequested = VisibilityWitnessEnabled() ||
-        trafficRenderWitnessRequested;
+        trafficRenderWitnessRequested || aircraftRenderWitnessRequested;
     bool atomicWitnessFingerprint = atomicWitnessRequested && g.LoadBase &&
         g.AtomicDefaultRenderCallBack &&
         reinterpret_cast<std::uintptr_t>(g.AtomicDefaultRenderCallBack) -
