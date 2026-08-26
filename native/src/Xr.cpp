@@ -49,7 +49,7 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.9.85";
+constexpr char kModVersion[] = "0.1.0.8";
 
 JavaVM*   g_hudTextVm{};
 jobject   g_hudTextApplication{};
@@ -303,6 +303,9 @@ std::atomic<bool>     g_gfxActive{false};        // graphics/perf submenu shown
 std::atomic<int>      g_gfxSel{0};
 std::atomic<bool>     g_controlsMenuActive{false};
 std::atomic<int>      g_controlsSel{0};
+std::atomic<bool>     g_controlsTipsActive{false};
+std::atomic<bool>     g_aboutActive{false};
+std::atomic<bool>     g_aboutFirstRun{false};
 std::atomic<bool>     g_gfxDistanceActive{false}; // draw-distance submenu shown
 std::atomic<int>      g_gfxDistanceSel{0};
 float                 g_holsterPos[8][3]{};      // holster anchors (guarded by g_headPoseMutex)
@@ -2779,6 +2782,15 @@ void SetControlsMenu(bool active, int selection) {
     g_controlsSel.store(selection, std::memory_order_relaxed);
 }
 
+void SetControlsTipsMenu(bool active) {
+    g_controlsTipsActive.store(active, std::memory_order_relaxed);
+}
+
+void SetAboutMenu(bool active, bool firstRun) {
+    g_aboutActive.store(active, std::memory_order_relaxed);
+    g_aboutFirstRun.store(firstRun, std::memory_order_relaxed);
+}
+
 void SetGraphicsMenu(bool active, int selection) {
     g_gfxActive.store(active, std::memory_order_relaxed);
     g_gfxSel.store(selection, std::memory_order_relaxed);
@@ -3912,13 +3924,85 @@ void PanelClear() {
 // Vice City parity: the CONTROLS page. One layout row (DEFAULT / SWAPPED
 // HANDS / CUSTOM) and one row per face button choosing the action it
 // triggers on foot; vehicles always keep the shipped layout.
+// Every control nuance that is NOT discoverable from the buttons themselves,
+// one screen, no navigation: the manual players kept asking for.
+// The Vice City port's welcome/about window: opens itself once on the first
+// movement in gameplay, and stays reachable from the main menu afterwards.
+void BuildAboutMenu() {
+    PanelClear();
+    const int cx = kPanelW / 2;
+    const bool firstRun = g_aboutFirstRun.load(std::memory_order_relaxed);
+    PanelText(firstRun ? "WELCOME TO SAN ANDREAS VR"
+                       : "ABOUT SAN ANDREAS VR",
+              cx, 22, 4, 100, 225, 255);
+    char versionLine[64];
+    std::snprintf(versionLine, sizeof(versionLine),
+                  "VERSION %s ALPHA - NOT FOR SALE", kModVersion);
+    PanelText(versionLine, cx, 58, 2, 170, 190, 210);
+    static const char* const kLines[] = {
+        "OPEN THE VR MENU: HOLD BOTH GRIPS + MENU (OR Y)",
+        "BUTTON REMAP + CONTROL TIPS LIVE IN MENU > CONTROLS",
+        "CHOOSE IMMERSIVE DRIVING IN VEHICLE SETTINGS",
+        "CALIBRATE WEAPONS IF A MODEL OR GRIP IS MISALIGNED",
+        "PROMPTS: TAP R2 = YES   L2 = NO   HOLD R2 = TAP-AND-HOLD",
+        "RECRUIT GANG: LOOK AT A GROVE PED AND HOLD R2",
+        "RECRUITING NEEDS RESPECT - EARN IT OR USE THE CHEAT",
+        "L3+R3 RECENTERS THE VIEW",
+        "THE MOD IS IN ACTIVE DEVELOPMENT - EXPECT ROUGH EDGES",
+        "DISCUSSION: FLAT2VR DISCORD",
+        "discord.com/channels/747967102895390741/1540234546182750228",
+        "PRESS ANY BUTTON TO CLOSE",
+    };
+    const int count = static_cast<int>(sizeof(kLines) / sizeof(kLines[0]));
+    const int top = 100, rowH = 34;
+    for (int i = 0; i < count; ++i) {
+        const bool close = i == count - 1;
+        const bool link = i == count - 2;
+        PanelText(kLines[i], cx, top + i * rowH, 2,
+                  close ? 255 : (link ? 140 : 210),
+                  close ? 205 : (link ? 200 : 225),
+                  close ? 80 : (link ? 255 : 235));
+    }
+}
+
+void BuildControlsTipsMenu() {
+    PanelClear();
+    const int cx = kPanelW / 2;
+    PanelText("CONTROL TIPS", cx, 16, 4, 100, 225, 255);
+    static const char* const kTips[] = {
+        "GRIPS+MENU (OR Y)  OPEN VR MENU",
+        "Y ENTER/EXIT   X JUMP   A SPRINT",
+        "B  FIRE HELD WEAPON IN VEHICLES / TANK",
+        "R2 TAP  ANSWER PROMPTS YES   L2  NO",
+        "R2 HOLD  TAP-AND-HOLD PROMPTS",
+        "PLANES: PULL/PUSH YOKE = PITCH",
+        "HYDRA NOZZLES + HELI YAW: RIGHT STICK",
+        "HELI: LEFT STICK = ROLL + PITCH",
+        "CLIMB BOOST: LEFT GRIP + RIGHT TRIGGER",
+        "PARACHUTE: JUMP OUT, A = OPEN CANOPY",
+        "SKYDIVE: HOLD RIGHT TRIGGER = DIVE",
+        "STEER CANOPY WITH STICKS OR RISERS",
+        "RECRUIT: LOOK AT GROVE PED + HOLD R2",
+        "DISMISS GROUP: LOOK AWAY + HOLD R2",
+        "RECRUITING NEEDS RESPECT (MISSIONS OR",
+        "  THE MAX RESPECT CHEAT)",
+        "HORN: PRESS PALM ON THE WHEEL HUB",
+        "L3+R3 RECENTER   GRIPS+R3 CAMERA VIEW",
+    };
+    const int count = static_cast<int>(sizeof(kTips) / sizeof(kTips[0]));
+    const int top = 56, rowH = 26;
+    for (int i = 0; i < count; ++i)
+        PanelText(kTips[i], cx, top + i * rowH, 2, 210, 225, 235);
+    PanelText("A / B BACK", cx, kPanelH - 18, 2, 150, 185, 150);
+}
+
 void BuildControlsMenu() {
     PanelClear();
     const int cx = kPanelW / 2;
     PanelText("CONTROLS", cx, 20, 5, 100, 225, 255);
     PanelText("ON FOOT ONLY - VEHICLES KEEP THE SHIPPED LAYOUT",
               cx, 56, 2, 150, 185, 150);
-    char rows[6][64];
+    char rows[7][64];
     std::snprintf(rows[0], sizeof(rows[0]), "LAYOUT  < %s >",
                   locomotion::ControlsLayoutName());
     for (int srcRow = 0; srcRow < locomotion::BIND_SRC_COUNT; ++srcRow) {
@@ -3927,10 +4011,11 @@ void BuildControlsMenu() {
                       locomotion::ButtonActionName(
                           locomotion::GetButtonBinding(srcRow)));
     }
-    std::snprintf(rows[5], sizeof(rows[0]), "BACK");
+    std::snprintf(rows[5], sizeof(rows[0]), "CONTROL TIPS");
+    std::snprintf(rows[6], sizeof(rows[0]), "BACK");
     const int sel = g_controlsSel.load(std::memory_order_relaxed);
     const int top = 96, rowH = 50;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
         const int c = (i == sel) ? 255 : 200;
@@ -3968,16 +4053,17 @@ void BuildMainMenu() {
         "CHEATS",
         "GRAPHICS",
         "CONTROLS",
+        "ABOUT",
         "CLOSE"
     };
-    const int N   = 13;
+    const int N   = 14;
     const int sel = g_mainSel.load(std::memory_order_relaxed);
     const int top = 82, rowH = 34;
     for (int i = 0; i < N; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
         const bool submenu=i==1||i==2||i==3||i==5||i==6||i==7||
-                           i==9||i==10||i==11;
+                           i==9||i==10||i==11||i==12;
         if (submenu)
             PanelText(kItems[i],cx,y,2,i==sel?255:100,
                       i==sel?235:225,i==sel?120:255);
@@ -4363,7 +4449,7 @@ void BuildLocomotionMenu() {
     const int cx=kPanelW/2;
     PanelText("LOCOMOTION",cx,16,5,100,225,255);
     const int sel=g_locomotionSel.load(std::memory_order_relaxed);
-    char rows[13][72]{};
+    char rows[14][72]{};
     std::snprintf(rows[0],sizeof(rows[0]),"MOVE DIRECTION   < %s >",
                   locomotion::MovementModeName());
     std::snprintf(rows[1],sizeof(rows[1]),"TURNING   < %s >",
@@ -4386,12 +4472,14 @@ void BuildLocomotionMenu() {
                   locomotion::AutoParachuteEnabled()?"ON":"OFF");
     std::snprintf(rows[10],sizeof(rows[10]),"FLIGHT CAMERA   < %s >",
                   locomotion::FlightCameraTilt()?"FULL TILT":"LEVEL");
-    std::snprintf(rows[11],sizeof(rows[11]),"RECENTER VIEW");
-    std::snprintf(rows[12],sizeof(rows[12]),"BACK");
+    std::snprintf(rows[11],sizeof(rows[11]),"CUTSCENES   < %s >",
+                  locomotion::CutsceneFirstPerson()?"FIRST PERSON":"CINEMA");
+    std::snprintf(rows[12],sizeof(rows[12]),"RECENTER VIEW");
+    std::snprintf(rows[13],sizeof(rows[13]),"BACK");
     // 13 rows on the 512px panel: the old 52px pitch already pushed the
     // bottom rows past the panel edge; a 32px pitch keeps everything on it.
     const int top=64,rowH=32;
-    for (int i=0;i<13;++i) {
+    for (int i=0;i<14;++i) {
         const int y=top+i*rowH;
         if (i==sel) PanelFillRect(26,y-4,kPanelW-26,y+22,120,40,110,235);
         const int c=i==sel?255:200;
@@ -4684,6 +4772,10 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
         std::fill(g_debugImageRevisions.begin(), g_debugImageRevisions.end(),
                   ~std::uint64_t{0});
         if      (mainMenu)          BuildMainMenu();
+        else if (g_aboutActive.load(std::memory_order_relaxed))
+                                    BuildAboutMenu();
+        else if (g_controlsTipsActive.load(std::memory_order_relaxed))
+                                    BuildControlsTipsMenu();
         else if (g_controlsMenuActive.load(std::memory_order_relaxed))
                                     BuildControlsMenu();
         else if (calibMenu)         BuildCalibMenu();

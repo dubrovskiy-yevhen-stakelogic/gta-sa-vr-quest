@@ -574,6 +574,12 @@ struct GameSymbols {
     int   (*CPad_GetSteeringLeftRight)(void* pad);
     int   (*CPad_GetSteeringUpDown)(void* pad);
     int   (*CPad_GetHandBrake)(void* pad);
+    void* CPad_GetHorn;
+    float* CStats_StatTypesFloat;   // stat array, indexed by stat id
+    unsigned char* CHud_bDrawingVitalStats;
+    void* CPlayerPed_ProcessGroupBehaviour;
+    void* CPlayerPed_MakeThisPedJoinOurGroup;
+    void* CPad_GetGroupControlForward;
     bool  (*CPad_GetSprint)(void* pad, int sprintType);
     bool  (*CPad_NextStationJustUp)(void* pad);
     // Mobile SA's enter/exit query polls the touch ENTER_CAR widget rather than

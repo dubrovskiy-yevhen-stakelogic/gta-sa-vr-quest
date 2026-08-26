@@ -119,6 +119,11 @@ std::atomic<int> g_yokeSensitivity{100}; // percent, 25..200
 // sockets to grab and calibrate — MOTION shows nothing on the bars at all,
 // which read as "the grips are missing". MOTION stays selectable in the menu.
 std::atomic<int> g_bicycleMode{BICYCLE_HANDLEBAR_TRIGGER};
+// Palm pressed onto the wheel HUB (centre) sounds the horn. Strictly the hub:
+// an open hand inside 45% of the wheel radius (9 cm cap) AND within 5 cm of
+// the wheel plane. Hands gripping the rim or holding a weapon never qualify,
+// so ordinary steering cannot honk by accident.
+std::atomic<bool> g_hornPressed{false};
 // Camera view per vehicle type. The Rhino tank ignores the setting and always
 // uses the chase view — its hull has no usable cockpit line of sight.
 std::atomic<int> g_carView{VIEW_FIRST_PERSON};
@@ -585,6 +590,7 @@ void Load() {
 void EnsureInit() { std::call_once(g_initOnce, Load); }
 
 void ClearGrabStateLocked() {
+    g_hornPressed.store(false,std::memory_order_release);
     for (int hand=0; hand<2; ++hand) {
         g_grabbed[hand]=false; g_gripDown[hand]=false;
         g_grabReferenceAngle[hand]=0.0f; g_continuousAngle[hand]=0.0f;
@@ -1754,6 +1760,26 @@ int OnGetSteeringUpDown(void* pad) {
     }
     return g_origSteeringUpDown?g_origSteeringUpDown(pad):0;
 }
+using GroupFwdFn=int(*)(void*,unsigned char,unsigned char);
+GroupFwdFn g_origGroupForward=nullptr;
+int OnGetGroupControlForward(void* pad,unsigned char b1,unsigned char b2) {
+    if (VrGameplayInputAllowed()&&!HasPlayerVehicle()&&
+        vrcam::RecruitGestureActive()) {
+        static unsigned int forcedLog=0;
+        if ((++forcedLog%90u)==1u)
+            LOGI("[recruit] GroupControlForward forced (b1=%d b2=%d)",b1,b2);
+        return 1;
+    }
+    return g_origGroupForward?g_origGroupForward(pad,b1,b2):0;
+}
+
+using HornFn=int(*)(void*,unsigned char);
+HornFn g_origHorn=nullptr;
+int OnGetHorn(void* pad,unsigned char arg) {
+    if (VrGameplayInputAllowed()&&HasPlayerVehicle()&&
+        g_hornPressed.load(std::memory_order_acquire)) return 1;
+    return g_origHorn?g_origHorn(pad,arg):0;
+}
 int OnGetHandBrake(void* pad) {
     if (VrGameplayInputAllowed()&&HasPlayerVehicle()) {
         xr::InputState input{}; xr::GetInput(input);
@@ -1894,6 +1920,18 @@ void* InstallHandBrakeTrampoline(void* target,void* replacement) {
     __builtin___clear_cache(reinterpret_cast<char*>(t),reinterpret_cast<char*>(t)+32);
     if (!PatchAbsoluteJump(target,replacement)) { munmap(trampoline,pageSize); return nullptr; }
     LOGI("[driving] CPad::GetHandBrake VR A-button hook installed");
+    if (g.CPad_GetHorn) {
+        // 2.11 arm64 @0x49d6b4: stp/str/mov/ldrh — no PC-relative words in
+        // the copied prologue.
+        constexpr std::uint32_t hornPrologue[4]={
+            0xa9be7bfdu,0xf9000bf3u,0x910003fdu,0x79422008u};
+        g_origHorn=reinterpret_cast<HornFn>(
+            InstallVerifiedTrampoline(g.CPad_GetHorn,
+                reinterpret_cast<void*>(&OnGetHorn),
+                hornPrologue,"CPad::GetHorn"));
+        if (g_origHorn)
+            LOGI("[driving] wheel-hub horn hook installed");
+    }
     return trampoline;
 }
 
@@ -2267,6 +2305,10 @@ void InstallPadHooks() {
         InstallTouchQueryTrampoline(g.CPad_JumpJustDown,
             reinterpret_cast<void*>(&OnJumpJustDown),
             "Jump JumpJustDown"));
+    g_origGroupForward=reinterpret_cast<GroupFwdFn>(
+        InstallTouchQueryTrampoline(g.CPad_GetGroupControlForward,
+            reinterpret_cast<void*>(&OnGetGroupControlForward),
+            "Recruit GroupControlForward"));
     if (g.CAutomobile_TankControl) {
         // Verified against the 2.11 arm64 disasm @0x6a9888: plain callee-save
         // prologue, no PC-relative instructions in the first four words.
@@ -3104,6 +3146,26 @@ void UpdateInput(const xr::InputState& input,bool gameplay,bool blocked) {
         }
         if (input.grip[hand]<=0.30f) g_gripDown[hand]=false;
         else if (input.grip[hand]>=0.65f) g_gripDown[hand]=true;
+    }
+    {
+        bool hornPressed=false;
+        if (!visual.bike) {
+            const V3 hornNormal{visual.normal[0],visual.normal[1],
+                                visual.normal[2]};
+            const float hubRadius=std::min(0.45f*visual.radius,0.09f);
+            for (int hand=0;hand<2;++hand) {
+                if (!poseValid[hand]||g_grabbed[hand]) continue;
+                if ((weaponHands&(1u<<hand))!=0) continue;
+                const V3 delta=positions[hand]-center;
+                const float dn=Dot(delta,hornNormal);
+                const V3 planar=delta-hornNormal*dn;
+                if (Length(planar)<=hubRadius&&std::abs(dn)<=0.05f) {
+                    hornPressed=true;
+                    break;
+                }
+            }
+        }
+        g_hornPressed.store(hornPressed,std::memory_order_release);
     }
     const bool left=g_grabbed[0]&&poseValid[0],rightGrabbed=g_grabbed[1]&&poseValid[1];
     const float previousAngle=(g_visual.active&&g_visual.bike==visual.bike)?

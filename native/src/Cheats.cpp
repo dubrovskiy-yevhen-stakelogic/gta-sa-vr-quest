@@ -9,7 +9,9 @@
 #include <atomic>
 #include <algorithm>
 #include <dlfcn.h>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <iterator>
 
@@ -20,7 +22,8 @@ namespace {
 // (recon/gtasa211-dynsym.txt). Calling the game's handlers retains its own model
 // streaming, wanted, weather and ped logic.
 enum class Kind : unsigned char { Plain, Vehicle, GodMode, UnlockCities, Reset,
-                                  MissionSkip, TutorialSkip };
+                                  MissionSkip, TutorialSkip, MissionSelect,
+                                  MissionLaunch, Respect, NeverTired };
 
 struct Entry {
     const char* label;
@@ -122,6 +125,24 @@ Entry g_cheats[] = {
     {"SKIP SCRIPT PROMPT (5S)", "_ZN6CCheat17ScriptBypassCheatEv",     -1, Kind::Plain, nullptr},
     {"SKIP MISSION (BETA)",    "DoMissionSkip",                        -1, Kind::MissionSkip, nullptr},
     {"SKIP TUTORIAL PROMPT",   nullptr,                                -1, Kind::TutorialSkip, nullptr},
+    // Debug mission launcher, driven through the same engine globals the
+    // retail debug widget uses: main.scm polls opcode 0x0A57 each frame and,
+    // when DoMissionSkip is set, dispatches currentMissionPage (a mission
+    // group, 0..5) and currentSkipToMissionNumber (the entry inside that
+    // group) to its per-page mission-start subroutines.
+    // Stat 64 (verified: CStats::FindMaxNumberOfGroupMembers reads stat
+    // array +0x100). Respect gates how many gang members can be recruited:
+    // below 10 nobody joins at all — CJ asks and they refuse. Appended at the
+    // END: CategoryForIndex uses hardcoded index ranges, so inserting rows
+    // mid-table shifts every category after the insertion point.
+    {"MAX RESPECT",            "_ZN6CStats12SetStatValueEtf",          -1, Kind::Respect, nullptr},
+    // CWorld::Players[0] + 0x189 (CPlayerInfo stride 0x1D8) = the byte the
+    // SET_PLAYER_NEVER_GETS_TIRED opcode writes. Latched per-frame: scripts
+    // and save loads reset it.
+    {"INFINITE SPRINT",        "_ZN6CWorld7PlayersE",                  -1, Kind::NeverTired, nullptr},
+    {"MISSION GROUP",          nullptr,                                -1, Kind::MissionSelect, nullptr},
+    {"MISSION NUMBER",         nullptr,                                -1, Kind::MissionSelect, nullptr},
+    {"LAUNCH MISSION",         "DoMissionSkip",                        -1, Kind::MissionLaunch, nullptr},
 
 };
 
@@ -131,11 +152,24 @@ bool* g_playerIsOffTheMap = nullptr;
 float (*g_getStatValue)(unsigned short) = nullptr;
 void (*g_setStatValue)(unsigned short, float) = nullptr;
 bool (*g_isPlayerOnAMission)() = nullptr;
+int* g_currentMissionPage = nullptr;
+int* g_currentSkipToMissionNumber = nullptr;
+int* g_skipToMissionNumber = nullptr;
+std::atomic<int> g_missionPageSel{0};
+std::atomic<int> g_missionNumberSel{0};
+// After LAUNCH: watch whether main.scm consumes (clears) the skip flag.
+std::atomic<std::uintptr_t> g_missionLaunchProbe{0};
+std::atomic<int> g_missionLaunchTicks{-1};
 void (*g_scriptBypassCheat)() = nullptr;
 // The city-unlock stat can be rewritten by the mission script as the story
 // state machine runs, so a single write silently reverted. While the cheat is
 // latched, the per-frame tick re-asserts it.
 std::atomic<bool> g_unlockCitiesActive{false};
+// MAX RESPECT is latched the same way: stats reload with every save, and a
+// low respect silently disables gang recruiting again.
+std::atomic<bool> g_maxRespectActive{false};
+std::atomic<bool> g_neverTiredActive{false};
+unsigned char* g_neverTiredByte = nullptr;
 
 struct VehicleChoice { const char* name; int model; };
 struct VehicleSelector {
@@ -340,6 +374,12 @@ void Init(void* handle) {
         dlsym(handle, "_ZN11CTheScripts18IsPlayerOnAMissionEv"));
     g_scriptBypassCheat = reinterpret_cast<void (*)()>(
         dlsym(handle, "_ZN6CCheat17ScriptBypassCheatEv"));
+    g_currentMissionPage = static_cast<int*>(
+        dlsym(handle, "currentMissionPage"));
+    g_currentSkipToMissionNumber = static_cast<int*>(
+        dlsym(handle, "currentSkipToMissionNumber"));
+    g_skipToMissionNumber = static_cast<int*>(
+        dlsym(handle, "SkipToMissionNumber"));
     if (g_nativeInvincible != nullptr)
         g_godMode.store(*g_nativeInvincible, std::memory_order_release);
     LOGI("cheats: resolved %d/%d handlers, native god state=%s", ok,
@@ -348,9 +388,44 @@ void Init(void* handle) {
 }
 
 void Tick() {
+    const std::uintptr_t probe =
+        g_missionLaunchProbe.load(std::memory_order_acquire);
+    if (probe != 0) {
+        const int tick = g_missionLaunchTicks.fetch_add(1,
+            std::memory_order_acq_rel);
+        if (*reinterpret_cast<const unsigned char*>(probe) == 0) {
+            // main.scm consumed the launch: leave its debug thread again.
+            if (g.CTheScripts_ScriptSpace != nullptr)
+                *reinterpret_cast<int*>(
+                    static_cast<unsigned char*>(g.CTheScripts_ScriptSpace) +
+                    6132) = 0;
+            g_missionLaunchProbe.store(0, std::memory_order_release);
+            LOGI("[mission] launch consumed by main.scm (tick %d)", tick);
+            return;
+        }
+        if (tick == 120 || tick == 360) {
+            const int value = *reinterpret_cast<const unsigned char*>(probe);
+            LOGI("[mission] flag after launch: DoMissionSkip=%d (tick %d)",
+                 value, tick);
+            if (FILE* f = std::fopen(
+                    "/sdcard/Android/data/com.rockstargames.gtasa/files/savr_debug.txt",
+                    "a")) {
+                std::fprintf(f, "flag tick=%d value=%d\n", tick, value);
+                std::fclose(f);
+            }
+            if (tick == 360)
+                g_missionLaunchProbe.store(0, std::memory_order_release);
+        }
+    }
     // ScriptBypassCheat must stay MANUAL (the cheat row below): applied
     // continuously it auto-passes scripted waits that are real gameplay
     // beats, silently skipping story sequences.
+    if (g_neverTiredActive.load(std::memory_order_acquire) &&
+        g_neverTiredByte != nullptr && *g_neverTiredByte == 0)
+        *g_neverTiredByte = 1;
+    if (g_maxRespectActive.load(std::memory_order_acquire) &&
+        g_getStatValue && g_setStatValue && g_getStatValue(64u) < 1000.0f)
+        g_setStatValue(64u, 1000.0f);
     if (!g_unlockCitiesActive.load(std::memory_order_acquire)) return;
     if (!g_getStatValue || !g_setStatValue) return;
     if (g_getStatValue(181u) < 3.0f) {
@@ -367,11 +442,24 @@ int Count() { return static_cast<int>(std::size(g_cheats)); }
 
 const char* Name(int index) {
     if (index < 0 || index >= Count()) return "";
+    if (g_cheats[index].kind == Kind::MissionSelect) {
+        static char label[2][48];
+        const bool pageRow =
+            std::strcmp(g_cheats[index].label, "MISSION GROUP") == 0;
+        std::snprintf(label[pageRow ? 0 : 1], sizeof(label[0]),
+                      "%s   < %d >", g_cheats[index].label,
+                      pageRow ? g_missionPageSel.load()
+                              : g_missionNumberSel.load());
+        return label[pageRow ? 0 : 1];
+    }
     if (g_cheats[index].kind != Kind::GodMode) return g_cheats[index].label;
     return g_godMode.load(std::memory_order_acquire) ? "GOD MODE   ON" : "GOD MODE   OFF";
 }
 
 bool Available(int index) {
+    if (index >= 0 && index < Count() &&
+        g_cheats[index].kind == Kind::MissionSelect)
+        return true;
     return index >= 0 && index < Count() && g_cheats[index].fn != nullptr;
 }
 
@@ -390,6 +478,66 @@ void Activate(int index) {
         return;
     }
     Entry& cheat = g_cheats[index];
+    if (cheat.kind == Kind::NeverTired) {
+        if (cheat.fn == nullptr) { LOGW("infinite sprint unavailable"); return; }
+        g_neverTiredByte = static_cast<unsigned char*>(cheat.fn) + 0x189;
+        const bool enabled = !g_neverTiredActive.load(std::memory_order_acquire);
+        g_neverTiredActive.store(enabled, std::memory_order_release);
+        *g_neverTiredByte = enabled ? 1 : 0;
+        LOGI("infinite sprint: %s", enabled ? "ON" : "OFF");
+        return;
+    }
+    if (cheat.kind == Kind::Respect) {
+        if (cheat.fn == nullptr) { LOGW("respect cheat unavailable"); return; }
+        reinterpret_cast<void (*)(unsigned short, float)>(cheat.fn)(64u,
+                                                                    1000.0f);
+        g_maxRespectActive.store(true, std::memory_order_release);
+        LOGI("cheat respect: stat 64 -> 1000 (latched per-frame)");
+        return;
+    }
+    if (cheat.kind == Kind::MissionSelect) {
+        const bool pageRow = std::strcmp(cheat.label, "MISSION GROUP") == 0;
+        auto& sel = pageRow ? g_missionPageSel : g_missionNumberSel;
+        const int limit = pageRow ? 6 : 20;
+        sel.store((sel.load() + 1) % limit);
+        return;
+    }
+    if (cheat.kind == Kind::MissionLaunch) {
+        if (cheat.fn == nullptr || g_currentMissionPage == nullptr ||
+            g_currentSkipToMissionNumber == nullptr) {
+            LOGW("mission launch unavailable (symbols missing)");
+            return;
+        }
+        *g_currentMissionPage = g_missionPageSel.load();
+        *g_currentSkipToMissionNumber = g_missionNumberSel.load();
+        if (g_skipToMissionNumber != nullptr)
+            *g_skipToMissionNumber = g_missionNumberSel.load();
+        // The poll that consumes the launch runs inside main.scm's debug
+        // thread, which is active only while script global $6132 is 1 (the
+        // debug-menu toggle). Arm it for the launch; the Tick probe below
+        // clears it again once the flag has been consumed.
+        if (g.CTheScripts_ScriptSpace != nullptr)
+            *reinterpret_cast<int*>(
+                static_cast<unsigned char*>(g.CTheScripts_ScriptSpace) +
+                6132) = 1;
+        *static_cast<unsigned char*>(cheat.fn) = 1;
+        g_missionLaunchProbe.store(
+            reinterpret_cast<std::uintptr_t>(cheat.fn),
+            std::memory_order_release);
+        g_missionLaunchTicks.store(0, std::memory_order_release);
+        LOGI("mission launch: page=%d number=%d flag=%p page@%p num@%p",
+             g_missionPageSel.load(), g_missionNumberSel.load(),
+             cheat.fn, static_cast<void*>(g_currentMissionPage),
+             static_cast<void*>(g_currentSkipToMissionNumber));
+        if (FILE* f = std::fopen(
+                "/sdcard/Android/data/com.rockstargames.gtasa/files/savr_debug.txt",
+                "a")) {
+            std::fprintf(f, "launch page=%d num=%d\n",
+                         g_missionPageSel.load(), g_missionNumberSel.load());
+            std::fclose(f);
+        }
+        return;
+    }
     if (cheat.fn == nullptr && cheat.kind != Kind::TutorialSkip) {
         LOGW("cheat '%s' unavailable (symbol missing)", cheat.label);
         return;
@@ -528,6 +676,18 @@ void ActivateCategoryItem(int category, int item) {
 
 bool CycleCategoryItem(int category,int item,int direction) {
     if (direction==0) return false;
+    {
+        const int source=CategorySourceIndex(category,item);
+        if (source>=0&&source<Count()&&
+            g_cheats[source].kind==Kind::MissionSelect) {
+            const bool pageRow =
+                std::strcmp(g_cheats[source].label, "MISSION GROUP") == 0;
+            auto& sel = pageRow ? g_missionPageSel : g_missionNumberSel;
+            const int limit = pageRow ? 6 : 20;
+            sel.store((sel.load() + limit + (direction<0?-1:1)) % limit);
+            return true;
+        }
+    }
     if (category==CATEGORY_VEHICLES&&item>=0&&item<kVehicleSelectorCount) {
         VehicleSelector& selector=g_vehicleSelectors[item];
         const int next=(selector.selected.load()+selector.count+

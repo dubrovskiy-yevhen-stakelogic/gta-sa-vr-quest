@@ -900,7 +900,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
     enum { PG_NONE = 0, PG_MAIN, PG_CALIB, PG_HOLSTER_CALIB, PG_HOLSTERS,
            PG_DRIVING, PG_DRIVING_CALIB, PG_LOCOMOTION, PG_HUD, PG_HUD_CROP,
            PG_HUD_WRIST, PG_CHEATS, PG_GRAPHICS, PG_GRAPHICS_DISTANCES,
-           PG_CONTROLS };
+           PG_CONTROLS, PG_CONTROLS_TIPS, PG_ABOUT };
     static int  menuPage = PG_NONE;
     static int  mainSel = 0, cheatSel = 0, cheatCategory = -1, calibSel = 0;
     static int  calibWeaponType = 0;
@@ -910,6 +910,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
     static int  hudWristMode = 0;   // 0 auto (hand/dash), 4 weapon, 5 two-hand
     static int  locomotionSel = 0, hudSel = 0, hudCropSel = 0, hudWristSel = 0,
                 gfxSel = 0, gfxDistanceSel = 0, controlsSel = 0;
+    static bool aboutFirstRun = false, aboutArmed = false;
     static bool openPrev = false, enterPrev = false, backPrev = false;
     static int  tUp = 0, tDown = 0, tMinus = 0, tPlus = 0;
     // One RIGHT/master calibration drives both hands. Frame counts provide the
@@ -965,6 +966,18 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         }
         viewChordPrev = viewChord;
 
+        // First-run welcome (VC parity): the first real movement input in
+        // gameplay opens the ABOUT window once; dismissing it persists
+        // WelcomeShown so it never returns.
+        if (menuPage == PG_NONE && inGameplay &&
+            !savr::locomotion::WelcomeSeen() &&
+            (std::abs(in.leftStick[0]) >= 0.2f ||
+             std::abs(in.leftStick[1]) >= 0.2f)) {
+            menuPage = PG_ABOUT;
+            aboutFirstRun = true;
+            aboutArmed = false;
+        }
+
         const bool openChord = grips && (in.menu || in.y);
         if (openChord && !openPrev) {
             if (menuPage == PG_HOLSTER_CALIB) savr::holster::EndCalibrationPreview();
@@ -989,7 +1002,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         case PG_MAIN: {
             // Laser, weapon/holster setup, driving, HUD, hand appearance,
             // cheats, graphics and close.
-            const int N = 13;
+            const int N = 14;
             if (navUp)   mainSel = (mainSel - 1 + N) % N;
             if (navDown) mainSel = (mainSel + 1) % N;
             if (mainSel == 0) {
@@ -1030,7 +1043,8 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 }
                 else if (mainSel == 10) { menuPage = PG_GRAPHICS; gfxSel = 0; }
                 else if (mainSel == 11) { menuPage = PG_CONTROLS; controlsSel = 0; }
-                else if (mainSel == 12)  menuPage = PG_NONE;
+                else if (mainSel == 12) { menuPage = PG_ABOUT; aboutFirstRun = false; aboutArmed = false; }
+                else if (mainSel == 13)  menuPage = PG_NONE;
             }
             if (back) menuPage = PG_NONE;
             break;
@@ -1221,7 +1235,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_LOCOMOTION: {
-            constexpr int ROWS=13;
+            constexpr int ROWS=14;
             if (navUp) locomotionSel=(locomotionSel-1+ROWS)%ROWS;
             if (navDown) locomotionSel=(locomotionSel+1)%ROWS;
             const int step=minus?-1:(plus?1:0);
@@ -1247,9 +1261,11 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 savr::locomotion::ToggleAutoParachute();
             else if (locomotionSel==10&&(step||enter))
                 savr::locomotion::ToggleFlightCameraTilt();
-            else if (locomotionSel==11&&enter)
-                vrcam::RequestRecenter();
+            else if (locomotionSel==11&&(step||enter))
+                savr::locomotion::ToggleCutsceneFirstPerson();
             else if (locomotionSel==12&&enter)
+                vrcam::RequestRecenter();
+            else if (locomotionSel==13&&enter)
                 menuPage=PG_MAIN;
             if (back) menuPage=PG_MAIN;
             break;
@@ -1411,7 +1427,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_CONTROLS: {
-            const int NC = 6; // layout, A, B, X, Y, back
+            const int NC = 7; // layout, A, B, X, Y, tips, back
             if (navUp)   controlsSel = (controlsSel - 1 + NC) % NC;
             if (navDown) controlsSel = (controlsSel + 1) % NC;
             const int step = minus ? -1 : (plus ? 1 : 0);
@@ -1424,8 +1440,28 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             } else if (controlsSel >= 1 && controlsSel <= 4 && step) {
                 savr::locomotion::CycleButtonBinding(controlsSel - 1, step);
             }
-            if (enter && controlsSel == 5) menuPage = PG_MAIN;
+            if (enter && controlsSel == 5) menuPage = PG_CONTROLS_TIPS;
+            if (enter && controlsSel == 6) menuPage = PG_MAIN;
             if (back) menuPage = PG_MAIN;
+            break;
+        }
+        case PG_CONTROLS_TIPS: {
+            if (enter || back) menuPage = PG_CONTROLS;
+            break;
+        }
+        case PG_ABOUT: {
+            // VC behaviour: any button closes, but only after every button
+            // has first been seen released (so the opening press or the
+            // movement stick cannot instantly dismiss it).
+            const bool anyButton = in.a || in.b || in.x || in.y || in.menu;
+            if (!anyButton) aboutArmed = true;
+            else if (aboutArmed) {
+                menuPage = PG_NONE;
+                if (aboutFirstRun) {
+                    savr::locomotion::MarkWelcomeSeen();
+                    aboutFirstRun = false;
+                }
+            }
             break;
         }
         case PG_GRAPHICS_DISTANCES: {
@@ -1478,6 +1514,8 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         xr::SetMenuState(menuPage == PG_CHEATS,cheatSel,cheatRows,cheatCategory);
         xr::SetGraphicsMenu(menuPage == PG_GRAPHICS, gfxSel);
         xr::SetControlsMenu(menuPage == PG_CONTROLS, controlsSel);
+        xr::SetControlsTipsMenu(menuPage == PG_CONTROLS_TIPS);
+        xr::SetAboutMenu(menuPage == PG_ABOUT, aboutFirstRun);
         xr::SetGraphicsDistanceMenu(
             menuPage == PG_GRAPHICS_DISTANCES, gfxDistanceSel);
     }

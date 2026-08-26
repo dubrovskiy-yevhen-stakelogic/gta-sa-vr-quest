@@ -40,6 +40,11 @@ std::atomic<bool> g_parachuteImmersiveControl{false};
 // of staying level while the cockpit rotates around the pilot (default OFF —
 // the level horizon is the comfort behaviour).
 std::atomic<bool> g_flightCameraTilt{false};
+// Cutscenes from the first person (head-tracked stereo at the cutscene
+// camera) instead of the theater screen. Shipped OFF: theater remains the
+// comfort default.
+std::atomic<bool> g_cutsceneFirstPerson{false};
+std::atomic<bool> g_welcomeSeen{false};
 // Face-button bindings, VC-port layout tables: A/B/X/Y each name the action
 // they trigger on foot.
 constexpr int kBindingDefault[BIND_SRC_COUNT]={
@@ -67,6 +72,8 @@ void Save() {
     std::fprintf(file,"ParachuteImmersiveControl=%d\n",
                  g_parachuteImmersiveControl.load()?1:0);
     std::fprintf(file,"FlightCameraTilt=%d\n",g_flightCameraTilt.load()?1:0);
+    std::fprintf(file,"CutsceneFirstPerson=%d\n",g_cutsceneFirstPerson.load()?1:0);
+    std::fprintf(file,"WelcomeShown=%d\n",g_welcomeSeen.load()?1:0);
     std::fprintf(file,"BindA=%d\n",g_binding[0].load());
     std::fprintf(file,"BindB=%d\n",g_binding[1].load());
     std::fprintf(file,"BindX=%d\n",g_binding[2].load());
@@ -78,6 +85,8 @@ void Load() {
     int movement=MOVEMENT_HEAD,turn=TURN_SMOOTH,sensitivity=100,snap=30,bob=0;
     int chuteFollow=1,autoChute=0,chuteImmersive=0,flightTilt=0;
     int gestureRun=1,gestureSwim=1;
+    int cutsceneFp=0;
+    int welcomeSeen=0;
     int bind[BIND_SRC_COUNT]={kBindingDefault[0],kBindingDefault[1],
                               kBindingDefault[2],kBindingDefault[3]};
     if (FILE* file=std::fopen(kPath,"r")) {
@@ -99,6 +108,10 @@ void Load() {
                 chuteImmersive=value;
             else if (std::sscanf(line,"FlightCameraTilt=%d",&value)==1)
                 flightTilt=value;
+            else if (std::sscanf(line,"CutsceneFirstPerson=%d",&value)==1)
+                cutsceneFp=value;
+            else if (std::sscanf(line,"WelcomeShown=%d",&value)==1)
+                welcomeSeen=value;
             else if (std::sscanf(line,"BindA=%d",&value)==1) bind[0]=value;
             else if (std::sscanf(line,"BindB=%d",&value)==1) bind[1]=value;
             else if (std::sscanf(line,"BindX=%d",&value)==1) bind[2]=value;
@@ -117,6 +130,8 @@ void Load() {
     g_autoParachute.store(autoChute!=0);
     g_parachuteImmersiveControl.store(chuteImmersive!=0);
     g_flightCameraTilt.store(flightTilt!=0);
+    g_cutsceneFirstPerson.store(cutsceneFp!=0);
+    g_welcomeSeen.store(welcomeSeen!=0);
     for (int i=0;i<BIND_SRC_COUNT;++i)
         g_binding[i].store(
             bind[i]>=BIND_ACT_NONE&&bind[i]<BIND_ACT_COUNT
@@ -268,6 +283,17 @@ void ToggleParachuteControl() {
     Save();
 }
 bool FlightCameraTilt() { EnsureInit(); return g_flightCameraTilt.load(); }
+bool WelcomeSeen() { EnsureInit(); return g_welcomeSeen.load(); }
+void MarkWelcomeSeen() {
+    EnsureInit();
+    if (!g_welcomeSeen.exchange(true)) Save();
+}
+bool CutsceneFirstPerson() { EnsureInit(); return g_cutsceneFirstPerson.load(); }
+void ToggleCutsceneFirstPerson() {
+    EnsureInit();
+    g_cutsceneFirstPerson.store(!g_cutsceneFirstPerson.load());
+    Save();
+}
 void ToggleFlightCameraTilt() {
     EnsureInit();
     g_flightCameraTilt.store(!g_flightCameraTilt.load());

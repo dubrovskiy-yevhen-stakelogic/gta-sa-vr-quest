@@ -61,6 +61,14 @@ void ToggleParachuteControl();
 // Realistic flight camera: the view base rolls/pitches with the airframe
 // (default OFF = level horizon comfort mode).
 bool FlightCameraTilt();
+// Cutscenes rendered in head-tracked stereo from the cutscene camera instead
+// of the flat theater screen.
+// One-shot welcome window flag, persisted: true after the player dismissed
+// the first-run ABOUT panel.
+bool WelcomeSeen();
+void MarkWelcomeSeen();
+bool CutsceneFirstPerson();
+void ToggleCutsceneFirstPerson();
 void ToggleFlightCameraTilt();
 
 // Rotate the physical left stick from the body frame into the current HMD

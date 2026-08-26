@@ -288,6 +288,8 @@ bool HudSourceScanActive();
 bool HudCalibrationActive();
 void SetGraphicsMenu(bool active, int selection);
 void SetControlsMenu(bool active, int selection);
+void SetControlsTipsMenu(bool active);
+void SetAboutMenu(bool active, bool firstRun);
 void SetGraphicsDistanceMenu(bool active, int selection);
 
 // Stop the compositor consuming the current RenderWare eye-texture generation.

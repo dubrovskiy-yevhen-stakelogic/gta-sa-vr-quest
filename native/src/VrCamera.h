@@ -7,6 +7,9 @@ struct TwoHandVisualState;
 
 namespace savr::vrcam {
 
+// True while the player holds the VR gang-recruit gesture (R2, stick quiet).
+bool RecruitGestureActive();
+
 // Install the camera hook onto CCamera::CopyCameraMatrixToRWCam. Call once, after
 // ResolveGameSymbols has succeeded. Returns false if the trampoline could not be
 // built, in which case the game simply renders its own flat camera.
