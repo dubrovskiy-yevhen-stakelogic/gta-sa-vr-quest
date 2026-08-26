@@ -1528,6 +1528,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         savr::throwable::Update(anyMenu);
         savr::physicalweapon::EnforceBikeWeaponLimit();
         savr::physicalweapon::AutoEquipParachute();
+        savr::physicalweapon::AutoAssignGadgetPoint();
         savr::cheats::Tick();
     }
     else {

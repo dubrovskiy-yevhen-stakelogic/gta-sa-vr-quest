@@ -1131,6 +1131,27 @@ bool ForceHold(int hand, int slot) {
     return true;
 }
 
+// Mission gadgets (spray can in Tagging Up Turf, camera, extinguisher) arrive
+// in slot 9, which shipped with no holster point — the script said "spray the
+// wall" while the player had nothing to grab. When the ped owns a gadget and
+// no point offers slot 9 yet, auto-assign the first EMPTY body point so the
+// item simply appears on the body. Players can still move it in the loadout.
+void AutoAssignGadgetPoint() {
+    void* ped = g.FindPlayerPed ? g.FindPlayerPed(-1) : nullptr;
+    if (ped == nullptr) return;
+    if (WeaponTypeInSlot(ped, 9) == 0) return;
+    if (holster::FindPointForSlot(9) >= 0) return;
+    for (int point = 0; point < holster::PointCount(); ++point) {
+        if (holster::IsPointFixed(point)) continue;
+        if (holster::PointSlot(point) >= 0) continue;
+        if (holster::SetPointSlot(point, 9)) {
+            LOGI("[physwpn] gadget slot auto-assigned to %s",
+                 holster::PointName(point));
+        }
+        return;
+    }
+}
+
 void AutoEquipParachute() {
     // No wearing ritual: after ~0.7s of genuine freefall with a parachute in
     // the inventory and empty tracked hands, the chute becomes the active

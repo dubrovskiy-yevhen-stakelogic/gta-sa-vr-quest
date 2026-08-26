@@ -288,6 +288,31 @@ constexpr int kAircraftOrdinaryOuterFarPriorityLimitMax =
     kAircraftOrdinaryOuterPriorityLimitMax -
     kAircraftOrdinaryOuterNearPriorityLimitMax;
 constexpr float kAircraftOrdinaryOuterFarBandStartM = 400.0f;
+// ScanSectorList writes CEntity::m_nScanCode before SetupMap decides whether
+// the entity is visible.  A later sector pass therefore cannot recover an
+// entity rejected by the current head pitch.  Capture the bounded ordinary
+// candidates during the stock/discovery walks, choose a stable angular/radial
+// shell, then reopen only selected misses by clearing their entity-local scan
+// stamp.  Retail immediately writes the current generation back before the
+// replayed SetupMap call; the global CWorld generation is never changed.
+constexpr std::uintptr_t kRetailWorldCurrentScanCodeOffset = 0xa56138u;
+constexpr std::uintptr_t kRetailWorldSectorsOffset = 0xa1a908u;
+constexpr std::uintptr_t kRetailWorldRepeatSectorsOffset = 0xa52d08u;
+// Itanium object vptrs point 16 bytes past the exported vtable symbol. Timed
+// model visibility is decided by an earlier retail branch that the direct
+// static-list enumeration cannot reproduce safely, so v1 leaves both classes
+// entirely stock-authoritative.
+constexpr std::uintptr_t kRetailTimeModelInfoVptrOffset = 0x8226f8u;
+constexpr std::uintptr_t kRetailLodTimeModelInfoVptrOffset = 0x8227a8u;
+constexpr int kAircraftOrdinaryRadialCandidateLimit = 2048;
+constexpr int kAircraftOrdinaryRadialCandidateHashSize = 4096;
+constexpr int kAircraftOrdinaryRadialReplaySectorLimit = 512;
+constexpr int kAircraftOrdinaryRadialSectorSnapshotLimit = 4096;
+constexpr int kAircraftOrdinaryInnerAngularBins = 24;
+constexpr int kAircraftOrdinaryInnerRadialBins = 4;
+constexpr int kAircraftOrdinaryOuterAngularBins = 8;
+constexpr int kAircraftOrdinaryOuterRadialBins = 4;
+constexpr float kAircraftOrdinaryLargeBuildingMinBoundRadiusM = 12.0f;
 constexpr int kAircraftOrdinaryHorizonForcedLimitMax =
     kAircraftOrdinaryHorizonForcedLimit +
     kAircraftOrdinaryOuterPriorityLimitMax;
@@ -299,6 +324,12 @@ constexpr int kAircraftOrdinaryHorizonForcedLimitMax =
 constexpr float kAircraftOrdinaryPromotionMinDrawDistanceM = 80.0f;
 constexpr float kAircraftOrdinaryPromotionMinBoundRadiusM = 5.0f;
 constexpr float kAircraftOrdinaryPromotionThresholdEpsilonM = 2.0f;
+// If the primary substantial-building class cannot fill the existing 96-entry
+// inner shell, use only sizeable, resident, rootless BUILDING meshes as a
+// second tier.  This never creates a second allowance: primary candidates win
+// every comparison and fallback candidates may occupy only otherwise-empty
+// slots inside the same fixed inner quota.
+constexpr float kAircraftOrdinaryFallbackBuildingMinBoundRadiusM = 5.0f;
 // At altitude, retail's 100 m streaming-priority sphere leaves many otherwise
 // eligible rootless building models non-resident inside the 300 m ordinary
 // footprint. Capture only substantial forward BUILDING leaves already seen by
@@ -325,8 +356,17 @@ constexpr int kAircraftOpaqueChildCaptureLimit = 256;
 constexpr int kAircraftRetainedRootCaptureLimit =
     kAircraftLodRootUnionCaptureLimit;
 constexpr int kRetailVisiblePointerCapacity = 1000;
+constexpr int kRetailVisibleSuperPointerCapacity = 50;
+constexpr int kRetailAlphaEntityCapacity = 200;
+constexpr int kRetailAlphaUnderwaterEntityCapacity = 100;
+constexpr std::uintptr_t kRetailVisibleEntityCountOffset = 0xa0d6d4u;
+constexpr std::uintptr_t kRetailVisibleLodCountOffset = 0xa0d6d8u;
+constexpr std::uintptr_t kRetailVisibleSuperLodCountOffset = 0xa0d6e0u;
 constexpr std::uintptr_t kRetailVisibleEntityPtrsOffset = 0xa0d700u;
 constexpr std::uintptr_t kRetailVisibleLodPtrsOffset = 0xa0f640u;
+constexpr std::uintptr_t kRetailVisibleSuperLodPtrsOffset = 0xa11580u;
+constexpr std::uintptr_t kRetailAlphaEntityListOffset = 0xcce4e0u;
+constexpr std::uintptr_t kRetailAlphaUnderwaterEntityListOffset = 0xcce588u;
 constexpr std::uintptr_t kRetailPcScratchOffset = 0x8a7c94u;
 constexpr std::uintptr_t kRetailLodRenderListBaseOffset = 0x60u;
 constexpr std::uintptr_t kRetailLodRenderListEndOffset = 0x8000u;
@@ -353,6 +393,16 @@ static_assert(kAircraftOrdinaryOuterNearPriorityLimitMax +
                   kAircraftOrdinaryOuterFarPriorityLimitMax ==
               kAircraftOrdinaryOuterPriorityLimitMax);
 static_assert(kAircraftOrdinaryHorizonForcedLimitMax == 128);
+static_assert(kAircraftOrdinaryInnerAngularBins *
+                  kAircraftOrdinaryInnerRadialBins ==
+              kAircraftOrdinaryHorizonForcedLimit);
+static_assert(kAircraftOrdinaryOuterAngularBins *
+                  kAircraftOrdinaryOuterRadialBins ==
+              kAircraftOrdinaryOuterPriorityLimitMax);
+static_assert(kAircraftOrdinaryRadialCandidateHashSize >=
+              2 * kAircraftOrdinaryRadialCandidateLimit);
+static_assert((kAircraftOrdinaryRadialCandidateHashSize &
+               (kAircraftOrdinaryRadialCandidateHashSize - 1)) == 0);
 static_assert(kAircraftOrdinaryHorizonForcedLimitMax <
               kAircraftLodVisibleAdmissionLimit);
 static_assert(kAircraftOpaqueChildCaptureLimit <=
@@ -3871,7 +3921,7 @@ bool OnExitVehicleJustDown(void* pad, bool onFoot, void* vehicle, bool arg3,
     const bool vrPressed = g_vrEnterExitJustDown.exchange(
         false, std::memory_order_acq_rel);
     if (vrPressed && !controlsEnabled && pad != nullptr) {
-        // Field probe: name the exact gate that swallowed the enter press.
+        // Name the exact gate that swallowed the enter press.
         LOGI("[driving] enter/exit press REFUSED pad110=%d pad12d=%d",
              *reinterpret_cast<const uint16_t*>(
                  reinterpret_cast<const char*>(pad) + 0x110),
@@ -4724,6 +4774,9 @@ thread_local void* g_aircraftStandaloneHorizonEntity = nullptr;
 thread_local bool g_aircraftOrdinaryHorizonScanActive = false;
 thread_local void* g_aircraftOrdinaryHorizonContextEntity = nullptr;
 thread_local void* g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
+thread_local void* g_aircraftOrdinaryRadialScreenProbeEntity = nullptr;
+thread_local bool g_aircraftOrdinaryRadialScreenProbeObserved = false;
+thread_local bool g_aircraftOrdinaryRadialScreenProbeVisible = false;
 thread_local bool g_aircraftOrdinaryHorizonContextOuterBand = false;
 thread_local bool g_aircraftOrdinaryHorizonContextOuterFarBand = false;
 thread_local bool g_aircraftOrdinaryHorizonRangePromoted = false;
@@ -4870,11 +4923,86 @@ struct AircraftOrdinaryOuterCounters {
     int phase1OuterPromotionStops{};
     int phase1InnerAdmissionStops{};
     int phase1OuterAdmissionStops{};
+    int radialCandidates{};
+    int radialInnerCandidates{};
+    int radialOuterCandidates{};
+    int radialInnerPrimaryCandidates{};
+    int radialInnerFallbackCandidates{};
+    int radialInnerSelectableCandidates{};
+    int radialSelectedFallbackInner{};
+    int radialScreenRejectZeroCandidates{};
+    int radialOcclusionRejectZeroCandidates{};
+    int radialSelectedResultZeroMisses{};
+    int radialCompletedResultZeroMisses{};
+    int radialSelectedInner{};
+    int radialSelectedOuter{};
+    int radialRetainedInner{};
+    int radialRetainedOuter{};
+    int radialReplayRequested{};
+    int radialReplayVisited{};
+    int radialReplayCompleted{};
+    int radialReplayMisses{};
+    int radialReplaySectors{};
+    int radialReplayVisible{};
+    int radialReplayCulled{};
+    int radialReplayStream{};
+    int radialReplayOther{};
+    int radialCaptureOverflow{};
+    int radialSectorOverflow{};
     int faults{};
     double wallMs{};
     double cpuMs{};
 };
 thread_local AircraftOrdinaryOuterCounters g_aircraftOrdinaryOuter{};
+struct AircraftOrdinaryRadialCandidate {
+    void* entity{};
+    float worldX{};
+    float worldY{};
+    float groundDistanceM{};
+    float slantDistanceM{};
+    float boundRadiusM{};
+    float rawDrawDistanceM{};
+    std::uint8_t entityType{};
+    std::uint8_t sectorX{};
+    std::uint8_t sectorY{};
+    bool outerBand{};
+    bool promotionEligible{};
+    bool fallbackEligible{};
+    bool rootless{};
+    bool sectorValid{};
+    bool phaseObserved{};
+    std::uint8_t phaseResult{};
+    bool phaseScreenTested{};
+    bool phaseScreenVisible{};
+    bool retained{};
+    bool replaySafe{};
+    bool selected{};
+    bool replayRequested{};
+    bool replayVisited{};
+    bool replayCompleted{};
+    std::uint8_t replayResult{0xffu};
+};
+thread_local std::array<AircraftOrdinaryRadialCandidate,
+                        kAircraftOrdinaryRadialCandidateLimit>
+    g_aircraftOrdinaryRadialCandidates{};
+thread_local std::array<void*, kAircraftOrdinaryRadialCandidateHashSize>
+    g_aircraftOrdinaryRadialCandidateHashKeys{};
+thread_local std::array<std::uint16_t,
+                        kAircraftOrdinaryRadialCandidateHashSize>
+    g_aircraftOrdinaryRadialCandidateHashIndices{};
+thread_local int g_aircraftOrdinaryRadialCandidateCount = 0;
+thread_local bool g_aircraftOrdinaryRadialCaptureOverflow = false;
+thread_local bool g_aircraftOrdinaryRadialSelectionActive = false;
+thread_local bool g_aircraftOrdinaryRadialAdmissionActive = false;
+thread_local float g_aircraftOrdinaryRadialMaxGroundM =
+    kAircraftOrdinaryHorizonMaxGroundDistanceM;
+struct AircraftOrdinarySectorStampSnapshot {
+    void* entity{};
+    std::uint16_t scanCode{};
+};
+thread_local std::array<AircraftOrdinarySectorStampSnapshot,
+                        kAircraftOrdinaryRadialSectorSnapshotLimit>
+    g_aircraftOrdinarySectorStampSnapshots{};
 struct AircraftOrdinaryPrefetchCandidate {
     int modelId{-1};
     float horizontalDistanceM{};
@@ -5661,10 +5789,47 @@ int CountAlphaList(void* listAddress, int capacity) {
     return -1;
 }
 
+struct AlphaListMembership {
+    bool valid{};
+    int nodes{-1};
+    int occurrences{-1};
+};
+
+AlphaListMembership InspectAlphaListMembership(
+        void* listAddress, int capacity, const void* entity) {
+    AlphaListMembership result{};
+    if (!listAddress || capacity <= 0 || !entity) return result;
+    auto* const head = reinterpret_cast<AlphaListNode*>(listAddress);
+    auto* const tail = reinterpret_cast<AlphaListNode*>(
+        reinterpret_cast<std::uint8_t*>(listAddress) + 0x28);
+    AlphaListNode* previous = head;
+    AlphaListNode* node = head->next;
+    int occurrences = 0;
+    for (int count = 0; count <= capacity; ++count) {
+        if (node == tail) {
+            if (tail->previous != previous) return result;
+            result.valid = true;
+            result.nodes = count;
+            result.occurrences = occurrences;
+            return result;
+        }
+        if (!node || (reinterpret_cast<std::uintptr_t>(node) & 7u) != 0u ||
+            node->previous != previous || !node->next) {
+            return result;
+        }
+        if (node->object == entity) ++occurrences;
+        previous = node;
+        node = node->next;
+    }
+    return result;
+}
+
 int CountTrackedAlphaNodes() {
-    const int entities = CountAlphaList(g.CVisibilityPlugins_m_alphaEntityList, 200);
+    const int entities = CountAlphaList(
+        g.CVisibilityPlugins_m_alphaEntityList, kRetailAlphaEntityCapacity);
     const int underwater = CountAlphaList(
-        g.CVisibilityPlugins_m_alphaUnderwaterEntityList, 100);
+        g.CVisibilityPlugins_m_alphaUnderwaterEntityList,
+        kRetailAlphaUnderwaterEntityCapacity);
     return entities >= 0 && underwater >= 0 ? entities + underwater : -1;
 }
 
@@ -6408,6 +6573,280 @@ AircraftOrdinaryPriorityLimits AircraftOrdinaryPriorityForRadius(
     limits.outerNear = limits.outer - limits.outerFar;
     limits.total = limits.inner + limits.outer;
     return limits;
+}
+
+struct AircraftOrdinaryRadialCandidateInfo {
+    void* entity{};
+    float worldX{};
+    float worldY{};
+    float groundDistanceM{};
+    float slantDistanceM{};
+    float boundRadiusM{};
+    float rawDrawDistanceM{};
+    std::uint8_t entityType{};
+    bool outerBand{};
+    bool promotionEligible{};
+    bool fallbackEligible{};
+    bool rootless{};
+};
+
+bool DescribeAircraftOrdinaryRadialCandidate(
+        void* entity, void* modelInfo, bool timeInRange,
+        AircraftOrdinaryRadialCandidateInfo* infoOut) {
+    if (!entity || !modelInfo || !infoOut || !timeInRange ||
+        !g_aircraftOrdinaryHorizonScanActive || !IsKnownCullOwnerThread() ||
+        !g.TheCamera || !g.CModelInfo_ms_modelInfoPtrs ||
+        !std::isfinite(g_aircraftOrdinaryRadialMaxGroundM) ||
+        g_aircraftOrdinaryRadialMaxGroundM <= 0.0f ||
+        !std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) ||
+        g_aircraftOrdinaryHorizonMaxSlantM <= 0.0f) {
+        return false;
+    }
+
+    auto* const entityBytes = static_cast<std::uint8_t*>(entity);
+    const int entityType = entityBytes[0x5a] & 0x7;
+    std::uint32_t entityFlags = 0u;
+    std::memcpy(&entityFlags, entityBytes + 0x28, sizeof(entityFlags));
+    constexpr std::uint32_t kBigBuildingFlag = 0x100u;
+    constexpr std::uint32_t kDrawLastFlag = 1u << 14;
+    if ((entityType != 1 && entityType != 5) ||
+        (entityFlags & (kBigBuildingFlag | kDrawLastFlag)) != 0u ||
+        entityBytes[0x58] != 0u) {
+        return false;
+    }
+    void* const linkedLod = *reinterpret_cast<void**>(entityBytes + 0x50);
+    if (linkedLod && !IsAircraftAuthoredLodRoot(linkedLod)) return false;
+
+    const int modelId = static_cast<int>(
+        *reinterpret_cast<const std::int16_t*>(entityBytes + 0x32));
+    if (modelId < 0 || modelId >= 20000 ||
+        g.CModelInfo_ms_modelInfoPtrs[modelId] != modelInfo ||
+        NeonSignModelBit(modelId) >= 0) {
+        return false;
+    }
+    auto* const modelBytes = static_cast<std::uint8_t*>(modelInfo);
+    const std::uintptr_t modelVptr =
+        *reinterpret_cast<const std::uintptr_t*>(modelBytes);
+    if (modelVptr == g.LoadBase + kRetailTimeModelInfoVptrOffset ||
+        modelVptr == g.LoadBase + kRetailLodTimeModelInfoVptrOffset) {
+        return false;
+    }
+    if (*reinterpret_cast<void**>(modelBytes + 0x40) == nullptr) return false;
+    const float rawDrawDistance = *reinterpret_cast<float*>(modelBytes + 0x38);
+    void* const colModel = *reinterpret_cast<void**>(modelBytes + 0x30);
+    const float boundRadius = colModel
+        ? *reinterpret_cast<float*>(
+              static_cast<std::uint8_t*>(colModel) + 0x24)
+        : 0.0f;
+    if (!std::isfinite(rawDrawDistance) || rawDrawDistance <= 0.0f ||
+        !std::isfinite(boundRadius) || boundRadius <= 0.0f) {
+        return false;
+    }
+
+    V3 entityWorld{};
+    if (!ReadEntityWorldPosition(entity, &entityWorld)) return false;
+    const float* const cameraPosition = reinterpret_cast<const float*>(
+        static_cast<const std::uint8_t*>(g.TheCamera) + kOffPos);
+    const float dx = entityWorld.x - cameraPosition[0];
+    const float dy = entityWorld.y - cameraPosition[1];
+    const float dz = entityWorld.z - cameraPosition[2];
+    const float groundDistance = std::hypot(dx, dy);
+    const float slantDistance = std::sqrt(std::max(
+        0.0f, dx * dx + dy * dy + dz * dz));
+    if (!std::isfinite(groundDistance) || !std::isfinite(slantDistance) ||
+        slantDistance + boundRadius <
+            kAircraftOrdinaryHorizonMinSlantDistanceM ||
+        groundDistance - boundRadius >
+            g_aircraftOrdinaryRadialMaxGroundM ||
+        slantDistance - boundRadius >
+            g_aircraftOrdinaryHorizonMaxSlantM) {
+        return false;
+    }
+
+    const bool outerBand = groundDistance >=
+        kAircraftOrdinaryHorizonMaxGroundDistanceM;
+    const bool normalSubstantial =
+        rawDrawDistance >= kAircraftOrdinaryPromotionMinDrawDistanceM &&
+        boundRadius >= kAircraftOrdinaryPromotionMinBoundRadiusM;
+    const bool largeBuilding = entityType == 1 &&
+        boundRadius >= kAircraftOrdinaryLargeBuildingMinBoundRadiusM;
+    const bool promotionEligible = normalSubstantial || largeBuilding;
+    const bool fallbackEligible = !outerBand && linkedLod == nullptr &&
+        entityType == 1 && !promotionEligible &&
+        boundRadius >= kAircraftOrdinaryFallbackBuildingMinBoundRadiusM;
+    // Linked detail children remain useful inside the proven 300 m layer, but
+    // the farther ring must stay rootless and substantial so it cannot turn
+    // into another expensive child/parent handoff pass.
+    if (outerBand && (linkedLod != nullptr || !promotionEligible)) return false;
+
+    *infoOut = {
+        entity,
+        entityWorld.x,
+        entityWorld.y,
+        groundDistance,
+        slantDistance,
+        boundRadius,
+        rawDrawDistance,
+        static_cast<std::uint8_t>(entityType),
+        outerBand,
+        promotionEligible,
+        fallbackEligible,
+        linkedLod == nullptr,
+    };
+    return true;
+}
+
+std::size_t AircraftOrdinaryRadialCandidateHashSlot(const void* entity) {
+    std::uintptr_t value = reinterpret_cast<std::uintptr_t>(entity) >> 4u;
+    value ^= value >> 30u;
+    value *= static_cast<std::uintptr_t>(0xbf58476d1ce4e5b9ULL);
+    value ^= value >> 27u;
+    value *= static_cast<std::uintptr_t>(0x94d049bb133111ebULL);
+    value ^= value >> 31u;
+    return static_cast<std::size_t>(value) &
+        static_cast<std::size_t>(
+            kAircraftOrdinaryRadialCandidateHashSize - 1);
+}
+
+AircraftOrdinaryRadialCandidate* FindAircraftOrdinaryRadialCandidate(
+        const void* entity) {
+    if (!entity) return nullptr;
+    std::size_t slot = AircraftOrdinaryRadialCandidateHashSlot(entity);
+    constexpr std::size_t kMask =
+        kAircraftOrdinaryRadialCandidateHashSize - 1u;
+    for (int probe = 0;
+         probe < kAircraftOrdinaryRadialCandidateHashSize; ++probe) {
+        void* const indexedEntity =
+            g_aircraftOrdinaryRadialCandidateHashKeys[slot];
+        if (!indexedEntity) return nullptr;
+        if (indexedEntity == entity) {
+            const int index = static_cast<int>(
+                g_aircraftOrdinaryRadialCandidateHashIndices[slot]);
+            if (index < 0 || index >= g_aircraftOrdinaryRadialCandidateCount)
+                return nullptr;
+            AircraftOrdinaryRadialCandidate& candidate =
+                g_aircraftOrdinaryRadialCandidates[
+                    static_cast<std::size_t>(index)];
+            return candidate.entity == entity ? &candidate : nullptr;
+        }
+        slot = (slot + 1u) & kMask;
+    }
+    return nullptr;
+}
+
+bool IndexAircraftOrdinaryRadialCandidate(void* entity, int index) {
+    if (!entity || index < 0 ||
+        index >= kAircraftOrdinaryRadialCandidateLimit) {
+        return false;
+    }
+    std::size_t slot = AircraftOrdinaryRadialCandidateHashSlot(entity);
+    constexpr std::size_t kMask =
+        kAircraftOrdinaryRadialCandidateHashSize - 1u;
+    for (int probe = 0;
+         probe < kAircraftOrdinaryRadialCandidateHashSize; ++probe) {
+        void*& indexedEntity =
+            g_aircraftOrdinaryRadialCandidateHashKeys[slot];
+        if (!indexedEntity || indexedEntity == entity) {
+            indexedEntity = entity;
+            g_aircraftOrdinaryRadialCandidateHashIndices[slot] =
+                static_cast<std::uint16_t>(index);
+            return true;
+        }
+        slot = (slot + 1u) & kMask;
+    }
+    return false;
+}
+
+AircraftOrdinaryRadialCandidate* MergeAircraftOrdinaryRadialCandidate(
+        const AircraftOrdinaryRadialCandidateInfo& info,
+        int sectorX, int sectorY, bool sectorValid) {
+    AircraftOrdinaryRadialCandidate* candidate =
+        FindAircraftOrdinaryRadialCandidate(info.entity);
+    if (!candidate) {
+        if (g_aircraftOrdinaryRadialCandidateCount >=
+                kAircraftOrdinaryRadialCandidateLimit) {
+            g_aircraftOrdinaryRadialCaptureOverflow = true;
+            ++g_aircraftOrdinaryOuter.radialCaptureOverflow;
+            return nullptr;
+        }
+        const int index = g_aircraftOrdinaryRadialCandidateCount;
+        if (!IndexAircraftOrdinaryRadialCandidate(info.entity, index)) {
+            g_aircraftOrdinaryRadialCaptureOverflow = true;
+            ++g_aircraftOrdinaryOuter.radialCaptureOverflow;
+            return nullptr;
+        }
+        candidate = &g_aircraftOrdinaryRadialCandidates[
+            static_cast<std::size_t>(index)];
+        ++g_aircraftOrdinaryRadialCandidateCount;
+        *candidate = {};
+        candidate->entity = info.entity;
+    }
+    candidate->worldX = info.worldX;
+    candidate->worldY = info.worldY;
+    candidate->groundDistanceM = info.groundDistanceM;
+    candidate->slantDistanceM = info.slantDistanceM;
+    candidate->boundRadiusM = info.boundRadiusM;
+    candidate->rawDrawDistanceM = info.rawDrawDistanceM;
+    candidate->entityType = info.entityType;
+    candidate->outerBand = info.outerBand;
+    candidate->promotionEligible = info.promotionEligible;
+    candidate->fallbackEligible = info.fallbackEligible;
+    candidate->rootless = info.rootless;
+    if (sectorValid && sectorX >= 0 && sectorX < 120 &&
+        sectorY >= 0 && sectorY < 120) {
+        candidate->sectorX = static_cast<std::uint8_t>(sectorX);
+        candidate->sectorY = static_cast<std::uint8_t>(sectorY);
+        candidate->sectorValid = true;
+    }
+    // Direct enumeration happens after both stock sector passes. An unobserved
+    // rootless entity is replayable only when its stamp proves retail really
+    // did not visit it in this generation. A current stamp without an observed
+    // result can hide a time/alpha/LOD side effect and must remain untouched.
+    if (sectorValid && !candidate->phaseObserved && info.rootless && g.LoadBase) {
+        std::uint16_t entityScanCode = 0u;
+        std::memcpy(&entityScanCode,
+                    static_cast<const std::uint8_t*>(info.entity) + 0x48,
+                    sizeof(entityScanCode));
+        const std::uint16_t currentScanCode =
+            *reinterpret_cast<const std::uint16_t*>(
+                g.LoadBase + kRetailWorldCurrentScanCodeOffset);
+        candidate->replaySafe = currentScanCode != 0u &&
+            entityScanCode != currentScanCode;
+    }
+    return candidate;
+}
+
+void ObserveAircraftOrdinaryRadialCandidate(
+        void* entity, void* modelInfo, bool timeInRange, int result,
+        bool retained, bool screenTested, bool screenVisible) {
+    if (!g_aircraftOrdinaryRadialSelectionActive ||
+        g_aircraftOrdinaryRadialAdmissionActive ||
+        (g_visibilityScanPhase != 1 && g_visibilityScanPhase != 2)) {
+        return;
+    }
+    AircraftOrdinaryRadialCandidateInfo info{};
+    if (!DescribeAircraftOrdinaryRadialCandidate(
+            entity, modelInfo, timeInRange, &info)) {
+        return;
+    }
+    AircraftOrdinaryRadialCandidate* const candidate =
+        MergeAircraftOrdinaryRadialCandidate(info, 0, 0, false);
+    if (!candidate) return;
+    candidate->phaseObserved = true;
+    candidate->phaseResult = static_cast<std::uint8_t>(
+        std::clamp(result, 0, 255));
+    candidate->phaseScreenTested = screenTested;
+    candidate->phaseScreenVisible = screenTested && screenVisible;
+    candidate->retained = candidate->retained || retained || result == 1;
+    // Result 2 is the exact post-range frustum/occlusion rejection and has not
+    // appended the entity or incremented a linked parent's child counter. A
+    // rootless result 0 is equally replayable only when the exact synchronous
+    // GetIsOnScreen call was reached: membership validation later distinguishes
+    // its frustum/occlusion miss from SetupMap's successful direct-add result 0.
+    // Result 0 before that screen call and every result 3 remain untouched.
+    candidate->replaySafe = info.rootless &&
+        !candidate->retained &&
+        (result == 2 || (result == 0 && screenTested));
 }
 
 AircraftOrdinaryHorizonClass ClassifyAircraftOrdinaryOuter(
@@ -7176,14 +7615,14 @@ AircraftLodCapacitySnapshot ReadAircraftLodCapacity() {
     const bool entityCounterValid = g.CRenderer_ms_nNoOfVisibleEntities &&
         reinterpret_cast<std::uintptr_t>(
             g.CRenderer_ms_nNoOfVisibleEntities) ==
-                g.LoadBase + 0xa0d6d4u;
+                g.LoadBase + kRetailVisibleEntityCountOffset;
     const bool lodCounterValid = g.CRenderer_ms_nNoOfVisibleLods &&
         reinterpret_cast<std::uintptr_t>(g.CRenderer_ms_nNoOfVisibleLods) ==
-            g.LoadBase + 0xa0d6d8u;
+            g.LoadBase + kRetailVisibleLodCountOffset;
     const bool superCounterValid = g.CRenderer_ms_nNoOfVisibleSuperLods &&
         reinterpret_cast<std::uintptr_t>(
             g.CRenderer_ms_nNoOfVisibleSuperLods) ==
-                g.LoadBase + 0xa0d6e0u;
+                g.LoadBase + kRetailVisibleSuperLodCountOffset;
     if (entityCounterValid)
         snapshot.visibleEntities = *g.CRenderer_ms_nNoOfVisibleEntities;
     if (lodCounterValid)
@@ -7198,6 +7637,141 @@ AircraftLodCapacitySnapshot ReadAircraftLodCapacity() {
         g_aircraftCoarseLodScratchPeak = std::max(
             g_aircraftCoarseLodScratchPeak, snapshot.scratchEntries);
     }
+    return snapshot;
+}
+
+struct AircraftOrdinaryRenderListTotals {
+    bool valid{};
+    int visibleEntities{-1};
+    int visibleLods{-1};
+    int visibleSuperLods{-1};
+    int scratchEntries{-1};
+    int alphaEntities{-1};
+    int alphaUnderwater{-1};
+};
+
+AircraftOrdinaryRenderListTotals ReadAircraftOrdinaryRenderListTotals() {
+    AircraftOrdinaryRenderListTotals totals{};
+    const AircraftLodCapacitySnapshot capacity = ReadAircraftLodCapacity();
+    totals.visibleEntities = capacity.visibleEntities;
+    totals.visibleLods = capacity.visibleLods;
+    totals.visibleSuperLods = capacity.visibleSuperLods;
+    totals.scratchEntries = capacity.scratchEntries;
+    totals.alphaEntities = CountAlphaList(
+        g.CVisibilityPlugins_m_alphaEntityList, kRetailAlphaEntityCapacity);
+    totals.alphaUnderwater = CountAlphaList(
+        g.CVisibilityPlugins_m_alphaUnderwaterEntityList,
+        kRetailAlphaUnderwaterEntityCapacity);
+    constexpr int kRetailScratchCapacity = static_cast<int>(
+        (kRetailLodRenderListEndOffset - kRetailLodRenderListBaseOffset) /
+        0x10u);
+    totals.valid = capacity.valid &&
+        totals.visibleEntities <= kRetailVisiblePointerCapacity &&
+        totals.visibleLods <= kRetailVisiblePointerCapacity &&
+        totals.visibleSuperLods <= kRetailVisibleSuperPointerCapacity &&
+        totals.scratchEntries <= kRetailScratchCapacity &&
+        totals.alphaEntities >= 0 &&
+        totals.alphaEntities <= kRetailAlphaEntityCapacity &&
+        totals.alphaUnderwater >= 0 &&
+        totals.alphaUnderwater <= kRetailAlphaUnderwaterEntityCapacity;
+    return totals;
+}
+
+int CountPointerOccurrences(void* const* entries, int count, int capacity,
+                            const void* entity) {
+    if (!entries || !entity || count < 0 || count > capacity) return -1;
+    int occurrences = 0;
+    for (int i = 0; i < count; ++i) {
+        if (!entries[i]) return -1;
+        if (entries[i] == entity) ++occurrences;
+    }
+    return occurrences;
+}
+
+struct AircraftOrdinaryRetentionSnapshot {
+    bool valid{};
+    int visibleEntities{-1};
+    int visibleLods{-1};
+    int visibleSuperLods{-1};
+    int scratchEntries{-1};
+    int alphaEntities{-1};
+    int alphaUnderwater{-1};
+
+    int TotalOccurrences() const {
+        if (!valid) return -1;
+        return visibleEntities + visibleLods + visibleSuperLods +
+            scratchEntries + alphaEntities + alphaUnderwater;
+    }
+
+    bool Missing() const { return valid && TotalOccurrences() == 0; }
+
+    bool ExactRenderable() const {
+        return valid && visibleLods == 0 && visibleSuperLods == 0 &&
+            scratchEntries == 0 &&
+            visibleEntities + alphaEntities + alphaUnderwater == 1 &&
+            TotalOccurrences() == 1;
+    }
+};
+
+AircraftOrdinaryRetentionSnapshot InspectAircraftOrdinaryRetention(
+        const void* entity) {
+    AircraftOrdinaryRetentionSnapshot snapshot{};
+    if (!g.LoadBase || !entity) return snapshot;
+    const AircraftOrdinaryRenderListTotals totals =
+        ReadAircraftOrdinaryRenderListTotals();
+    if (!totals.valid) return snapshot;
+
+    auto** const visibleEntities = reinterpret_cast<void**>(
+        g.LoadBase + kRetailVisibleEntityPtrsOffset);
+    auto** const visibleLods = reinterpret_cast<void**>(
+        g.LoadBase + kRetailVisibleLodPtrsOffset);
+    auto** const visibleSuperLods = reinterpret_cast<void**>(
+        g.LoadBase + kRetailVisibleSuperLodPtrsOffset);
+    const std::uintptr_t scratchBegin = g.LoadBase + kRetailPcScratchOffset +
+        kRetailLodRenderListBaseOffset;
+    constexpr int kRetailScratchCapacity = static_cast<int>(
+        (kRetailLodRenderListEndOffset - kRetailLodRenderListBaseOffset) /
+        0x10u);
+
+    snapshot.visibleEntities = CountPointerOccurrences(
+        visibleEntities, totals.visibleEntities,
+        kRetailVisiblePointerCapacity, entity);
+    snapshot.visibleLods = CountPointerOccurrences(
+        visibleLods, totals.visibleLods, kRetailVisiblePointerCapacity, entity);
+    snapshot.visibleSuperLods = CountPointerOccurrences(
+        visibleSuperLods, totals.visibleSuperLods,
+        kRetailVisibleSuperPointerCapacity, entity);
+    snapshot.scratchEntries = 0;
+    if (totals.scratchEntries < 0 ||
+        totals.scratchEntries > kRetailScratchCapacity) {
+        return snapshot;
+    }
+    for (int i = 0; i < totals.scratchEntries; ++i) {
+        void* scratchEntity = nullptr;
+        std::memcpy(
+            &scratchEntity,
+            reinterpret_cast<const void*>(
+                scratchBegin + static_cast<std::uintptr_t>(i) * 0x10u),
+            sizeof(scratchEntity));
+        if (!scratchEntity) return snapshot;
+        if (scratchEntity == entity) ++snapshot.scratchEntries;
+    }
+    const AlphaListMembership alphaEntities = InspectAlphaListMembership(
+        g.CVisibilityPlugins_m_alphaEntityList,
+        kRetailAlphaEntityCapacity, entity);
+    const AlphaListMembership alphaUnderwater = InspectAlphaListMembership(
+        g.CVisibilityPlugins_m_alphaUnderwaterEntityList,
+        kRetailAlphaUnderwaterEntityCapacity, entity);
+    if (!alphaEntities.valid || !alphaUnderwater.valid ||
+        alphaEntities.nodes != totals.alphaEntities ||
+        alphaUnderwater.nodes != totals.alphaUnderwater ||
+        snapshot.visibleEntities < 0 || snapshot.visibleLods < 0 ||
+        snapshot.visibleSuperLods < 0) {
+        return snapshot;
+    }
+    snapshot.alphaEntities = alphaEntities.occurrences;
+    snapshot.alphaUnderwater = alphaUnderwater.occurrences;
+    snapshot.valid = true;
     return snapshot;
 }
 
@@ -7554,7 +8128,31 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         setupCaller == g.LoadBase + 0x4b5e50u &&
         reinterpret_cast<std::uintptr_t>(g_origSetupMapEntityVisibility) ==
             g.LoadBase + 0x4b68b8u;
-    const bool aircraftOrdinaryOuterCall = aircraftOrdinarySectorCall &&
+    AircraftOrdinaryRadialCandidate* const radialReplayCandidate =
+        g_aircraftOrdinaryRadialAdmissionActive &&
+                g_visibilityScanPhase == 6
+            ? FindAircraftOrdinaryRadialCandidate(entity)
+            : nullptr;
+    const bool aircraftOrdinaryRadialReplayCall =
+        aircraftOrdinarySectorCall && radialReplayCandidate &&
+        radialReplayCandidate->selected &&
+        radialReplayCandidate->replayRequested &&
+        !radialReplayCandidate->retained &&
+        radialReplayCandidate->rootless &&
+        radialReplayCandidate->replaySafe;
+    if (g_aircraftOrdinaryRadialAdmissionActive &&
+        g_visibilityScanPhase == 6 && aircraftOrdinarySectorCall &&
+        !aircraftOrdinaryRadialReplayCall) {
+        // Replay sectors are preconditioned so every non-selected list member
+        // already carries the current scan code. Reaching this hook for one is
+        // a fail-closed proof that the list snapshot was incomplete.
+        ++g_aircraftOrdinaryOuter.faults;
+        return 0;
+    }
+    const bool aircraftOrdinaryOuterCall =
+        aircraftOrdinaryRadialReplayCall
+            ? radialReplayCandidate->outerBand
+            : aircraftOrdinarySectorCall &&
         g_aircraftOrdinaryHorizonScanActive &&
         g_aircraftOrdinaryOuterScanActive && g_visibilityScanPhase == 4;
     const bool aircraftOrdinaryPhase1OuterPolicyCall =
@@ -7567,8 +8165,37 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
     if (aircraftOrdinarySectorCall &&
         g_aircraftOrdinaryHorizonScanActive &&
         (g_visibilityScanPhase == 1 || g_visibilityScanPhase == 2 ||
-         aircraftOrdinaryOuterCall)) {
+         aircraftOrdinaryOuterCall || aircraftOrdinaryRadialReplayCall)) {
         ++g_aircraftOrdinaryHorizon.probes;
+        if (aircraftOrdinaryRadialReplayCall) {
+            AircraftOrdinaryRadialCandidateInfo replayInfo{};
+            if (!DescribeAircraftOrdinaryRadialCandidate(
+                    entity, modelInfo, timeInRange, &replayInfo) ||
+                !replayInfo.rootless ||
+                replayInfo.outerBand != radialReplayCandidate->outerBand ||
+                replayInfo.promotionEligible !=
+                    radialReplayCandidate->promotionEligible ||
+                replayInfo.fallbackEligible !=
+                    radialReplayCandidate->fallbackEligible) {
+                ++g_aircraftOrdinaryOuter.faults;
+                return 0;
+            }
+            aircraftOrdinaryHorizon = true;
+            aircraftOrdinaryOuterPolicy = replayInfo.outerBand;
+            ++g_aircraftOrdinaryHorizon.qualified;
+            if (replayInfo.rootless)
+                ++g_aircraftOrdinaryHorizon.leaves;
+            else
+                ++g_aircraftOrdinaryHorizon.linked;
+            if (replayInfo.outerBand) {
+                ++g_aircraftOrdinaryOuter.probes;
+                ++g_aircraftOrdinaryOuter.qualified;
+                if (replayInfo.entityType == 1)
+                    ++g_aircraftOrdinaryOuter.qualifiedBuildings;
+                else if (replayInfo.entityType == 5)
+                    ++g_aircraftOrdinaryOuter.qualifiedDummies;
+            }
+        } else {
         AircraftOrdinaryHorizonClass aircraftOrdinaryOuterClass =
             AircraftOrdinaryHorizonClass::Filtered;
         if (aircraftOrdinaryOuterCall ||
@@ -7637,6 +8264,7 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         // let retail turn them into streaming requests or linked handoffs.
         if (aircraftOrdinaryOuterCall && !aircraftOrdinaryHorizon)
             return 0;
+        }
     }
 
     // Snapshot the exact one-child counter before retail SetupMap.  The
@@ -7989,7 +8617,8 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
                     maxGroundDistance &&
                 slantDistance - boundRadius <=
                     g_aircraftOrdinaryHorizonMaxSlantM &&
-                AircraftHorizontalConeAllows(dx, dy, boundRadius);
+                (g_aircraftOrdinaryRadialAdmissionActive ||
+                 AircraftHorizontalConeAllows(dx, dy, boundRadius));
         }
         const bool promotionFingerprint =
             g_setupMapDrawDistanceBridgeActive.load(
@@ -8014,14 +8643,27 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
                 g_aircraftOrdinaryOuter.phase1InnerPromotions <
                     g_aircraftOrdinaryInnerPriorityLimit;
         }
-        const bool promotionCandidateWithoutPriority = promotionFingerprint &&
+        const bool radialSelectionOwnsCurrentPhase =
+            g_aircraftOrdinaryRadialSelectionActive &&
+            !g_aircraftOrdinaryRadialAdmissionActive &&
+            (g_visibilityScanPhase == 1 || g_visibilityScanPhase == 2);
+        const bool radialFallbackPromotion =
+            aircraftOrdinaryRadialReplayCall && radialReplayCandidate &&
+            radialReplayCandidate->fallbackEligible;
+        const bool ordinaryPromotionGeometryClass = radialFallbackPromotion ||
+            (std::isfinite(rawDrawDistance) &&
+             rawDrawDistance >=
+                 kAircraftOrdinaryPromotionMinDrawDistanceM &&
+             std::isfinite(boundRadius) &&
+             boundRadius >= kAircraftOrdinaryPromotionMinBoundRadiusM) ||
+            (entityType == 1 && std::isfinite(boundRadius) &&
+             boundRadius >=
+                 kAircraftOrdinaryLargeBuildingMinBoundRadiusM);
+        const bool promotionCandidateWithoutPriority =
+            !radialSelectionOwnsCurrentPhase && promotionFingerprint &&
             std::isfinite(distance) && distance >= 0.0f &&
-            std::isfinite(rawDrawDistance) &&
-            rawDrawDistance >=
-                kAircraftOrdinaryPromotionMinDrawDistanceM &&
             std::isfinite(liveCameraLod) && liveCameraLod > 0.01f &&
-            std::isfinite(boundRadius) &&
-            boundRadius >= kAircraftOrdinaryPromotionMinBoundRadiusM &&
+            ordinaryPromotionGeometryClass &&
             std::isfinite(liveFar) && liveFar > 0.0f &&
             std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) &&
             g_aircraftOrdinaryHorizonMaxSlantM > 0.0f &&
@@ -8168,8 +8810,25 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
     if (aircraftVisibilityScoped) ++g_aircraftBigLodVisibilityDepth;
     if (aircraftStandaloneVisibilityScoped)
         ++g_aircraftStandaloneHorizonVisibilityDepth;
+    const bool observeAircraftOrdinaryRadialRetention =
+        aircraftOrdinarySectorCall &&
+        g_aircraftOrdinaryRadialSelectionActive &&
+        !g_aircraftOrdinaryRadialAdmissionActive &&
+        (g_visibilityScanPhase == 1 || g_visibilityScanPhase == 2);
+    const bool screenProbeOwned =
+        observeAircraftOrdinaryRadialRetention &&
+        g_aircraftOrdinaryRadialScreenProbeEntity == nullptr;
+    if (screenProbeOwned) {
+        g_aircraftOrdinaryRadialScreenProbeEntity = entity;
+        g_aircraftOrdinaryRadialScreenProbeObserved = false;
+        g_aircraftOrdinaryRadialScreenProbeVisible = false;
+    } else if (observeAircraftOrdinaryRadialRetention) {
+        ++g_aircraftOrdinaryOuter.faults;
+        g_aircraftOrdinaryOuterSessionDisabled = true;
+    }
     const AircraftLodCapacitySnapshot aircraftOrdinaryCapacityBefore =
-        aircraftOrdinaryRangePromotion
+        (aircraftOrdinaryRangePromotion ||
+         observeAircraftOrdinaryRadialRetention)
             ? ReadAircraftLodCapacity()
             : AircraftLodCapacitySnapshot{};
     if (useDrawDistanceBridge) {
@@ -8188,6 +8847,17 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         result = g_origSetupMapEntityVisibility(
             entity, modelInfo, distance, timeInRange);
     }
+    const bool aircraftOrdinaryScreenTested = screenProbeOwned &&
+        g_aircraftOrdinaryRadialScreenProbeEntity == entity &&
+        g_aircraftOrdinaryRadialScreenProbeObserved;
+    const bool aircraftOrdinaryScreenVisible =
+        aircraftOrdinaryScreenTested &&
+        g_aircraftOrdinaryRadialScreenProbeVisible;
+    if (screenProbeOwned) {
+        g_aircraftOrdinaryRadialScreenProbeEntity = nullptr;
+        g_aircraftOrdinaryRadialScreenProbeObserved = false;
+        g_aircraftOrdinaryRadialScreenProbeVisible = false;
+    }
     if (aircraftStandaloneVisibilityScoped)
         --g_aircraftStandaloneHorizonVisibilityDepth;
     if (aircraftVisibilityScoped) --g_aircraftBigLodVisibilityDepth;
@@ -8196,7 +8866,8 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         const bool aircraftOrdinaryRangePromotionAccepted =
             g_aircraftOrdinaryHorizonRangePromotionAccepted;
         const AircraftLodCapacitySnapshot aircraftOrdinaryCapacityAfter =
-            aircraftOrdinaryRangePromotion
+            (aircraftOrdinaryRangePromotion ||
+             observeAircraftOrdinaryRadialRetention)
                 ? ReadAircraftLodCapacity()
                 : AircraftLodCapacitySnapshot{};
         // A rootless ordinary entity returns VISIBLE and is appended by its
@@ -8240,6 +8911,10 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
                     static_cast<std::uint8_t*>(modelInfo) + 0x38),
                 observedDrawDistance, drawDistance);
         }
+        if (aircraftOrdinaryRadialReplayCall) {
+            radialReplayCandidate->replayResult =
+                static_cast<std::uint8_t>(std::clamp(result, 0, 255));
+        }
         if (result == 1) {
             ++g_aircraftOrdinaryHorizon.resultVisible;
         } else if (result == 2) {
@@ -8263,6 +8938,13 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             } else {
                 ++g_aircraftOrdinaryOuter.resultOther;
             }
+        }
+        if (observeAircraftOrdinaryRadialRetention) {
+            ObserveAircraftOrdinaryRadialCandidate(
+                entity, modelInfo, timeInRange, result,
+                result == 1 || aircraftOrdinaryRetainedInSetupMap,
+                aircraftOrdinaryScreenTested,
+                aircraftOrdinaryScreenVisible);
         }
     }
     CaptureAircraftOpaqueChild(
@@ -12745,6 +13427,932 @@ bool AircraftOrdinaryOuterSupported() {
         g_aircraftOrdinaryHorizonScanActive && IsKnownCullOwnerThread();
 }
 
+bool AircraftOrdinaryRadialSelectionSupported() {
+    return !g_aircraftOrdinaryOuterSessionDisabled &&
+        AircraftOrdinaryOuterSupported() && g.LoadBase &&
+        g_origGetIsOnScreen &&
+        g_origIsEntityOccluded &&
+        g_targetedOcclusionHookActive.load(std::memory_order_acquire) &&
+        g.CRenderer_ms_nNoOfVisibleEntities &&
+        g.CRenderer_ms_nNoOfVisibleLods &&
+        g.CRenderer_ms_nNoOfVisibleSuperLods &&
+        reinterpret_cast<std::uintptr_t>(
+            g.CRenderer_ms_nNoOfVisibleEntities) ==
+                g.LoadBase + kRetailVisibleEntityCountOffset &&
+        reinterpret_cast<std::uintptr_t>(
+            g.CRenderer_ms_nNoOfVisibleLods) ==
+                g.LoadBase + kRetailVisibleLodCountOffset &&
+        reinterpret_cast<std::uintptr_t>(
+            g.CRenderer_ms_nNoOfVisibleSuperLods) ==
+                g.LoadBase + kRetailVisibleSuperLodCountOffset &&
+        g.CVisibilityPlugins_m_alphaEntityList &&
+        g.CVisibilityPlugins_m_alphaUnderwaterEntityList &&
+        reinterpret_cast<std::uintptr_t>(
+            g.CVisibilityPlugins_m_alphaEntityList) ==
+                g.LoadBase + kRetailAlphaEntityListOffset &&
+        reinterpret_cast<std::uintptr_t>(
+            g.CVisibilityPlugins_m_alphaUnderwaterEntityList) ==
+                g.LoadBase + kRetailAlphaUnderwaterEntityListOffset &&
+        kRetailWorldCurrentScanCodeOffset != 0u &&
+        kRetailWorldSectorsOffset != 0u &&
+        kRetailWorldRepeatSectorsOffset != 0u;
+}
+
+bool EnumerateAircraftOrdinaryStaticList(
+        void* head, int sectorX, int sectorY) {
+    void* node = head;
+    int visitedNodes = 0;
+    while (node) {
+        if (++visitedNodes > kAircraftOrdinaryRadialSectorSnapshotLimit) {
+            g_aircraftOrdinaryRadialCaptureOverflow = true;
+            ++g_aircraftOrdinaryOuter.radialCaptureOverflow;
+            return false;
+        }
+        auto* const nodeBytes = static_cast<std::uint8_t*>(node);
+        void* const entity = *reinterpret_cast<void**>(nodeBytes);
+        void* const next = *reinterpret_cast<void**>(nodeBytes + 0x8);
+        if (next == node) {
+            g_aircraftOrdinaryRadialCaptureOverflow = true;
+            ++g_aircraftOrdinaryOuter.radialCaptureOverflow;
+            return false;
+        }
+        if (entity && g.CModelInfo_ms_modelInfoPtrs) {
+            const auto* const entityBytes =
+                static_cast<const std::uint8_t*>(entity);
+            const int modelId = static_cast<int>(
+                *reinterpret_cast<const std::int16_t*>(entityBytes + 0x32));
+            void* const modelInfo = modelId >= 0 && modelId < 20000
+                ? g.CModelInfo_ms_modelInfoPtrs[modelId] : nullptr;
+            AircraftOrdinaryRadialCandidateInfo info{};
+            if (DescribeAircraftOrdinaryRadialCandidate(
+                    entity, modelInfo, true, &info)) {
+                MergeAircraftOrdinaryRadialCandidate(
+                    info, sectorX, sectorY, true);
+                if (g_aircraftOrdinaryRadialCaptureOverflow) return false;
+            }
+        }
+        node = next;
+    }
+    return true;
+}
+
+bool EnumerateAircraftOrdinaryStaticDisk(float radiusM) {
+    if (!g.LoadBase || !g.CRenderer_ms_vecCameraPosition ||
+        !std::isfinite(radiusM) || radiusM <= 0.0f) {
+        return false;
+    }
+    constexpr float kWorldMin = -3000.0f;
+    constexpr float kSectorM = 50.0f;
+    constexpr int kSectorCount = 120;
+    const float cameraX = g.CRenderer_ms_vecCameraPosition[0];
+    const float cameraY = g.CRenderer_ms_vecCameraPosition[1];
+    if (!std::isfinite(cameraX) || !std::isfinite(cameraY)) return false;
+    const auto sectorIndex = [](float world) {
+        return std::clamp(
+            static_cast<int>(std::floor((world - kWorldMin) / kSectorM)),
+            0, kSectorCount - 1);
+    };
+    const int minX = sectorIndex(cameraX - radiusM);
+    const int maxX = sectorIndex(cameraX + radiusM);
+    const int minY = sectorIndex(cameraY - radiusM);
+    const int maxY = sectorIndex(cameraY + radiusM);
+    const float radiusSq = radiusM * radiusM;
+    auto* const sectorBase = reinterpret_cast<std::uint8_t*>(
+        g.LoadBase + kRetailWorldSectorsOffset);
+    int enumeratedSectors = 0;
+    for (int sectorY = minY; sectorY <= maxY; ++sectorY) {
+        const float sectorMinY = kWorldMin + sectorY * kSectorM;
+        const float sectorMaxY = sectorMinY + kSectorM;
+        const float closestY = std::clamp(cameraY, sectorMinY, sectorMaxY);
+        const float dy = closestY - cameraY;
+        for (int sectorX = minX; sectorX <= maxX; ++sectorX) {
+            const float sectorMinX = kWorldMin + sectorX * kSectorM;
+            const float sectorMaxX = sectorMinX + kSectorM;
+            const float closestX = std::clamp(cameraX, sectorMinX, sectorMaxX);
+            const float dx = closestX - cameraX;
+            if (dx * dx + dy * dy > radiusSq) continue;
+            const std::size_t sectorOffset = static_cast<std::size_t>(
+                sectorY * kSectorCount + sectorX) * 0x10u;
+            auto* const sector = sectorBase + sectorOffset;
+            void* const buildingHead = *reinterpret_cast<void**>(sector);
+            void* const dummyHead = *reinterpret_cast<void**>(sector + 0x8);
+            if (!EnumerateAircraftOrdinaryStaticList(
+                    buildingHead, sectorX, sectorY) ||
+                !EnumerateAircraftOrdinaryStaticList(
+                    dummyHead, sectorX, sectorY)) {
+                return false;
+            }
+            ++enumeratedSectors;
+        }
+    }
+    g_aircraftOrdinaryOuter.candidateSectors = enumeratedSectors;
+    return true;
+}
+
+bool BetterAircraftOrdinaryRadialCandidate(
+        const AircraftOrdinaryRadialCandidate& candidate,
+        const AircraftOrdinaryRadialCandidate& current) {
+    if (candidate.promotionEligible != current.promotionEligible)
+        return candidate.promotionEligible;
+    if (candidate.boundRadiusM != current.boundRadiusM)
+        return candidate.boundRadiusM > current.boundRadiusM;
+    if (candidate.rawDrawDistanceM != current.rawDrawDistanceM)
+        return candidate.rawDrawDistanceM > current.rawDrawDistanceM;
+    if (candidate.groundDistanceM != current.groundDistanceM)
+        return candidate.groundDistanceM > current.groundDistanceM;
+    return reinterpret_cast<std::uintptr_t>(candidate.entity) <
+        reinterpret_cast<std::uintptr_t>(current.entity);
+}
+
+bool SelectAircraftOrdinaryRadialCandidates() {
+    std::array<int, kAircraftOrdinaryHorizonForcedLimit> innerCells{};
+    std::array<int, kAircraftOrdinaryHorizonForcedLimit> innerFallbackCells{};
+    std::array<int, kAircraftOrdinaryOuterPriorityLimitMax> outerCells{};
+    innerCells.fill(-1);
+    innerFallbackCells.fill(-1);
+    outerCells.fill(-1);
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kTau = 2.0f * kPi;
+
+    // SetupMap result 0 has two meanings for a rootless entity: a true miss, or
+    // a successful direct AddEntityToRenderList. Resolve that ambiguity from
+    // exact post-scan membership instead of the result code or a global delta.
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+        AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        candidate.selected = false;
+        candidate.replayRequested = false;
+        candidate.replayVisited = false;
+        candidate.replayCompleted = false;
+        candidate.replayResult = 0xffu;
+        if (!candidate.rootless || !candidate.sectorValid ||
+            (!candidate.promotionEligible && !candidate.fallbackEligible)) {
+            continue;
+        }
+        if (!candidate.outerBand) {
+            if (candidate.promotionEligible)
+                ++g_aircraftOrdinaryOuter.radialInnerPrimaryCandidates;
+            else if (candidate.fallbackEligible)
+                ++g_aircraftOrdinaryOuter.radialInnerFallbackCandidates;
+        }
+        const bool observedRetained = candidate.retained;
+        const AircraftOrdinaryRetentionSnapshot retention =
+            InspectAircraftOrdinaryRetention(candidate.entity);
+        const bool exact = retention.ExactRenderable();
+        const bool missing = retention.Missing();
+        if (missing && candidate.phaseObserved &&
+            candidate.phaseResult == 0u && candidate.phaseScreenTested) {
+            if (candidate.phaseScreenVisible)
+                ++g_aircraftOrdinaryOuter
+                    .radialOcclusionRejectZeroCandidates;
+            else
+                ++g_aircraftOrdinaryOuter
+                    .radialScreenRejectZeroCandidates;
+        }
+        const bool sourceInvariant = exact
+            ? (observedRetained ||
+               (candidate.phaseObserved && candidate.phaseResult == 0u))
+            : (missing && !observedRetained &&
+               (!candidate.phaseObserved || candidate.phaseResult != 1u));
+        if (!retention.valid || !sourceInvariant) {
+            ++g_aircraftOrdinaryOuter.faults;
+            g_aircraftOrdinaryOuterSessionDisabled = true;
+            return false;
+        }
+        candidate.retained = exact;
+        if (candidate.retained) candidate.replaySafe = false;
+        if (!candidate.outerBand &&
+            (candidate.retained || candidate.replaySafe)) {
+            ++g_aircraftOrdinaryOuter.radialInnerSelectableCandidates;
+        }
+    }
+
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+        AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        if (!candidate.rootless || !candidate.promotionEligible ||
+            !candidate.sectorValid ||
+            (!candidate.retained && !candidate.replaySafe)) {
+            continue;
+        }
+        const float* const cameraPosition = reinterpret_cast<const float*>(
+            static_cast<const std::uint8_t*>(g.TheCamera) + kOffPos);
+        const float dx = candidate.worldX - cameraPosition[0];
+        const float dy = candidate.worldY - cameraPosition[1];
+        float angle = std::atan2(dy, dx) + kPi;
+        if (!std::isfinite(angle)) continue;
+        if (angle >= kTau) angle = std::nextafter(kTau, 0.0f);
+        const auto chooseCell = [&](auto& cells, int cell) {
+            int& selectedIndex = cells[static_cast<std::size_t>(cell)];
+            if (selectedIndex < 0 || BetterAircraftOrdinaryRadialCandidate(
+                    candidate,
+                    g_aircraftOrdinaryRadialCandidates[
+                        static_cast<std::size_t>(selectedIndex)])) {
+                selectedIndex = i;
+            }
+        };
+
+        if (!candidate.outerBand) {
+            const int angularBin = std::clamp(
+                static_cast<int>(angle / kTau *
+                    kAircraftOrdinaryInnerAngularBins),
+                0, kAircraftOrdinaryInnerAngularBins - 1);
+            const int radialBin = std::clamp(
+                static_cast<int>(candidate.groundDistanceM /
+                    kAircraftOrdinaryHorizonMaxGroundDistanceM *
+                    kAircraftOrdinaryInnerRadialBins),
+                0, kAircraftOrdinaryInnerRadialBins - 1);
+            chooseCell(innerCells,
+                angularBin * kAircraftOrdinaryInnerRadialBins + radialBin);
+        } else {
+            const int angularBin = std::clamp(
+                static_cast<int>(angle / kTau *
+                    kAircraftOrdinaryOuterAngularBins),
+                0, kAircraftOrdinaryOuterAngularBins - 1);
+            int radialBin = kAircraftOrdinaryOuterRadialBins - 1;
+            if (candidate.groundDistanceM <
+                    kAircraftOrdinaryOuterFarBandStartM) {
+                const float nearT = std::clamp(
+                    (candidate.groundDistanceM -
+                     kAircraftOrdinaryHorizonMaxGroundDistanceM) /
+                        (kAircraftOrdinaryOuterFarBandStartM -
+                         kAircraftOrdinaryHorizonMaxGroundDistanceM),
+                    0.0f, std::nextafter(1.0f, 0.0f));
+                radialBin = std::clamp(
+                    static_cast<int>(nearT * 3.0f), 0, 2);
+            }
+            chooseCell(outerCells,
+                angularBin * kAircraftOrdinaryOuterRadialBins + radialBin);
+        }
+    }
+
+    const auto selectIndex = [](int index) {
+        if (index < 0) return false;
+        AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(index)];
+        if (candidate.selected) return false;
+        candidate.selected = true;
+        candidate.replayRequested = !candidate.retained && candidate.replaySafe;
+        return true;
+    };
+    int selectedInner = 0;
+    for (int index : innerCells) {
+        if (selectIndex(index)) ++selectedInner;
+    }
+    // Water, parks and sparse industrial cells often leave angular/radial
+    // buckets empty. Backfill from the remaining deterministic candidate order
+    // so the fixed 96-entry allowance cannot collapse into middle-distance
+    // holes merely because several cells contain no building.
+    while (selectedInner < g_aircraftOrdinaryInnerPriorityLimit) {
+        int bestIndex = -1;
+        for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+            const AircraftOrdinaryRadialCandidate& candidate =
+                g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+            if (candidate.outerBand || candidate.selected ||
+                !candidate.rootless || !candidate.promotionEligible ||
+                !candidate.sectorValid ||
+                (!candidate.retained && !candidate.replaySafe)) {
+                continue;
+            }
+            if (bestIndex < 0 || BetterAircraftOrdinaryRadialCandidate(
+                    candidate,
+                    g_aircraftOrdinaryRadialCandidates[
+                        static_cast<std::size_t>(bestIndex)])) {
+                bestIndex = i;
+            }
+        }
+        if (!selectIndex(bestIndex)) break;
+        ++selectedInner;
+    }
+
+    // Only after every selectable primary candidate has claimed the shared
+    // allowance may a fallback BUILDING occupy a free inner slot. Prefer cells
+    // with no primary witness first, then use the same stable quality order to
+    // fill any remaining part of the unchanged 96-entry ceiling.
+    if (selectedInner < g_aircraftOrdinaryInnerPriorityLimit) {
+        for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+            AircraftOrdinaryRadialCandidate& candidate =
+                g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+            if (candidate.outerBand || candidate.selected ||
+                !candidate.rootless || !candidate.fallbackEligible ||
+                !candidate.sectorValid ||
+                (!candidate.retained && !candidate.replaySafe)) {
+                continue;
+            }
+            const float* const cameraPosition =
+                reinterpret_cast<const float*>(
+                    static_cast<const std::uint8_t*>(g.TheCamera) + kOffPos);
+            const float dx = candidate.worldX - cameraPosition[0];
+            const float dy = candidate.worldY - cameraPosition[1];
+            float angle = std::atan2(dy, dx) + kPi;
+            if (!std::isfinite(angle)) continue;
+            if (angle >= kTau) angle = std::nextafter(kTau, 0.0f);
+            const int angularBin = std::clamp(
+                static_cast<int>(angle / kTau *
+                    kAircraftOrdinaryInnerAngularBins),
+                0, kAircraftOrdinaryInnerAngularBins - 1);
+            const int radialBin = std::clamp(
+                static_cast<int>(candidate.groundDistanceM /
+                    kAircraftOrdinaryHorizonMaxGroundDistanceM *
+                    kAircraftOrdinaryInnerRadialBins),
+                0, kAircraftOrdinaryInnerRadialBins - 1);
+            const int cell = angularBin * kAircraftOrdinaryInnerRadialBins +
+                radialBin;
+            int& selectedIndex =
+                innerFallbackCells[static_cast<std::size_t>(cell)];
+            if (selectedIndex < 0 || BetterAircraftOrdinaryRadialCandidate(
+                    candidate,
+                    g_aircraftOrdinaryRadialCandidates[
+                        static_cast<std::size_t>(selectedIndex)])) {
+                selectedIndex = i;
+            }
+        }
+        for (std::size_t cell = 0;
+             cell < innerFallbackCells.size() &&
+                 selectedInner < g_aircraftOrdinaryInnerPriorityLimit;
+             ++cell) {
+            if (innerCells[cell] < 0 &&
+                selectIndex(innerFallbackCells[cell])) {
+                ++selectedInner;
+            }
+        }
+        for (int index : innerFallbackCells) {
+            if (selectedInner >= g_aircraftOrdinaryInnerPriorityLimit) break;
+            if (selectIndex(index)) ++selectedInner;
+        }
+        while (selectedInner < g_aircraftOrdinaryInnerPriorityLimit) {
+            int bestIndex = -1;
+            for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+                const AircraftOrdinaryRadialCandidate& candidate =
+                    g_aircraftOrdinaryRadialCandidates[
+                        static_cast<std::size_t>(i)];
+                if (candidate.outerBand || candidate.selected ||
+                    !candidate.rootless || !candidate.fallbackEligible ||
+                    !candidate.sectorValid ||
+                    (!candidate.retained && !candidate.replaySafe)) {
+                    continue;
+                }
+                if (bestIndex < 0 || BetterAircraftOrdinaryRadialCandidate(
+                        candidate,
+                        g_aircraftOrdinaryRadialCandidates[
+                            static_cast<std::size_t>(bestIndex)])) {
+                    bestIndex = i;
+                }
+            }
+            if (!selectIndex(bestIndex)) break;
+            ++selectedInner;
+        }
+    }
+
+    // Eight azimuths and three 300..400 m radial bands exactly match the
+    // 24-entry near allowance; the fourth band is the eight-entry 400..500 m
+    // horizon share. At partial altitude, visit azimuths in a low-discrepancy
+    // order so a ramped quota cannot cluster on one side of the aircraft.
+    constexpr std::array<int, 8> kAngleOrder{0, 4, 2, 6, 1, 5, 3, 7};
+    int selectedNear = 0;
+    for (int wave = 0; wave < 3 &&
+            selectedNear < g_aircraftOrdinaryOuterNearPriorityLimit; ++wave) {
+        for (int order = 0; order < 8 &&
+                selectedNear < g_aircraftOrdinaryOuterNearPriorityLimit;
+             ++order) {
+            const int angleBin = kAngleOrder[static_cast<std::size_t>(order)];
+            const int radialBin = (wave + order) % 3;
+            const int index = outerCells[static_cast<std::size_t>(
+                angleBin * kAircraftOrdinaryOuterRadialBins + radialBin)];
+            if (selectIndex(index)) ++selectedNear;
+        }
+    }
+    // Empty cells must not strand an otherwise valid quota. Fill remaining
+    // near slots in stable cell order without exceeding the same fixed 24.
+    for (int index : outerCells) {
+        if (selectedNear >= g_aircraftOrdinaryOuterNearPriorityLimit) break;
+        if (index < 0 ||
+            g_aircraftOrdinaryRadialCandidates[
+                static_cast<std::size_t>(index)].groundDistanceM >=
+                    kAircraftOrdinaryOuterFarBandStartM) {
+            continue;
+        }
+        if (selectIndex(index)) ++selectedNear;
+    }
+    while (selectedNear < g_aircraftOrdinaryOuterNearPriorityLimit) {
+        int bestIndex = -1;
+        for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+            const AircraftOrdinaryRadialCandidate& candidate =
+                g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+            if (!candidate.outerBand ||
+                candidate.groundDistanceM >=
+                    kAircraftOrdinaryOuterFarBandStartM ||
+                candidate.selected || !candidate.rootless ||
+                !candidate.promotionEligible ||
+                !candidate.sectorValid ||
+                (!candidate.retained && !candidate.replaySafe)) {
+                continue;
+            }
+            if (bestIndex < 0 || BetterAircraftOrdinaryRadialCandidate(
+                    candidate,
+                    g_aircraftOrdinaryRadialCandidates[
+                        static_cast<std::size_t>(bestIndex)])) {
+                bestIndex = i;
+            }
+        }
+        if (!selectIndex(bestIndex)) break;
+        ++selectedNear;
+    }
+    int selectedFar = 0;
+    for (int angleBin : kAngleOrder) {
+        if (selectedFar >= g_aircraftOrdinaryOuterFarPriorityLimit) break;
+        const int index = outerCells[static_cast<std::size_t>(
+            angleBin * kAircraftOrdinaryOuterRadialBins +
+            (kAircraftOrdinaryOuterRadialBins - 1))];
+        if (selectIndex(index)) ++selectedFar;
+    }
+    while (selectedFar < g_aircraftOrdinaryOuterFarPriorityLimit) {
+        int bestIndex = -1;
+        for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+            const AircraftOrdinaryRadialCandidate& candidate =
+                g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+            if (!candidate.outerBand ||
+                candidate.groundDistanceM <
+                    kAircraftOrdinaryOuterFarBandStartM ||
+                candidate.selected || !candidate.rootless ||
+                !candidate.promotionEligible ||
+                !candidate.sectorValid ||
+                (!candidate.retained && !candidate.replaySafe)) {
+                continue;
+            }
+            if (bestIndex < 0 || BetterAircraftOrdinaryRadialCandidate(
+                    candidate,
+                    g_aircraftOrdinaryRadialCandidates[
+                        static_cast<std::size_t>(bestIndex)])) {
+                bestIndex = i;
+            }
+        }
+        if (!selectIndex(bestIndex)) break;
+        ++selectedFar;
+    }
+    // Preserve the near/far reservation when both rings have enough content,
+    // but never strand the fixed outer allowance over water or a sparse ring.
+    // Borrow only after each original share has exhausted its own candidates;
+    // prefer 300..400 m when both have leftovers because this is the reported
+    // middle-hole band.
+    while (selectedNear + selectedFar <
+           g_aircraftOrdinaryOuterPriorityLimit) {
+        bool unselectedNearExists = false;
+        for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+            const AircraftOrdinaryRadialCandidate& candidate =
+                g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+            if (candidate.outerBand &&
+                candidate.groundDistanceM <
+                    kAircraftOrdinaryOuterFarBandStartM &&
+                !candidate.selected && candidate.rootless &&
+                candidate.promotionEligible &&
+                candidate.sectorValid &&
+                (candidate.retained || candidate.replaySafe)) {
+                unselectedNearExists = true;
+                break;
+            }
+        }
+        int bestIndex = -1;
+        for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+            const AircraftOrdinaryRadialCandidate& candidate =
+                g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+            const bool nearBand = candidate.groundDistanceM <
+                kAircraftOrdinaryOuterFarBandStartM;
+            if (!candidate.outerBand || candidate.selected ||
+                !candidate.rootless || !candidate.promotionEligible ||
+                !candidate.sectorValid ||
+                (!candidate.retained && !candidate.replaySafe) ||
+                (unselectedNearExists && !nearBand)) {
+                continue;
+            }
+            if (bestIndex < 0 || BetterAircraftOrdinaryRadialCandidate(
+                    candidate,
+                    g_aircraftOrdinaryRadialCandidates[
+                        static_cast<std::size_t>(bestIndex)])) {
+                bestIndex = i;
+            }
+        }
+        if (!selectIndex(bestIndex)) break;
+        const AircraftOrdinaryRadialCandidate& selectedCandidate =
+            g_aircraftOrdinaryRadialCandidates[
+                static_cast<std::size_t>(bestIndex)];
+        if (selectedCandidate.groundDistanceM <
+                kAircraftOrdinaryOuterFarBandStartM)
+            ++selectedNear;
+        else
+            ++selectedFar;
+    }
+    // Admission runs later in sector order. Make its two ring gates match the
+    // exact borrowed distribution while keeping the unchanged total allowance.
+    g_aircraftOrdinaryOuterNearPriorityLimit = selectedNear;
+    g_aircraftOrdinaryOuterFarPriorityLimit = selectedFar;
+    g_aircraftOrdinaryOuter.nearLimit = selectedNear;
+    g_aircraftOrdinaryOuter.farLimit = selectedFar;
+
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+        const AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        if (candidate.outerBand)
+            ++g_aircraftOrdinaryOuter.radialOuterCandidates;
+        else
+            ++g_aircraftOrdinaryOuter.radialInnerCandidates;
+        if (!candidate.selected) continue;
+        if (candidate.outerBand) {
+            ++g_aircraftOrdinaryOuter.radialSelectedOuter;
+            if (candidate.retained)
+                ++g_aircraftOrdinaryOuter.radialRetainedOuter;
+        } else {
+            ++g_aircraftOrdinaryOuter.radialSelectedInner;
+            if (candidate.fallbackEligible)
+                ++g_aircraftOrdinaryOuter.radialSelectedFallbackInner;
+            if (candidate.retained)
+                ++g_aircraftOrdinaryOuter.radialRetainedInner;
+        }
+        if (candidate.replayRequested)
+            ++g_aircraftOrdinaryOuter.radialReplayRequested;
+        if (candidate.replayRequested && candidate.phaseObserved &&
+            candidate.phaseResult == 0u && candidate.phaseScreenTested) {
+            ++g_aircraftOrdinaryOuter.radialSelectedResultZeroMisses;
+        }
+    }
+    g_aircraftOrdinaryOuter.radialCandidates =
+        g_aircraftOrdinaryRadialCandidateCount;
+    return true;
+}
+
+bool SnapshotAircraftOrdinaryReplaySector(
+        int sectorX, int sectorY, int* snapshotCountOut) {
+    if (!snapshotCountOut || !g.LoadBase || sectorX < 0 || sectorX >= 120 ||
+        sectorY < 0 || sectorY >= 120) {
+        return false;
+    }
+    *snapshotCountOut = 0;
+    auto* const normalBase = reinterpret_cast<std::uint8_t*>(
+        g.LoadBase + kRetailWorldSectorsOffset);
+    auto* const repeatBase = reinterpret_cast<std::uint8_t*>(
+        g.LoadBase + kRetailWorldRepeatSectorsOffset);
+    auto* const normal = normalBase + static_cast<std::size_t>(
+        sectorY * 120 + sectorX) * 0x10u;
+    const int repeatIndex = (sectorX & 15) | ((sectorY & 15) << 4);
+    auto* const repeat = repeatBase +
+        static_cast<std::size_t>(repeatIndex) * 0x18u;
+    const std::array<void*, 5> heads{
+        *reinterpret_cast<void**>(normal),
+        *reinterpret_cast<void**>(repeat + 0x10),
+        *reinterpret_cast<void**>(repeat),
+        *reinterpret_cast<void**>(repeat + 0x8),
+        *reinterpret_cast<void**>(normal + 0x8),
+    };
+
+    for (void* head : heads) {
+        void* node = head;
+        int listNodes = 0;
+        while (node) {
+            if (++listNodes > kAircraftOrdinaryRadialSectorSnapshotLimit) {
+                return false;
+            }
+            auto* const nodeBytes = static_cast<std::uint8_t*>(node);
+            void* const entity = *reinterpret_cast<void**>(nodeBytes);
+            void* const next = *reinterpret_cast<void**>(nodeBytes + 0x8);
+            if (next == node) return false;
+            if (entity) {
+                bool duplicate = false;
+                for (int i = 0; i < *snapshotCountOut; ++i) {
+                    if (g_aircraftOrdinarySectorStampSnapshots[
+                            static_cast<std::size_t>(i)].entity == entity) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    if (*snapshotCountOut >=
+                            kAircraftOrdinaryRadialSectorSnapshotLimit) {
+                        return false;
+                    }
+                    const auto* const entityBytes =
+                        static_cast<const std::uint8_t*>(entity);
+                    std::uint16_t scanCode = 0u;
+                    std::memcpy(&scanCode, entityBytes + 0x48,
+                                sizeof(scanCode));
+                    g_aircraftOrdinarySectorStampSnapshots[
+                        static_cast<std::size_t>((*snapshotCountOut)++)] = {
+                            entity, scanCode};
+                }
+            }
+            node = next;
+        }
+    }
+    return true;
+}
+
+bool ReplayAircraftOrdinarySector(int sectorX, int sectorY,
+                                  std::uint16_t currentScanCode) {
+    int snapshotCount = 0;
+    if (!SnapshotAircraftOrdinaryReplaySector(
+            sectorX, sectorY, &snapshotCount)) {
+        ++g_aircraftOrdinaryOuter.radialSectorOverflow;
+        return false;
+    }
+    auto* const currentScanCodeAddress = reinterpret_cast<std::uint16_t*>(
+        g.LoadBase + kRetailWorldCurrentScanCodeOffset);
+    if (*currentScanCodeAddress != currentScanCode) return false;
+    const std::uint16_t replayCode =
+        static_cast<std::uint16_t>(currentScanCode ^ 0x8000u);
+    const AircraftOrdinaryRenderListTotals totalsBefore =
+        ReadAircraftOrdinaryRenderListTotals();
+    if (!totalsBefore.valid) return false;
+
+    // Validate every pending target before touching any scan stamp. Observed
+    // result-2 targets must still carry this generation; truly unvisited
+    // targets must still carry an older one, and neither class may already be
+    // present in any render destination. Any other combination means an
+    // unobserved path owned the entity and the sector replay must abort.
+    int requestedTargets = 0;
+    for (int candidateIndex = 0;
+         candidateIndex < g_aircraftOrdinaryRadialCandidateCount;
+         ++candidateIndex) {
+        const AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[
+                static_cast<std::size_t>(candidateIndex)];
+        if (!candidate.replayRequested || candidate.replayVisited ||
+            candidate.sectorX != sectorX || candidate.sectorY != sectorY) {
+            continue;
+        }
+        const AircraftOrdinarySectorStampSnapshot* targetSnapshot = nullptr;
+        for (int snapshotIndex = 0; snapshotIndex < snapshotCount;
+             ++snapshotIndex) {
+            const AircraftOrdinarySectorStampSnapshot& snapshot =
+                g_aircraftOrdinarySectorStampSnapshots[
+                    static_cast<std::size_t>(snapshotIndex)];
+            if (snapshot.entity == candidate.entity) {
+                targetSnapshot = &snapshot;
+                break;
+            }
+        }
+        const bool sourceInvariant = targetSnapshot && candidate.rootless &&
+            candidate.replaySafe && !candidate.retained &&
+            (candidate.phaseObserved
+                 ? ((candidate.phaseResult == 2u ||
+                     (candidate.phaseResult == 0u &&
+                      candidate.phaseScreenTested)) &&
+                    targetSnapshot->scanCode == currentScanCode)
+                 : targetSnapshot->scanCode != currentScanCode) &&
+            InspectAircraftOrdinaryRetention(candidate.entity).Missing();
+        if (!sourceInvariant) return false;
+        ++requestedTargets;
+    }
+    if (requestedTargets <= 0) return false;
+    for (int snapshotIndex = 0; snapshotIndex < snapshotCount;
+         ++snapshotIndex) {
+        const AircraftOrdinarySectorStampSnapshot& snapshot =
+            g_aircraftOrdinarySectorStampSnapshots[
+                static_cast<std::size_t>(snapshotIndex)];
+        const AircraftOrdinaryRadialCandidate* const candidate =
+            FindAircraftOrdinaryRadialCandidate(snapshot.entity);
+        if (!candidate || !candidate->selected ||
+            !candidate->replayRequested || candidate->replayVisited) {
+            continue;
+        }
+        const bool sourceInvariant = candidate->rootless &&
+            candidate->replaySafe && !candidate->retained &&
+            (candidate->phaseObserved
+                 ? ((candidate->phaseResult == 2u ||
+                     (candidate->phaseResult == 0u &&
+                      candidate->phaseScreenTested)) &&
+                    snapshot.scanCode == currentScanCode)
+                 : snapshot.scanCode != currentScanCode);
+        if (!sourceInvariant) return false;
+    }
+
+    for (int i = 0; i < snapshotCount; ++i) {
+        const AircraftOrdinarySectorStampSnapshot& snapshot =
+            g_aircraftOrdinarySectorStampSnapshots[static_cast<std::size_t>(i)];
+        auto* const scanCode = reinterpret_cast<std::uint16_t*>(
+            static_cast<std::uint8_t*>(snapshot.entity) + 0x48);
+        AircraftOrdinaryRadialCandidate* const candidate =
+            FindAircraftOrdinaryRadialCandidate(snapshot.entity);
+        const bool selectedTarget = candidate && candidate->selected &&
+            candidate->replayRequested && !candidate->replayVisited &&
+            !candidate->retained && candidate->rootless &&
+            candidate->replaySafe;
+        *scanCode = selectedTarget ? replayCode : currentScanCode;
+    }
+
+    const int faultsBefore = g_aircraftOrdinaryOuter.faults;
+    g.CRenderer_ScanSectorList(sectorX, sectorY);
+    bool sectorOk = *currentScanCodeAddress == currentScanCode &&
+        g.CStreaming_ms_disableStreaming &&
+        *g.CStreaming_ms_disableStreaming;
+    int completedTargets = 0;
+    for (int i = 0; i < snapshotCount; ++i) {
+        const AircraftOrdinarySectorStampSnapshot& snapshot =
+            g_aircraftOrdinarySectorStampSnapshots[static_cast<std::size_t>(i)];
+        auto* const scanCode = reinterpret_cast<std::uint16_t*>(
+            static_cast<std::uint8_t*>(snapshot.entity) + 0x48);
+        AircraftOrdinaryRadialCandidate* const candidate =
+            FindAircraftOrdinaryRadialCandidate(snapshot.entity);
+        const bool selectedTarget = candidate && candidate->selected &&
+            candidate->replayRequested && !candidate->replayVisited &&
+            !candidate->retained && candidate->rootless &&
+            candidate->replaySafe;
+        if (selectedTarget) {
+            candidate->replayVisited = *scanCode == currentScanCode;
+            const AircraftOrdinaryRetentionSnapshot retention =
+                InspectAircraftOrdinaryRetention(candidate->entity);
+            const bool exact = retention.ExactRenderable();
+            const bool missing = retention.Missing();
+            const bool visibleResult = candidate->replayResult == 0u ||
+                candidate->replayResult == 1u;
+            candidate->replayCompleted = candidate->replayVisited &&
+                visibleResult && exact;
+            if (candidate->replayCompleted) ++completedTargets;
+            // Result 0 may be either direct-add success or a genuine miss.
+            // Result 1 without caller retention, or any non-visible result that
+            // nevertheless grew a list, is a structural contract violation.
+            if (!retention.valid || (!exact && !missing) ||
+                !candidate->replayVisited ||
+                (candidate->replayResult == 1u && !exact) ||
+                (!visibleResult && !missing)) {
+                sectorOk = false;
+            }
+            *scanCode = currentScanCode;
+        } else {
+            *scanCode = snapshot.scanCode;
+        }
+    }
+    const AircraftOrdinaryRenderListTotals totalsAfter =
+        ReadAircraftOrdinaryRenderListTotals();
+    if (!totalsAfter.valid) {
+        sectorOk = false;
+    } else {
+        const int deltaVisibleEntities =
+            totalsAfter.visibleEntities - totalsBefore.visibleEntities;
+        const int deltaVisibleLods =
+            totalsAfter.visibleLods - totalsBefore.visibleLods;
+        const int deltaVisibleSuperLods =
+            totalsAfter.visibleSuperLods - totalsBefore.visibleSuperLods;
+        const int deltaScratch =
+            totalsAfter.scratchEntries - totalsBefore.scratchEntries;
+        const int deltaAlphaEntities =
+            totalsAfter.alphaEntities - totalsBefore.alphaEntities;
+        const int deltaAlphaUnderwater =
+            totalsAfter.alphaUnderwater - totalsBefore.alphaUnderwater;
+        const bool nonNegative = deltaVisibleEntities >= 0 &&
+            deltaVisibleLods >= 0 && deltaVisibleSuperLods >= 0 &&
+            deltaScratch >= 0 && deltaAlphaEntities >= 0 &&
+            deltaAlphaUnderwater >= 0;
+        const int allowedGrowth = deltaVisibleEntities +
+            deltaAlphaEntities + deltaAlphaUnderwater;
+        sectorOk = sectorOk && nonNegative && deltaVisibleLods == 0 &&
+            deltaVisibleSuperLods == 0 && deltaScratch == 0 &&
+            allowedGrowth == completedTargets &&
+            allowedGrowth <= requestedTargets;
+    }
+    return sectorOk &&
+        g_aircraftOrdinaryOuter.faults == faultsBefore;
+}
+
+void SelectAndReplayAircraftOrdinaryRadialShell(
+        const AircraftCoarseLodProfile& profile) {
+    if (!profile.active || !g_aircraftOrdinaryRadialSelectionActive ||
+        g_aircraftOrdinaryRadialCaptureOverflow ||
+        !AircraftOrdinaryRadialSelectionSupported()) {
+        return;
+    }
+    const float outerRadius = AircraftOrdinaryOuterRadiusForAltitude(
+        profile.altitudeM);
+    g_aircraftOrdinaryRadialMaxGroundM = outerRadius;
+    g_aircraftOrdinaryOuter.radiusM = outerRadius;
+    const double wallStart = NowMs();
+    const double cpuStart = perf::ThreadCpuMs();
+    if (!EnumerateAircraftOrdinaryStaticDisk(outerRadius) ||
+        g_aircraftOrdinaryRadialCaptureOverflow) {
+        ++g_aircraftOrdinaryOuter.faults;
+        if (g_aircraftOrdinaryRadialCaptureOverflow)
+            g_aircraftOrdinaryOuterSessionDisabled = true;
+        return;
+    }
+    if (!SelectAircraftOrdinaryRadialCandidates()) {
+        g_aircraftOrdinaryOuter.cpuMs += std::max(
+            0.0, perf::ThreadCpuMs() - cpuStart);
+        g_aircraftOrdinaryOuter.wallMs += std::max(
+            0.0, NowMs() - wallStart);
+        return;
+    }
+
+    std::array<std::uint16_t,
+               kAircraftOrdinaryRadialReplaySectorLimit> replaySectors{};
+    int replaySectorCount = 0;
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+        const AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        if (!candidate.replayRequested || !candidate.sectorValid) continue;
+        const std::uint16_t key = static_cast<std::uint16_t>(
+            static_cast<unsigned int>(candidate.sectorY) * 120u +
+            static_cast<unsigned int>(candidate.sectorX));
+        bool duplicate = false;
+        for (int j = 0; j < replaySectorCount; ++j) {
+            if (replaySectors[static_cast<std::size_t>(j)] == key) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        if (replaySectorCount >= kAircraftOrdinaryRadialReplaySectorLimit) {
+            ++g_aircraftOrdinaryOuter.radialSectorOverflow;
+            ++g_aircraftOrdinaryOuter.faults;
+            g_aircraftOrdinaryOuterSessionDisabled = true;
+            return;
+        }
+        replaySectors[static_cast<std::size_t>(replaySectorCount++)] = key;
+    }
+    std::sort(replaySectors.begin(),
+              replaySectors.begin() + replaySectorCount);
+
+    auto* const currentScanCodeAddress = reinterpret_cast<std::uint16_t*>(
+        g.LoadBase + kRetailWorldCurrentScanCodeOffset);
+    const std::uint16_t currentScanCode = *currentScanCodeAddress;
+    if (currentScanCode == 0u) {
+        ++g_aircraftOrdinaryOuter.faults;
+        g_aircraftOrdinaryOuterSessionDisabled = true;
+        return;
+    }
+    const bool savedDisableStreaming = *g.CStreaming_ms_disableStreaming;
+    const int requestsBefore = std::max(
+        0, *g.CStreaming_ms_numModelsRequested);
+    const int previousPhase = g_visibilityScanPhase;
+    *g.CStreaming_ms_disableStreaming = true;
+    g_aircraftOrdinaryRadialAdmissionActive = true;
+    g_visibilityScanPhase = 6;
+    bool replaySafe = true;
+    for (int i = 0; i < replaySectorCount; ++i) {
+        const int key = replaySectors[static_cast<std::size_t>(i)];
+        const int sectorX = key % 120;
+        const int sectorY = key / 120;
+        if (!ReplayAircraftOrdinarySector(
+                sectorX, sectorY, currentScanCode)) {
+            replaySafe = false;
+            break;
+        }
+        ++g_aircraftOrdinaryOuter.radialReplaySectors;
+    }
+    g_visibilityScanPhase = previousPhase;
+    g_aircraftOrdinaryRadialAdmissionActive = false;
+    *g.CStreaming_ms_disableStreaming = savedDisableStreaming;
+
+    bool incompleteReplay = false;
+    bool replayStreamResult = false;
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+        const AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        if (!candidate.replayRequested) continue;
+        if (candidate.replayVisited)
+            ++g_aircraftOrdinaryOuter.radialReplayVisited;
+        if (candidate.replayCompleted)
+            ++g_aircraftOrdinaryOuter.radialReplayCompleted;
+        else {
+            ++g_aircraftOrdinaryOuter.radialReplayMisses;
+            incompleteReplay = true;
+        }
+        if (candidate.replayCompleted)
+            ++g_aircraftOrdinaryOuter.radialReplayVisible;
+        else if (candidate.replayResult == 2u)
+            ++g_aircraftOrdinaryOuter.radialReplayCulled;
+        else if (candidate.replayResult == 3u) {
+            ++g_aircraftOrdinaryOuter.radialReplayStream;
+            replayStreamResult = true;
+        } else
+            ++g_aircraftOrdinaryOuter.radialReplayOther;
+        if (candidate.replayCompleted && candidate.phaseObserved &&
+            candidate.phaseResult == 0u && candidate.phaseScreenTested) {
+            ++g_aircraftOrdinaryOuter.radialCompletedResultZeroMisses;
+        }
+    }
+    const int requestsAfter = std::max(
+        0, *g.CStreaming_ms_numModelsRequested);
+    const bool structuralReplayFault = !replaySafe ||
+        *currentScanCodeAddress != currentScanCode ||
+        requestsAfter != requestsBefore ||
+        g_aircraftOrdinaryHorizonContextEntity != nullptr ||
+        g_aircraftOrdinaryHorizonForcedOcclusionEntity != nullptr ||
+        g_aircraftOrdinaryRadialScreenProbeEntity != nullptr ||
+        g_aircraftOrdinaryRadialScreenProbeObserved ||
+        g_aircraftOrdinaryRadialScreenProbeVisible ||
+        g_aircraftOrdinaryHorizonContextOuterBand ||
+        g_aircraftOrdinaryHorizonContextOuterFarBand ||
+        g_aircraftOrdinaryHorizonRangePromoted ||
+        g_aircraftOrdinaryHorizonRangePromotionAccepted;
+    if (structuralReplayFault || incompleteReplay) {
+        ++g_aircraftOrdinaryOuter.faults;
+    }
+    if (structuralReplayFault || replayStreamResult)
+        g_aircraftOrdinaryOuterSessionDisabled = true;
+    g_aircraftOrdinaryOuter.cpuMs += std::max(
+        0.0, perf::ThreadCpuMs() - cpuStart);
+    g_aircraftOrdinaryOuter.wallMs += std::max(
+        0.0, NowMs() - wallStart);
+}
+
 void ScanAircraftOrdinaryOuterAnnulus(
         const AircraftCoarseLodProfile& profile) {
     const float outerRadius = AircraftOrdinaryOuterRadiusForAltitude(
@@ -14729,6 +16337,63 @@ void OnRenderScene(bool underwater) {
         .aircraftOrdinaryOuterFarAdmissionStops =
             g_aircraftOrdinaryHorizonFrameActive
                 ? g_aircraftOrdinaryOuter.farAdmissionStops : 0,
+        .aircraftOrdinaryOuterSessionDisabled =
+            g_aircraftOrdinaryHorizonFrameActive &&
+            g_aircraftOrdinaryOuterSessionDisabled,
+        .aircraftOrdinaryOuterRadialCandidates =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialCandidates : 0,
+        .aircraftOrdinaryOuterRadialInnerCandidates =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialInnerCandidates : 0,
+        .aircraftOrdinaryOuterRadialOuterCandidates =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialOuterCandidates : 0,
+        .aircraftOrdinaryOuterRadialSelectedInner =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialSelectedInner : 0,
+        .aircraftOrdinaryOuterRadialSelectedOuter =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialSelectedOuter : 0,
+        .aircraftOrdinaryOuterRadialRetainedInner =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialRetainedInner : 0,
+        .aircraftOrdinaryOuterRadialRetainedOuter =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialRetainedOuter : 0,
+        .aircraftOrdinaryOuterRadialReplayRequested =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplayRequested : 0,
+        .aircraftOrdinaryOuterRadialReplayVisited =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplayVisited : 0,
+        .aircraftOrdinaryOuterRadialReplayCompleted =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplayCompleted : 0,
+        .aircraftOrdinaryOuterRadialReplayMisses =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplayMisses : 0,
+        .aircraftOrdinaryOuterRadialReplaySectors =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplaySectors : 0,
+        .aircraftOrdinaryOuterRadialReplayVisible =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplayVisible : 0,
+        .aircraftOrdinaryOuterRadialReplayCulled =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplayCulled : 0,
+        .aircraftOrdinaryOuterRadialReplayStream =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplayStream : 0,
+        .aircraftOrdinaryOuterRadialReplayOther =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialReplayOther : 0,
+        .aircraftOrdinaryOuterRadialCaptureOverflow =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialCaptureOverflow : 0,
+        .aircraftOrdinaryOuterRadialSectorOverflow =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.radialSectorOverflow : 0,
         .cullAttributionFaults =
             cullCountersConsistent && targetedOcclusionCountersConsistent &&
                     !cullForeignThreadSeen
@@ -14935,6 +16600,11 @@ bool OnGetIsOnScreen(void* entity) {
         g_staticVisibilityContext.store(active, std::memory_order_release);
         const bool result = g_origGetIsOnScreen(entity);
         g_staticVisibilityContext.store(saved, std::memory_order_release);
+        if (aircraftOrdinaryHorizonContext &&
+            g_aircraftOrdinaryRadialScreenProbeEntity == entity) {
+            g_aircraftOrdinaryRadialScreenProbeObserved = true;
+            g_aircraftOrdinaryRadialScreenProbeVisible = result;
+        }
         if (modelId == 718 && VisibilityWitnessEnabled()) {
             static thread_local double lastPalmScreenMs = 0.0;
             const double nowMs = perf::MonotonicMs();
@@ -15267,22 +16937,41 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
             g_aircraftOrdinaryHorizonContextEntity != nullptr;
         if (aircraftOrdinaryHorizonCall) {
             const bool aircraftOrdinaryOuterCall =
-                g_aircraftOrdinaryOuterScanActive &&
-                g_visibilityScanPhase == 4;
+                (g_aircraftOrdinaryOuterScanActive &&
+                 g_visibilityScanPhase == 4) ||
+                (g_aircraftOrdinaryRadialAdmissionActive &&
+                 g_visibilityScanPhase == 6 &&
+                 g_aircraftOrdinaryHorizonContextOuterBand);
+            const bool deterministicRadialReplay =
+                g_aircraftOrdinaryRadialAdmissionActive &&
+                g_visibilityScanPhase == 6;
             ++g_aircraftOrdinaryHorizon.sphereTests;
             const bool stockVisible =
                 g_origIsSphereVisible(cam, origin, radius);
             if (stockVisible)
                 ++g_aircraftOrdinaryHorizon.stockVisible;
-            // A stock-range entity remains completely stock-authoritative. A
-            // range-promoted transaction, however, reached this call only
-            // because of our scoped SetupMap threshold, so it must share the
-            // same geometric filters and current bounded frame budget as a
-            // frustum rescue.
+            // Stock phases only collect the exact candidate/result witnesses.
+            // The stable radial selector below decides one bounded union after
+            // the complete static-sector enumeration, so head pitch cannot let
+            // first-come phase-1 entities consume its slots.
+            if (g_aircraftOrdinaryRadialSelectionActive &&
+                !g_aircraftOrdinaryRadialAdmissionActive &&
+                (g_visibilityScanPhase == 1 ||
+                 g_visibilityScanPhase == 2)) {
+                return stockVisible;
+            }
+            // Outside deterministic phase 6, a stock-range entity remains
+            // completely stock-authoritative. A range-promoted transaction,
+            // however, reached this call only because of our scoped SetupMap
+            // threshold, so it must share the same geometric filters and
+            // current bounded frame budget as a frustum rescue. Selected phase
+            // 6 entries deliberately take that same bounded path below even
+            // when the stock sphere happened to pass.
             const bool rangePromoted =
                 g_aircraftOrdinaryHorizonRangePromoted;
             if (stockVisible && !rangePromoted &&
-                !aircraftOrdinaryOuterCall) {
+                !aircraftOrdinaryOuterCall &&
+                !deterministicRadialReplay) {
                 return true;
             }
 
@@ -15332,7 +17021,8 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
                 ++g_aircraftOrdinaryHorizon.slantRangeRejects;
                 return false;
             }
-            if (!AircraftHorizontalConeAllows(dx, dy, extent)) {
+            if (!g_aircraftOrdinaryRadialAdmissionActive &&
+                !AircraftHorizontalConeAllows(dx, dy, extent)) {
                 ++g_aircraftOrdinaryHorizon.coneRejects;
                 return false;
             }
@@ -15412,9 +17102,16 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
                 ++g_aircraftOrdinaryHorizon.forcedStockPhase;
             else if (g_visibilityScanPhase == 2)
                 ++g_aircraftOrdinaryHorizon.forcedNearbyPhase;
-            // Stock frustum visibility keeps stock occlusion. Only an actual
-            // frustum rescue receives the exact consume-once occlusion bypass.
-            if (!stockVisible) {
+            // Stock phases keep stock occlusion.  The deterministic phase-6
+            // shell, however, must not let the stock-frustum result choose two
+            // different occlusion policies for the same selected cell.  That
+            // made a ground object keep stock occlusion at level/down gaze but
+            // receive the bypass when an up gaze first rejected its sphere,
+            // recreating the exact pitch-dependent middle holes the replay is
+            // meant to remove.  Phase 6 contains only the already-selected,
+            // quota/capacity-checked target, so give it the same consume-once
+            // witness regardless of stockVisible without widening any budget.
+            if (!stockVisible || deterministicRadialReplay) {
                 g_aircraftOrdinaryHorizonForcedOcclusionEntity =
                     g_aircraftOrdinaryHorizonContextEntity;
             }
@@ -15579,11 +17276,14 @@ void OnScanWorld() {
     // through the supplemental sectors, then restore the gameplay camera value.
     bool hmdHeadingScoped = false;
     float savedHeading = 0.0f;
-    if (g_staticCullCone.valid && g.CRenderer_ms_fCameraHeading && g.LoadBase &&
+    float scanForwardX = 0.0f;
+    float scanForwardY = 0.0f;
+    if (ReadAircraftHorizontalForward(&scanForwardX, &scanForwardY) &&
+        g.CRenderer_ms_fCameraHeading && g.LoadBase &&
         reinterpret_cast<std::uintptr_t>(g.CRenderer_ms_fCameraHeading) -
                 g.LoadBase == 0xa0d6ccu) {
         const float hmdHeading = std::atan2(
-            -g_staticCullCone.forward.x, g_staticCullCone.forward.y);
+            -scanForwardX, scanForwardY);
         savedHeading = *g.CRenderer_ms_fCameraHeading;
         if (std::isfinite(hmdHeading) && std::isfinite(savedHeading)) {
             *g.CRenderer_ms_fCameraHeading = hmdHeading;
@@ -15647,8 +17347,18 @@ void OnScanWorld() {
     // Fail closed at every new main render-list transaction even if a previous
     // frame returned through an unexpected retail path.
     g_aircraftOrdinaryHorizonScanActive = false;
+    g_aircraftOrdinaryRadialSelectionActive = false;
+    g_aircraftOrdinaryRadialAdmissionActive = false;
+    g_aircraftOrdinaryRadialCandidateCount = 0;
+    g_aircraftOrdinaryRadialCandidateHashKeys.fill(nullptr);
+    g_aircraftOrdinaryRadialCaptureOverflow = false;
+    g_aircraftOrdinaryRadialMaxGroundM =
+        kAircraftOrdinaryHorizonMaxGroundDistanceM;
     g_aircraftOrdinaryHorizonContextEntity = nullptr;
     g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
+    g_aircraftOrdinaryRadialScreenProbeEntity = nullptr;
+    g_aircraftOrdinaryRadialScreenProbeObserved = false;
+    g_aircraftOrdinaryRadialScreenProbeVisible = false;
     g_aircraftOrdinaryHorizonContextOuterBand = false;
     g_aircraftOrdinaryHorizonContextOuterFarBand = false;
     g_aircraftOrdinaryHorizonRangePromoted = false;
@@ -15707,6 +17417,9 @@ void OnScanWorld() {
         g_aircraftOrdinaryHorizon = {};
         g_aircraftOrdinaryHorizonContextEntity = nullptr;
         g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
+        g_aircraftOrdinaryRadialScreenProbeEntity = nullptr;
+        g_aircraftOrdinaryRadialScreenProbeObserved = false;
+        g_aircraftOrdinaryRadialScreenProbeVisible = false;
         g_aircraftOrdinaryHorizonContextOuterBand = false;
         g_aircraftOrdinaryHorizonContextOuterFarBand = false;
         g_aircraftOrdinaryHorizonRangePromoted = false;
@@ -15716,6 +17429,9 @@ void OnScanWorld() {
             AircraftOrdinaryOuterRadiusForAltitude(aircraftScanLod.altitudeM);
         const AircraftOrdinaryPriorityLimits priorityLimits =
             AircraftOrdinaryPriorityForRadius(outerPriorityRadius);
+        g_aircraftOrdinaryRadialMaxGroundM = outerPriorityRadius;
+        g_aircraftOrdinaryRadialSelectionActive =
+            AircraftOrdinaryRadialSelectionSupported();
         const bool outerPriorityRequested = std::isfinite(outerPriorityRadius) &&
             outerPriorityRadius >
                 kAircraftOrdinaryHorizonMaxGroundDistanceM + 0.01f;
@@ -15794,10 +17510,11 @@ void OnScanWorld() {
         g_aircraftStandaloneHorizonEntity = nullptr;
         g_aircraftStandaloneHorizonVisibilityDepth = 0;
     }
-    // Retail phase 1 stamps entities before SetupMap decides visibility. Give
-    // the audited outer band its reserved share immediately after the authored
-    // root disk, before the 300 m supplemental phase can consume the residue.
-    ScanAircraftOrdinaryOuterAnnulus(aircraftScanLod);
+    // The deterministic selector replays its exact rootless misses only after
+    // stock and nearby observations are complete. Keep the older sector-first
+    // pass solely as the fail-closed fallback for an unsupported retail binary.
+    if (!g_aircraftOrdinaryRadialSelectionActive)
+        ScanAircraftOrdinaryOuterAnnulus(aircraftScanLod);
     g_visibilityScanPhase = 2;
 
     bool aircraftRootUnionFinalized = false;
@@ -15958,6 +17675,13 @@ void OnScanWorld() {
                  "quota_stop=pi/po/ai/ao=%d/%d/%d/%d "
                  "ring=prom_n/f=%d/%d admit_n/f=%d/%d "
                  "stop_pn/pf/an/af=%d/%d/%d/%d "
+                 "radial=cand/i/o=%d/%d/%d "
+                 "elig=pri/fb/sel=%d/%d/%d sel_fb=%d sel=i/o=%d/%d "
+                 "zero=scr/occ/sel/done=%d/%d/%d/%d "
+                 "keep=i/o=%d/%d "
+                 "replay=req/visit/done/miss/sec=%d/%d/%d/%d/%d "
+                 "out=v/c/s/o=%d/%d/%d/%d "
+                 "overflow=c/s=%d/%d "
                  "time=wall/cpu=%.3f/%.3fms",
                  g_aircraftOrdinaryOuter.active ? 1 : 0,
                  static_cast<double>(g_aircraftOrdinaryOuter.radiusM),
@@ -16003,14 +17727,49 @@ void OnScanWorld() {
                  g_aircraftOrdinaryOuter.farPromotionStops,
                  g_aircraftOrdinaryOuter.nearAdmissionStops,
                  g_aircraftOrdinaryOuter.farAdmissionStops,
+                 g_aircraftOrdinaryOuter.radialCandidates,
+                 g_aircraftOrdinaryOuter.radialInnerCandidates,
+                 g_aircraftOrdinaryOuter.radialOuterCandidates,
+                 g_aircraftOrdinaryOuter.radialInnerPrimaryCandidates,
+                 g_aircraftOrdinaryOuter.radialInnerFallbackCandidates,
+                 g_aircraftOrdinaryOuter.radialInnerSelectableCandidates,
+                 g_aircraftOrdinaryOuter.radialSelectedFallbackInner,
+                 g_aircraftOrdinaryOuter.radialSelectedInner,
+                 g_aircraftOrdinaryOuter.radialSelectedOuter,
+                 g_aircraftOrdinaryOuter.radialScreenRejectZeroCandidates,
+                 g_aircraftOrdinaryOuter.radialOcclusionRejectZeroCandidates,
+                 g_aircraftOrdinaryOuter.radialSelectedResultZeroMisses,
+                 g_aircraftOrdinaryOuter.radialCompletedResultZeroMisses,
+                 g_aircraftOrdinaryOuter.radialRetainedInner,
+                 g_aircraftOrdinaryOuter.radialRetainedOuter,
+                 g_aircraftOrdinaryOuter.radialReplayRequested,
+                 g_aircraftOrdinaryOuter.radialReplayVisited,
+                 g_aircraftOrdinaryOuter.radialReplayCompleted,
+                 g_aircraftOrdinaryOuter.radialReplayMisses,
+                 g_aircraftOrdinaryOuter.radialReplaySectors,
+                 g_aircraftOrdinaryOuter.radialReplayVisible,
+                 g_aircraftOrdinaryOuter.radialReplayCulled,
+                 g_aircraftOrdinaryOuter.radialReplayStream,
+                 g_aircraftOrdinaryOuter.radialReplayOther,
+                 g_aircraftOrdinaryOuter.radialCaptureOverflow,
+                 g_aircraftOrdinaryOuter.radialSectorOverflow,
                  g_aircraftOrdinaryOuter.wallMs,
                  g_aircraftOrdinaryOuter.cpuMs);
         }
         g_aircraftOrdinaryHorizonContextEntity = nullptr;
         g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
+        g_aircraftOrdinaryRadialScreenProbeEntity = nullptr;
+        g_aircraftOrdinaryRadialScreenProbeObserved = false;
+        g_aircraftOrdinaryRadialScreenProbeVisible = false;
         g_aircraftOrdinaryHorizonContextOuterBand = false;
         g_aircraftOrdinaryHorizonContextOuterFarBand = false;
         g_aircraftOrdinaryHorizonScanActive = false;
+        g_aircraftOrdinaryRadialSelectionActive = false;
+        g_aircraftOrdinaryRadialAdmissionActive = false;
+        g_aircraftOrdinaryRadialCandidateCount = 0;
+        g_aircraftOrdinaryRadialCaptureOverflow = false;
+        g_aircraftOrdinaryRadialMaxGroundM =
+            kAircraftOrdinaryHorizonMaxGroundDistanceM;
         g_aircraftOrdinaryHorizonRangePromoted = false;
         g_aircraftOrdinaryHorizonMaxSlantM = 0.0f;
         g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
@@ -16112,6 +17871,7 @@ void OnScanWorld() {
         !g_stereoActive.load(std::memory_order_relaxed) ||
         !g.CRenderer_ScanSectorList || !g.CRenderer_ms_vecCameraPosition ||
         (g.CCutsceneMgr_ms_running && *g.CCutsceneMgr_ms_running)) {
+        SelectAndReplayAircraftOrdinaryRadialShell(aircraftScanLod);
         RequestAircraftOrdinaryPrefetchCandidates();
         finalizeAircraftRootUnion();
         finishAircraftOrdinaryHorizon();
@@ -16124,6 +17884,7 @@ void OnScanWorld() {
     const float cameraX = g.CRenderer_ms_vecCameraPosition[0];
     const float cameraY = g.CRenderer_ms_vecCameraPosition[1];
     if (!std::isfinite(cameraX) || !std::isfinite(cameraY)) {
+        SelectAndReplayAircraftOrdinaryRadialShell(aircraftScanLod);
         RequestAircraftOrdinaryPrefetchCandidates();
         finalizeAircraftRootUnion();
         finishAircraftOrdinaryHorizon();
@@ -16208,9 +17969,10 @@ void OnScanWorld() {
         }
     }
 
-    // Phase 2 deliberately keeps the proven retail 300 m footprint and runs
-    // after phase 4, so it may backfill any unused part of the bounded
-    // 96..128-entry altitude budget.
+    // Phase 2 deliberately keeps the proven retail 300 m footprint. Once all
+    // stock outcomes are known, fill the same bounded 96..128-entry allowance
+    // from a pitch-independent static-sector shell.
+    SelectAndReplayAircraftOrdinaryRadialShell(aircraftScanLod);
     RequestAircraftOrdinaryPrefetchCandidates();
     finalizeAircraftRootUnion();
     finishAircraftOrdinaryHorizon();

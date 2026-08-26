@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <cstring>
 
 namespace savr::vrfire {
@@ -154,7 +155,9 @@ Vec3 Normalize(Vec3 v) {
 bool GetPhysicalRay(void* shooter, int weaponType, Vec3& origin, Vec3& direction,
                     bool* suppressShot = nullptr) {
     if (suppressShot) *suppressShot = false;
-    if (!shooter || !SupportedHitscan(weaponType) || !g.FindPlayerPed ||
+    // Every direct-fire family aims with the tracked hand: hitscan guns,
+    // the AREA sprayers (flamethrower/spraycan/extinguisher) and the camera.
+    if (!shooter || !SupportedDirectFire(weaponType) || !g.FindPlayerPed ||
         shooter != g.FindPlayerPed(-1)) {
         return false;
     }
@@ -729,16 +732,40 @@ void Update(bool blocked) {
     if (weaponType == 43 && !scopeaim::IsActiveFor(hand, weaponType)) return;
 
     const std::uint32_t now = *g.CTimer_m_snTimeInMilliseconds;
-    if (!freshPress && now < g_directNextFireMs[hand]) return;
+    // Sprayers are CONTINUOUS: retail's use-gun task calls CWeapon::Fire
+    // every frame while the trigger is held, and the paint/tag progress
+    // accumulates per call — a per-shot cadence would stutter the jet.
+    if (!AreaEffectWeapon(weaponType) &&
+        !freshPress && now < g_directNextFireMs[hand]) return;
 
     // READY/FIRING are the only states accepted by CWeapon::Fire. Reloading and
     // out-of-ammo still advance through the native CWeapon::Update lifecycle.
     const std::uint32_t state = *reinterpret_cast<const std::uint32_t*>(weapon + 0x04);
-    if (state > 1u) return;
+    if (state > 1u) {
+        static double lastStateLog = 0.0;
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const double nowState = ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (nowState - lastStateLog > 2.0) {
+            lastStateLog = nowState;
+            LOGI("[vr.fire] held weapon not ready type=%d state=%u", weaponType, state);
+        }
+        return;
+    }
 
     Vec3 origin{};
     Vec3 direction{};
-    if (!GetPhysicalRay(ped, weaponType, origin, direction)) return;
+    if (!GetPhysicalRay(ped, weaponType, origin, direction)) {
+        static double lastRayLog = 0.0;
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const double nowRay = ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (nowRay - lastRayLog > 2.0) {
+            lastRayLog = nowRay;
+            LOGI("[vr.fire] physical ray unavailable type=%d hand=%d", weaponType, hand);
+        }
+        return;
+    }
 
     // The mobile country-rifle owner rejects a null target before reaching its
     // instant-hit path. Supply a physical-ray target for that weapon; the
@@ -777,7 +804,21 @@ void Update(bool blocked) {
     const bool fired = g.CWeapon_Fire(
         weapon, ped, &origin, &origin, nullptr, target, nullptr);
     if (cameraMode) *cameraMode = savedCameraMode;
-    if (!fired) return;
+    if (!fired) {
+        static double lastFireFail = 0.0;
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const double nowFail = ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (nowFail - lastFireFail > 2.0) {
+            lastFireFail = nowFail;
+            LOGI("[vr.fire] CWeapon::Fire refused type=%d state=%u ammoClip=%u ammo=%u",
+                 weaponType,
+                 *reinterpret_cast<const std::uint32_t*>(weapon + 0x04),
+                 *reinterpret_cast<const std::uint32_t*>(weapon + 0x08),
+                 *reinterpret_cast<const std::uint32_t*>(weapon + 0x0c));
+        }
+        return;
+    }
 
     g_directNextFireMs[hand] = now + PhysicalFireIntervalMs(ped, weaponType);
     static std::atomic<unsigned> directCount{0};

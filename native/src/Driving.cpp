@@ -913,8 +913,7 @@ bool GetActivePlayerCar(void** vehicleOut=nullptr,void** pedOut=nullptr) {
     if ((appearance!=kAutomobileAppearance&&appearance!=kBoatAppearance&&
          appearance!=kPlaneAppearance)||
         !isDriver||train) {
-        // Some mission vehicles unexpectedly fail these gates in the field
-        // (reported: the San News van shows no virtual wheel). Name the gate
+        // Some mission vehicles unexpectedly fail these gates. Name the gate
         // once per model so a device log capture pins the exact cause.
         static int loggedRejectModel=-1;
         if (appearance!=2&&loggedRejectModel!=modelId) {
@@ -1172,8 +1171,8 @@ bool BuildWheelTracking(WheelVisualState* visual) {
             // real seat change re-enters through the vehicle-switch reset.
             // Once armed, the wheel anchors on the CACHED seat point rigidly
             // attached to the vehicle frame, not the live ped/head sample:
-            // the steering/lean animation moved the head bone and the whole
-            // wheel slid side to side with it (reported on the Monster).
+            // the steering/lean animation moves the head bone and the whole
+            // wheel would slide side to side with it.
             pp=vp+vr*g_wheelSeatLocal.x+vf*g_wheelSeatLocal.y+
                 vu*g_wheelSeatLocal.z;
         }
@@ -1537,16 +1536,6 @@ void BikePreRenderCommon(void* bike, BikePreRenderFn origPreRender) {
         if (IsBicycleModel(model)&&std::abs(angle)<1.0e-4f&&
             g_bicycleMode.load(std::memory_order_acquire)==BICYCLE_MOTION)
             angle=-std::clamp(g_bicycleSteering,-1.0f,1.0f)*0.55f;
-        if (IsBicycleModel(model)) {
-            static double lastBarLog=0.0;
-            const double nowBar=MonotonicSeconds();
-            if (nowBar-lastBarLog>2.0) {
-                lastBarLog=nowBar;
-                LOGI("[driving] bmx bar angle=%.3f solver=%.3f mode=%d",
-                     angle,g_visual.physicalAngle,
-                     g_bicycleMode.load(std::memory_order_acquire));
-            }
-        }
     }
     if (!std::isfinite(angle)||std::abs(angle)<1.0e-5f) return;
     constexpr std::size_t kBikeNodesOffset=0x758;
@@ -1559,9 +1548,8 @@ void BikePreRenderCommon(void* bike, BikePreRenderFn origPreRender) {
     void* frame=*reinterpret_cast<void**>(
         reinterpret_cast<char*>(bike)+kBikeNodesOffset+
         handlebarNode*sizeof(void*));
-    // Field diagnostics: name the model once so a log capture shows whether
-    // the rotation path runs and whether the handlebar node exists on the
-    // models reported as static (starter motorcycle).
+    // Diagnostics: name the model once so a log capture shows whether the
+    // rotation path runs and whether the handlebar node exists.
     {
         static int loggedRotateModel=-1;
         if (loggedRotateModel!=model) {
@@ -1573,18 +1561,6 @@ void BikePreRenderCommon(void* bike, BikePreRenderFn origPreRender) {
     if (!frame) return;
     float* matrix=reinterpret_cast<float*>(
         reinterpret_cast<char*>(frame)+0x20); // RwFrame local matrix
-    // Decisive probe: does our rotation persist into the next PreRender, and
-    // does anything rewrite the local matrix between frames?
-    if (IsBicycleModel(model)) {
-        static double lastProbe=0.0;
-        const double nowProbe=MonotonicSeconds();
-        if (nowProbe-lastProbe>2.0) {
-            lastProbe=nowProbe;
-            LOGI("[driving] bar frame entry right=(%.3f,%.3f,%.3f) pos=(%.2f,%.2f,%.2f)",
-                 matrix[0],matrix[1],matrix[2],
-                 matrix[12],matrix[13],matrix[14]);
-        }
-    }
     V3 right{matrix[0],matrix[1],matrix[2]};
     V3 forward{matrix[4],matrix[5],matrix[6]};
     V3 up{matrix[8],matrix[9],matrix[10]};
@@ -1734,9 +1710,9 @@ int OnGetSteering(void* pad) {
         xr::InputState input{}; xr::GetInput(input);
         const int steer=static_cast<int>(
             std::clamp(input.leftStick[0],-1.0f,1.0f)*128.0f);
-        // Field diagnostic: helis feed this value into their roll channel
-        // (ProcessControlInputs stores -steer/128 at heli+0xbd4). Reported as
-        // "no roll" — this proves whether the value reaches the game.
+        // Helis feed this value into their roll channel (ProcessControlInputs
+        // stores -steer/128 at heli+0xbd4); log it so a capture shows whether
+        // the stick reaches the game.
         if (std::abs(steer)>12&&
             g_activeVehicleAppearance.load(std::memory_order_acquire)==3) {
             static unsigned int rollLog=0;

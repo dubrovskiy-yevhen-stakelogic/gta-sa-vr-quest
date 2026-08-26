@@ -62,7 +62,11 @@ std::atomic<int> gLastActiveSlot{-1};
 std::atomic<int> gLastActiveType{0};
 
 bool ValidPoint(int point) { return point >= 0 && point < POINT_COUNT; }
-bool SelectableSlot(int slot) { return slot == kEmptySlot || (slot >= 1 && slot <= 7); }
+bool SelectableSlot(int slot) {
+    // 9 = the gadget slot (spray can, fire extinguisher, camera): mission
+    // items land there and must be reachable from a body point.
+    return slot == kEmptySlot || (slot >= 1 && slot <= 7) || slot == 9;
+}
 int WeaponTypeInSlot(void* ped, int slot);
 
 // gSettingsMutex must be held. When `slot` is already assigned, exchange the
@@ -273,6 +277,7 @@ const char* SlotName(int slot) {
         case 6:  return "SNIPER";
         case 7:  return "HEAVY";
         case 8:  return "THROWABLE";
+        case 9:  return "GADGET";
         default: return "UNKNOWN";
     }
 }
@@ -340,11 +345,12 @@ int CyclePointSlot(int point, int direction) {
     // There are seven configurable categories. Start after the current value
     // and stop after one full pass. This keeps EMPTY out of the cycle and also
     // avoids silently stealing/swapping a category assigned to another point.
-    const int start = current >= 1 && current <= 7
-        ? current
-        : (step > 0 ? 0 : 8);
-    for (int attempt = 1; attempt <= 7; ++attempt) {
-        const int selected = 1 + (start - 1 + step * attempt + 14) % 7;
+    static constexpr int kCycle[8] = {1, 2, 3, 4, 5, 6, 7, 9};
+    int startIndex = step > 0 ? -1 : 8;
+    for (int i = 0; i < 8; ++i)
+        if (kCycle[i] == current) { startIndex = i; break; }
+    for (int attempt = 1; attempt <= 8; ++attempt) {
+        const int selected = kCycle[(startIndex + step * attempt + 16) % 8];
         if (WeaponTypeInSlot(ped, selected) == 0) continue;
         if (FindPointForSlot(selected) >= 0) continue;
         SetPointSlot(point, selected);

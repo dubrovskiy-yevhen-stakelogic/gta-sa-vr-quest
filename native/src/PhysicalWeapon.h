@@ -76,6 +76,9 @@ void EnforceBikeWeaponLimit();
 // ~0.7s of continuous airtime, the parachute auto-selects so the right
 // trigger can open it — no manual equipping. Call from the input pump.
 void AutoEquipParachute();
+// Give mission gadgets (slot 9: spray/camera/extinguisher) a body point when
+// none is configured, so scripted hand-outs are physically reachable.
+void AutoAssignGadgetPoint();
 
 // Put an inventory slot directly into a tracked hand (cheat/give flows). The
 // weapon must exist in the ped inventory; no holster point is required. With

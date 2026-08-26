@@ -49,7 +49,7 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.9.79";
+constexpr char kModVersion[] = "0.9.85";
 
 JavaVM*   g_hudTextVm{};
 jobject   g_hudTextApplication{};
