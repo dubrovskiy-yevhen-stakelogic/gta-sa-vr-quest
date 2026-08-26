@@ -622,6 +622,19 @@ struct GameWindow {
     Series aircraftOrdinaryOuterPhase1InnerAdmissionStops;
     Series aircraftOrdinaryOuterPhase1OuterAdmissionStops;
     Series aircraftOrdinaryPhase2BackfillAdmissions;
+    Series aircraftOrdinaryInnerLimit;
+    Series aircraftOrdinaryOuterLimit;
+    Series aircraftOrdinaryOuterNearLimit;
+    Series aircraftOrdinaryOuterFarLimit;
+    Series aircraftOrdinaryTotalLimit;
+    Series aircraftOrdinaryOuterNearPromotions;
+    Series aircraftOrdinaryOuterFarPromotions;
+    Series aircraftOrdinaryOuterNearAdmissions;
+    Series aircraftOrdinaryOuterFarAdmissions;
+    Series aircraftOrdinaryOuterNearPromotionStops;
+    Series aircraftOrdinaryOuterFarPromotionStops;
+    Series aircraftOrdinaryOuterNearAdmissionStops;
+    Series aircraftOrdinaryOuterFarAdmissionStops;
     int cullAttributionFaults{};
     Series buildingDetailTests;
     Series buildingDetailOverrides;
@@ -816,7 +829,20 @@ FILE* OpenGameCsv() {
         "aircraft_ordinary_outer_phase1_outer_promotion_stops_avg,"
         "aircraft_ordinary_outer_phase1_inner_admission_stops_avg,"
         "aircraft_ordinary_outer_phase1_outer_admission_stops_avg,"
-        "aircraft_ordinary_phase2_backfill_admissions_avg\n");
+        "aircraft_ordinary_phase2_backfill_admissions_avg,"
+        "aircraft_ordinary_inner_limit_avg,"
+        "aircraft_ordinary_outer_limit_avg,"
+        "aircraft_ordinary_outer_near_limit_avg,"
+        "aircraft_ordinary_outer_far_limit_avg,"
+        "aircraft_ordinary_total_limit_avg,"
+        "aircraft_ordinary_outer_near_promotions_avg,"
+        "aircraft_ordinary_outer_far_promotions_avg,"
+        "aircraft_ordinary_outer_near_admissions_avg,"
+        "aircraft_ordinary_outer_far_admissions_avg,"
+        "aircraft_ordinary_outer_near_promotion_stops_avg,"
+        "aircraft_ordinary_outer_far_promotion_stops_avg,"
+        "aircraft_ordinary_outer_near_admission_stops_avg,"
+        "aircraft_ordinary_outer_far_admission_stops_avg\n");
     LOGI("[perf.init] game summary CSV: %s", kGameCsvPath);
     return g_gameCsv;
 }
@@ -2017,7 +2043,9 @@ void EmitGameWindow(double endMs) {
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
             "%.2f,%.2f,%.2f,%.2f,"
-            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+            "%.2f,%.2f,%.2f,%.2f\n",
             w.aircraftLodActiveFrames > 0 ? 1 : 0,
             w.aircraftAltitudeM.Average(),
             w.aircraftOrdinaryMaxSlantM.Average(),
@@ -2068,7 +2096,20 @@ void EmitGameWindow(double endMs) {
             w.aircraftOrdinaryOuterPhase1OuterPromotionStops.Average(),
             w.aircraftOrdinaryOuterPhase1InnerAdmissionStops.Average(),
             w.aircraftOrdinaryOuterPhase1OuterAdmissionStops.Average(),
-            w.aircraftOrdinaryPhase2BackfillAdmissions.Average());
+            w.aircraftOrdinaryPhase2BackfillAdmissions.Average(),
+            w.aircraftOrdinaryInnerLimit.Average(),
+            w.aircraftOrdinaryOuterLimit.Average(),
+            w.aircraftOrdinaryOuterNearLimit.Average(),
+            w.aircraftOrdinaryOuterFarLimit.Average(),
+            w.aircraftOrdinaryTotalLimit.Average(),
+            w.aircraftOrdinaryOuterNearPromotions.Average(),
+            w.aircraftOrdinaryOuterFarPromotions.Average(),
+            w.aircraftOrdinaryOuterNearAdmissions.Average(),
+            w.aircraftOrdinaryOuterFarAdmissions.Average(),
+            w.aircraftOrdinaryOuterNearPromotionStops.Average(),
+            w.aircraftOrdinaryOuterFarPromotionStops.Average(),
+            w.aircraftOrdinaryOuterNearAdmissionStops.Average(),
+            w.aircraftOrdinaryOuterFarAdmissionStops.Average());
         static int rowsSinceFlush = 0;
         if (++rowsSinceFlush >= 5) {
             std::fflush(file);
@@ -3432,6 +3473,32 @@ void SubmitGameFrame(const GameFrameSample& sample) {
                 g_latestStereo.aircraftOrdinaryOuterPhase1OuterAdmissionStops);
             w.aircraftOrdinaryPhase2BackfillAdmissions.Add(
                 g_latestStereo.aircraftOrdinaryPhase2BackfillAdmissions);
+            w.aircraftOrdinaryInnerLimit.Add(
+                g_latestStereo.aircraftOrdinaryInnerLimit);
+            w.aircraftOrdinaryOuterLimit.Add(
+                g_latestStereo.aircraftOrdinaryOuterLimit);
+            w.aircraftOrdinaryOuterNearLimit.Add(
+                g_latestStereo.aircraftOrdinaryOuterNearLimit);
+            w.aircraftOrdinaryOuterFarLimit.Add(
+                g_latestStereo.aircraftOrdinaryOuterFarLimit);
+            w.aircraftOrdinaryTotalLimit.Add(
+                g_latestStereo.aircraftOrdinaryTotalLimit);
+            w.aircraftOrdinaryOuterNearPromotions.Add(
+                g_latestStereo.aircraftOrdinaryOuterNearPromotions);
+            w.aircraftOrdinaryOuterFarPromotions.Add(
+                g_latestStereo.aircraftOrdinaryOuterFarPromotions);
+            w.aircraftOrdinaryOuterNearAdmissions.Add(
+                g_latestStereo.aircraftOrdinaryOuterNearAdmissions);
+            w.aircraftOrdinaryOuterFarAdmissions.Add(
+                g_latestStereo.aircraftOrdinaryOuterFarAdmissions);
+            w.aircraftOrdinaryOuterNearPromotionStops.Add(
+                g_latestStereo.aircraftOrdinaryOuterNearPromotionStops);
+            w.aircraftOrdinaryOuterFarPromotionStops.Add(
+                g_latestStereo.aircraftOrdinaryOuterFarPromotionStops);
+            w.aircraftOrdinaryOuterNearAdmissionStops.Add(
+                g_latestStereo.aircraftOrdinaryOuterNearAdmissionStops);
+            w.aircraftOrdinaryOuterFarAdmissionStops.Add(
+                g_latestStereo.aircraftOrdinaryOuterFarAdmissionStops);
         }
         w.cullAttributionFaults +=
             std::max(0, g_latestStereo.cullAttributionFaults);

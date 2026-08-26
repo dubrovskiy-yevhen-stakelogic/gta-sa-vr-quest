@@ -28,6 +28,16 @@ from typing import Iterable
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BUILD = ROOT / "build"
+DEFAULT_SETTINGS_DIR = ROOT / "defaults" / "quest"
+DEFAULT_SETTING_NAMES = (
+    "vr_driving.ini",
+    "vr_appearance.ini",
+    "vr_calib.ini",
+    "vr_graphics.ini",
+    "vr_holsters.ini",
+    "vr_hud.ini",
+    "vr_locomotion.ini",
+)
 
 PACKAGE_NAME = "com.rockstargames.gtasa"
 VERSION_CODE = "4234641"
@@ -1175,6 +1185,15 @@ def assemble_apks(
     native_bytes = native_lib.read_bytes()
     loader_bytes = openxr_loader.read_bytes()
     dex_bytes = loader_dex.read_bytes()
+    default_settings: dict[str, tuple[bytes, int]] = {}
+    for name in DEFAULT_SETTING_NAMES:
+        source = DEFAULT_SETTINGS_DIR / name
+        if not source.is_file():
+            raise KitError(f"required shipping default setting is missing: {source}")
+        default_settings[f"assets/savr_defaults/{name}"] = (
+            source.read_bytes(),
+            zipfile.ZIP_DEFLATED,
+        )
 
     clean_directory(output, build)
     patches: dict[Path, tuple[set[str], set[str]]] = {}
@@ -1187,6 +1206,7 @@ def assemble_apks(
         if apk.path == package.base.path:
             replacements["AndroidManifest.xml"] = manifest
             additions[dex_name] = (dex_bytes, zipfile.ZIP_STORED)
+            additions.update(default_settings)
         if apk.path == package.arm64.path:
             additions["lib/arm64-v8a/libsavr.so"] = (native_bytes, zipfile.ZIP_DEFLATED)
             additions["lib/arm64-v8a/libopenxr_loader.so"] = (

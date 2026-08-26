@@ -259,27 +259,38 @@ constexpr int kAircraftStandaloneHorizonAttemptLimit = 256;
 // the map footprint, resident-only policy and admission budget remain bounded.
 constexpr float kAircraftOrdinaryHorizonMinSlantDistanceM = 100.0f;
 constexpr float kAircraftOrdinaryHorizonMaxGroundDistanceM = 300.0f;
+// Keep the complete pre-outer ordinary union available while the outer band
+// grows.  Runtime 0.9.78 showed that replacing 32 of these 96 slots at the
+// instant AGL crossed 200 m merely moved the blue cut from the far horizon into
+// the 100..300 m middle ring: at 200..249 m the inner quota rejected 62.18
+// candidates/window even though the new outer band still left slots unused.
 constexpr int kAircraftOrdinaryHorizonForcedLimit = 96;
 // Runtime 0.9.63 proved that the slant compensation and the bounded prefetch
 // were healthy, but neither can see an entity whose 50 m ordinary sector was
 // never visited.  Above 200 m AGL, add a final resident-only forward annulus.
-// It reaches 500 m by 300 m AGL, shares the existing 96-entry admission cap,
-// and runs with retail streaming disabled so it cannot turn into a bulk loader.
+// It reaches 500 m by 300 m AGL and grows a separate bounded allowance from
+// zero to 32 entries.  Thus climb can only add cheap resident silhouettes; it
+// never removes the already-proven 96-entry middle-distance layer.  Phase 4
+// still runs with retail streaming disabled so it cannot become a bulk loader.
 constexpr float kAircraftOrdinaryOuterStartAltitudeM = 200.0f;
 constexpr float kAircraftOrdinaryOuterFullAltitudeM = 300.0f;
 constexpr float kAircraftOrdinaryOuterMaxGroundDistanceM = 500.0f;
 constexpr int kAircraftOrdinaryOuterCandidateLimit = 160;
 constexpr int kAircraftOrdinaryOuterSectorLimit = 112;
-// Runtime 0.9.64 proved that the late outer pass was healthy but starved: at
-// >=300 m AGL the earlier ordinary pass consumed 95..96 of the shared 96
-// admissions before the annulus ran.  During retail phase 1 reserve one third
-// of that unchanged budget for the 300..500 m band.  Phase 4 spends any
-// residue next, then phase 2 is allowed to backfill every unused slot.  This
-// changes ownership/order, never the total forced-visible ceiling.
-constexpr int kAircraftOrdinaryPhase1InnerPriorityLimit = 64;
-constexpr int kAircraftOrdinaryPhase1OuterPriorityLimit =
-    kAircraftOrdinaryHorizonForcedLimit -
-    kAircraftOrdinaryPhase1InnerPriorityLimit;
+// Runtime 0.9.78 also showed that retail phase 1 owned about 92% of outer
+// admissions in arbitrary traversal order.  Keep independent near/far shares
+// so 300 m boundary objects cannot consume the entire 300..500 m allowance
+// before phase 4 reaches the real horizon.  Both shares ramp with the actual
+// radius; the values below are only their full-altitude maxima.
+constexpr int kAircraftOrdinaryOuterPriorityLimitMax = 32;
+constexpr int kAircraftOrdinaryOuterNearPriorityLimitMax = 24;
+constexpr int kAircraftOrdinaryOuterFarPriorityLimitMax =
+    kAircraftOrdinaryOuterPriorityLimitMax -
+    kAircraftOrdinaryOuterNearPriorityLimitMax;
+constexpr float kAircraftOrdinaryOuterFarBandStartM = 400.0f;
+constexpr int kAircraftOrdinaryHorizonForcedLimitMax =
+    kAircraftOrdinaryHorizonForcedLimit +
+    kAircraftOrdinaryOuterPriorityLimitMax;
 // Reaching the horizontal visibility union also requires passing SetupMap's
 // earlier min(draw*cameraLOD, far+bound) gate. Promote only substantial,
 // already-resident statics, and only for the current audited transaction. Tiny
@@ -336,11 +347,14 @@ static_assert(kAircraftStandaloneHorizonAttemptLimit <
               kAircraftLodVisibleAdmissionLimit);
 static_assert(kAircraftOrdinaryOuterSectorLimit <=
               kAircraftOrdinaryOuterCandidateLimit);
-static_assert(kAircraftOrdinaryPhase1InnerPriorityLimit > 0);
-static_assert(kAircraftOrdinaryPhase1OuterPriorityLimit > 0);
-static_assert(kAircraftOrdinaryPhase1InnerPriorityLimit +
-                  kAircraftOrdinaryPhase1OuterPriorityLimit ==
-              kAircraftOrdinaryHorizonForcedLimit);
+static_assert(kAircraftOrdinaryOuterNearPriorityLimitMax > 0);
+static_assert(kAircraftOrdinaryOuterFarPriorityLimitMax > 0);
+static_assert(kAircraftOrdinaryOuterNearPriorityLimitMax +
+                  kAircraftOrdinaryOuterFarPriorityLimitMax ==
+              kAircraftOrdinaryOuterPriorityLimitMax);
+static_assert(kAircraftOrdinaryHorizonForcedLimitMax == 128);
+static_assert(kAircraftOrdinaryHorizonForcedLimitMax <
+              kAircraftLodVisibleAdmissionLimit);
 static_assert(kAircraftOpaqueChildCaptureLimit <=
               kRetailVisiblePointerCapacity);
 static_assert(kAircraftRetainedRootCaptureLimit <=
@@ -4711,6 +4725,7 @@ thread_local bool g_aircraftOrdinaryHorizonScanActive = false;
 thread_local void* g_aircraftOrdinaryHorizonContextEntity = nullptr;
 thread_local void* g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
 thread_local bool g_aircraftOrdinaryHorizonContextOuterBand = false;
+thread_local bool g_aircraftOrdinaryHorizonContextOuterFarBand = false;
 thread_local bool g_aircraftOrdinaryHorizonRangePromoted = false;
 thread_local bool g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
 thread_local bool g_aircraftOrdinaryHorizonFrameActive = false;
@@ -4719,6 +4734,13 @@ thread_local bool g_aircraftOrdinaryOuterSessionDisabled = false;
 thread_local bool g_aircraftOrdinaryOuterPriorityActive = false;
 thread_local float g_aircraftOrdinaryOuterMaxGroundM =
     kAircraftOrdinaryHorizonMaxGroundDistanceM;
+thread_local int g_aircraftOrdinaryInnerPriorityLimit =
+    kAircraftOrdinaryHorizonForcedLimit;
+thread_local int g_aircraftOrdinaryOuterPriorityLimit = 0;
+thread_local int g_aircraftOrdinaryOuterNearPriorityLimit = 0;
+thread_local int g_aircraftOrdinaryOuterFarPriorityLimit = 0;
+thread_local int g_aircraftOrdinaryFrameForcedLimit =
+    kAircraftOrdinaryHorizonForcedLimit;
 thread_local float g_aircraftOrdinaryHorizonAltitudeM = 0.0f;
 thread_local float g_aircraftOrdinaryHorizonMaxSlantM = 0.0f;
 thread_local float g_aircraftOrdinaryHorizonFrameMaxSlantM = 0.0f;
@@ -4808,6 +4830,11 @@ thread_local AircraftOrdinaryHorizonCounters
 struct AircraftOrdinaryOuterCounters {
     bool active{};
     float radiusM{};
+    int innerLimit{kAircraftOrdinaryHorizonForcedLimit};
+    int outerLimit{};
+    int nearLimit{};
+    int farLimit{};
+    int totalLimit{kAircraftOrdinaryHorizonForcedLimit};
     int candidateSectors{};
     int scannedSectors{};
     int coneSkippedSectors{};
@@ -4821,6 +4848,14 @@ struct AircraftOrdinaryOuterCounters {
     int stockVisible{};
     int promotions{};
     int admitted{};
+    int nearPromotions{};
+    int farPromotions{};
+    int nearAdmissions{};
+    int farAdmissions{};
+    int nearPromotionStops{};
+    int farPromotionStops{};
+    int nearAdmissionStops{};
+    int farAdmissionStops{};
     int forceStops{};
     int capacityStops{};
     int resultVisible{};
@@ -6332,6 +6367,49 @@ float AircraftOrdinaryOuterRadiusForAltitude(float altitudeM) {
          kAircraftOrdinaryHorizonMaxGroundDistanceM) * t;
 }
 
+struct AircraftOrdinaryPriorityLimits {
+    int inner{kAircraftOrdinaryHorizonForcedLimit};
+    int outer{};
+    int outerNear{};
+    int outerFar{};
+    int total{kAircraftOrdinaryHorizonForcedLimit};
+};
+
+AircraftOrdinaryPriorityLimits AircraftOrdinaryPriorityForRadius(
+        float outerRadiusM) {
+    AircraftOrdinaryPriorityLimits limits{};
+    if (!std::isfinite(outerRadiusM) ||
+        outerRadiusM <= kAircraftOrdinaryHorizonMaxGroundDistanceM) {
+        return limits;
+    }
+
+    const float outerSpan = std::max(
+        1.0f, kAircraftOrdinaryOuterMaxGroundDistanceM -
+                  kAircraftOrdinaryHorizonMaxGroundDistanceM);
+    const float outerT = std::clamp(
+        (outerRadiusM - kAircraftOrdinaryHorizonMaxGroundDistanceM) /
+            outerSpan,
+        0.0f, 1.0f);
+    limits.outer = std::clamp(
+        static_cast<int>(std::lround(
+            outerT * kAircraftOrdinaryOuterPriorityLimitMax)),
+        1, kAircraftOrdinaryOuterPriorityLimitMax);
+
+    // Keep both radial budgets monotonic.  The far ring only receives every
+    // second slot added after the radius crosses 400 m; it must never take an
+    // already available near-ring slot merely because the float radius moved
+    // a fraction past the boundary.
+    const int outerLimitAtFarBandStart =
+        kAircraftOrdinaryOuterPriorityLimitMax -
+        2 * kAircraftOrdinaryOuterFarPriorityLimitMax;
+    limits.outerFar = std::clamp(
+        (limits.outer - outerLimitAtFarBandStart) / 2,
+        0, kAircraftOrdinaryOuterFarPriorityLimitMax);
+    limits.outerNear = limits.outer - limits.outerFar;
+    limits.total = limits.inner + limits.outer;
+    return limits;
+}
+
 AircraftOrdinaryHorizonClass ClassifyAircraftOrdinaryOuter(
         const void* entity, const void* modelInfo, bool timeInRange) {
     const bool phase1Priority = g_aircraftOrdinaryOuterPriorityActive &&
@@ -6396,8 +6474,7 @@ AircraftOrdinaryHorizonClass ClassifyAircraftOrdinaryOuter(
         0.0f, dx * dx + dy * dy + dz * dz));
     if (!std::isfinite(groundDistance) ||
         !std::isfinite(slantDistance) ||
-        groundDistance + boundRadius <
-            kAircraftOrdinaryHorizonMaxGroundDistanceM ||
+        groundDistance < kAircraftOrdinaryHorizonMaxGroundDistanceM ||
         groundDistance - boundRadius > g_aircraftOrdinaryOuterMaxGroundM ||
         slantDistance + boundRadius <
             kAircraftOrdinaryHorizonMinSlantDistanceM ||
@@ -7598,6 +7675,7 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
     bool aircraftOrdinaryRangePromotion = false;
     bool aircraftOrdinaryDrawDistanceOverride = false;
     const bool aircraftOrdinaryOuterBand = aircraftOrdinaryOuterPolicy;
+    bool aircraftOrdinaryOuterFarBand = false;
     VisibilityOwnerSnapshot owner{};
     ScopedModelDrawDistance fallbackDrawDistanceScope;
     ScopedRendererFarClipPlane targetedFarScope;
@@ -7896,10 +7974,13 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             const float maxGroundDistance = aircraftOrdinaryOuterBand
                 ? g_aircraftOrdinaryOuterMaxGroundM
                 : kAircraftOrdinaryHorizonMaxGroundDistanceM;
+            aircraftOrdinaryOuterFarBand = aircraftOrdinaryOuterBand &&
+                std::isfinite(horizontalDistance) &&
+                horizontalDistance > kAircraftOrdinaryOuterFarBandStartM;
             promotionGeometry = std::isfinite(horizontalDistance) &&
                 std::isfinite(slantDistance) &&
                 (!aircraftOrdinaryOuterCall ||
-                 horizontalDistance + boundRadius >=
+                 horizontalDistance >=
                      kAircraftOrdinaryHorizonMaxGroundDistanceM) &&
                 (!aircraftOrdinaryOuterBand || timeInRange) &&
                 slantDistance + boundRadius >=
@@ -7923,13 +8004,15 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             aircraftOrdinaryOuterBand &&
             (g_visibilityScanPhase == 1 || aircraftOrdinaryOuterCall);
         if (outerPriorityPhase) {
-            promotionPriorityAllows =
-                g_aircraftOrdinaryOuter.promotions <
-                    kAircraftOrdinaryPhase1OuterPriorityLimit;
+            promotionPriorityAllows = aircraftOrdinaryOuterFarBand
+                ? g_aircraftOrdinaryOuter.farPromotions <
+                      g_aircraftOrdinaryOuterFarPriorityLimit
+                : g_aircraftOrdinaryOuter.nearPromotions <
+                      g_aircraftOrdinaryOuterNearPriorityLimit;
         } else if (phase1Priority) {
             promotionPriorityAllows =
                 g_aircraftOrdinaryOuter.phase1InnerPromotions <
-                    kAircraftOrdinaryPhase1InnerPriorityLimit;
+                    g_aircraftOrdinaryInnerPriorityLimit;
         }
         const bool promotionCandidateWithoutPriority = promotionFingerprint &&
             std::isfinite(distance) && distance >= 0.0f &&
@@ -7944,15 +8027,26 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             g_aircraftOrdinaryHorizonMaxSlantM > 0.0f &&
             promotionGeometry &&
             g_aircraftOrdinaryHorizon.rangePromotions <
-                kAircraftOrdinaryHorizonForcedLimit &&
+                g_aircraftOrdinaryFrameForcedLimit &&
             distance - boundRadius <=
                 g_aircraftOrdinaryHorizonMaxSlantM;
         if (promotionCandidateWithoutPriority && !promotionPriorityAllows &&
             phase1Priority) {
-            if (aircraftOrdinaryOuterBand)
+            if (aircraftOrdinaryOuterBand) {
                 ++g_aircraftOrdinaryOuter.phase1OuterPromotionStops;
-            else
+                if (aircraftOrdinaryOuterFarBand)
+                    ++g_aircraftOrdinaryOuter.farPromotionStops;
+                else
+                    ++g_aircraftOrdinaryOuter.nearPromotionStops;
+            } else {
                 ++g_aircraftOrdinaryOuter.phase1InnerPromotionStops;
+            }
+        } else if (promotionCandidateWithoutPriority &&
+                   !promotionPriorityAllows && outerPriorityPhase) {
+            if (aircraftOrdinaryOuterFarBand)
+                ++g_aircraftOrdinaryOuter.farPromotionStops;
+            else
+                ++g_aircraftOrdinaryOuter.nearPromotionStops;
         }
         const bool promotionCandidate =
             promotionCandidateWithoutPriority && promotionPriorityAllows;
@@ -7995,8 +8089,13 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
                     promotedEffectiveThreshold > distance;
                 if (aircraftOrdinaryRangePromotion) {
                     ++g_aircraftOrdinaryHorizon.rangePromotions;
-                    if (aircraftOrdinaryOuterBand)
+                    if (aircraftOrdinaryOuterBand) {
                         ++g_aircraftOrdinaryOuter.promotions;
+                        if (aircraftOrdinaryOuterFarBand)
+                            ++g_aircraftOrdinaryOuter.farPromotions;
+                        else
+                            ++g_aircraftOrdinaryOuter.nearPromotions;
+                    }
                     if (phase1Priority) {
                         if (aircraftOrdinaryOuterBand)
                             ++g_aircraftOrdinaryOuter.phase1OuterPromotions;
@@ -8049,6 +8148,8 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         g_aircraftOrdinaryHorizonForcedOcclusionEntity;
     const bool savedOrdinaryHorizonContextOuterBand =
         g_aircraftOrdinaryHorizonContextOuterBand;
+    const bool savedOrdinaryHorizonContextOuterFarBand =
+        g_aircraftOrdinaryHorizonContextOuterFarBand;
     const bool savedOrdinaryHorizonRangePromoted =
         g_aircraftOrdinaryHorizonRangePromoted;
     const bool savedOrdinaryHorizonRangePromotionAccepted =
@@ -8058,6 +8159,8 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
         g_aircraftOrdinaryHorizonContextOuterBand =
             aircraftOrdinaryOuterBand;
+        g_aircraftOrdinaryHorizonContextOuterFarBand =
+            aircraftOrdinaryOuterFarBand;
         g_aircraftOrdinaryHorizonRangePromoted =
             aircraftOrdinaryRangePromotion;
         g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
@@ -8122,6 +8225,8 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             savedOrdinaryHorizonForcedOcclusionEntity;
         g_aircraftOrdinaryHorizonContextOuterBand =
             savedOrdinaryHorizonContextOuterBand;
+        g_aircraftOrdinaryHorizonContextOuterFarBand =
+            savedOrdinaryHorizonContextOuterFarBand;
         g_aircraftOrdinaryHorizonRangePromoted =
             savedOrdinaryHorizonRangePromoted;
         g_aircraftOrdinaryHorizonRangePromotionAccepted =
@@ -12667,6 +12772,7 @@ void ScanAircraftOrdinaryOuterAnnulus(
     if (g_aircraftOrdinaryHorizonContextEntity != nullptr ||
         g_aircraftOrdinaryHorizonForcedOcclusionEntity != nullptr ||
         g_aircraftOrdinaryHorizonContextOuterBand ||
+        g_aircraftOrdinaryHorizonContextOuterFarBand ||
         g_aircraftOrdinaryHorizonRangePromoted ||
         g_aircraftOrdinaryHorizonRangePromotionAccepted) {
         ++g_aircraftOrdinaryOuter.faults;
@@ -12754,10 +12860,10 @@ void ScanAircraftOrdinaryOuterAnnulus(
     }
     std::sort(candidates.begin(), candidates.begin() + candidateCount,
               [](const Candidate& lhs, const Candidate& rhs) {
-                  if (lhs.anglePenalty != rhs.anglePenalty)
-                      return lhs.anglePenalty < rhs.anglePenalty;
                   if (lhs.distanceSq != rhs.distanceSq)
                       return lhs.distanceSq < rhs.distanceSq;
+                  if (lhs.anglePenalty != rhs.anglePenalty)
+                      return lhs.anglePenalty < rhs.anglePenalty;
                   return lhs.stableIndex < rhs.stableIndex;
               });
 
@@ -12786,9 +12892,9 @@ void ScanAircraftOrdinaryOuterAnnulus(
 
     for (int i = 0; i < sectorsToScan; ++i) {
         if (g_aircraftOrdinaryHorizon.forcedVisible >=
-                kAircraftOrdinaryHorizonForcedLimit ||
+                g_aircraftOrdinaryFrameForcedLimit ||
             g_aircraftOrdinaryOuter.admitted >=
-                kAircraftOrdinaryPhase1OuterPriorityLimit) {
+                g_aircraftOrdinaryOuterPriorityLimit) {
             ++g_aircraftOrdinaryOuter.forceStops;
             break;
         }
@@ -12821,6 +12927,7 @@ void ScanAircraftOrdinaryOuterAnnulus(
         g_aircraftOrdinaryHorizonContextEntity != nullptr ||
         g_aircraftOrdinaryHorizonForcedOcclusionEntity != nullptr ||
         g_aircraftOrdinaryHorizonContextOuterBand ||
+        g_aircraftOrdinaryHorizonContextOuterFarBand ||
         g_aircraftOrdinaryHorizonRangePromoted ||
         g_aircraftOrdinaryHorizonRangePromotionAccepted) {
         ++g_aircraftOrdinaryOuter.faults;
@@ -12828,6 +12935,7 @@ void ScanAircraftOrdinaryOuterAnnulus(
         g_aircraftOrdinaryHorizonContextEntity = nullptr;
         g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
         g_aircraftOrdinaryHorizonContextOuterBand = false;
+        g_aircraftOrdinaryHorizonContextOuterFarBand = false;
         g_aircraftOrdinaryHorizonRangePromoted = false;
         g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
     }
@@ -14582,6 +14690,45 @@ void OnRenderScene(bool underwater) {
         .aircraftOrdinaryPhase2BackfillAdmissions =
             g_aircraftOrdinaryHorizonFrameActive
                 ? g_aircraftOrdinaryHorizon.forcedNearbyPhase : 0,
+        .aircraftOrdinaryInnerLimit =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.innerLimit : 0,
+        .aircraftOrdinaryOuterLimit =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.outerLimit : 0,
+        .aircraftOrdinaryOuterNearLimit =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.nearLimit : 0,
+        .aircraftOrdinaryOuterFarLimit =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.farLimit : 0,
+        .aircraftOrdinaryTotalLimit =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.totalLimit : 0,
+        .aircraftOrdinaryOuterNearPromotions =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.nearPromotions : 0,
+        .aircraftOrdinaryOuterFarPromotions =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.farPromotions : 0,
+        .aircraftOrdinaryOuterNearAdmissions =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.nearAdmissions : 0,
+        .aircraftOrdinaryOuterFarAdmissions =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.farAdmissions : 0,
+        .aircraftOrdinaryOuterNearPromotionStops =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.nearPromotionStops : 0,
+        .aircraftOrdinaryOuterFarPromotionStops =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.farPromotionStops : 0,
+        .aircraftOrdinaryOuterNearAdmissionStops =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.nearAdmissionStops : 0,
+        .aircraftOrdinaryOuterFarAdmissionStops =
+            g_aircraftOrdinaryHorizonFrameActive
+                ? g_aircraftOrdinaryOuter.farAdmissionStops : 0,
         .cullAttributionFaults =
             cullCountersConsistent && targetedOcclusionCountersConsistent &&
                     !cullForeignThreadSeen
@@ -15130,7 +15277,8 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
             // A stock-range entity remains completely stock-authoritative. A
             // range-promoted transaction, however, reached this call only
             // because of our scoped SetupMap threshold, so it must share the
-            // same geometric filters and 96-entry budget as a frustum rescue.
+            // same geometric filters and current bounded frame budget as a
+            // frustum rescue.
             const bool rangePromoted =
                 g_aircraftOrdinaryHorizonRangePromoted;
             if (stockVisible && !rangePromoted &&
@@ -15145,9 +15293,16 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
             const bool aircraftOrdinaryOuterBand =
                 aircraftOrdinaryOuterCall ||
                 g_aircraftOrdinaryHorizonContextOuterBand;
+            // Promotion and admission must charge the same radial bucket even
+            // when the model pivot and transformed bound-sphere origin straddle
+            // 400 m. SetupMap latched the pivot-based owner for this exact
+            // synchronous transaction.
+            const bool aircraftOrdinaryOuterFarBand =
+                aircraftOrdinaryOuterBand &&
+                g_aircraftOrdinaryHorizonContextOuterFarBand;
             if (aircraftOrdinaryOuterCall &&
                 (!std::isfinite(groundDistance) ||
-                 groundDistance + extent <
+                 groundDistance <
                      kAircraftOrdinaryHorizonMaxGroundDistanceM)) {
                 ++g_aircraftOrdinaryHorizon.sphereRangeRejects;
                 ++g_aircraftOrdinaryHorizon.horizontalRangeRejects;
@@ -15190,25 +15345,37 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
                 aircraftOrdinaryOuterBand &&
                 (g_visibilityScanPhase == 1 || aircraftOrdinaryOuterCall);
             if (outerPriorityPhase) {
-                admissionPriorityAllows =
-                    g_aircraftOrdinaryOuter.admitted <
-                        kAircraftOrdinaryPhase1OuterPriorityLimit;
+                admissionPriorityAllows = aircraftOrdinaryOuterFarBand
+                    ? g_aircraftOrdinaryOuter.farAdmissions <
+                          g_aircraftOrdinaryOuterFarPriorityLimit
+                    : g_aircraftOrdinaryOuter.nearAdmissions <
+                          g_aircraftOrdinaryOuterNearPriorityLimit;
             } else if (phase1Priority) {
                 admissionPriorityAllows =
                     g_aircraftOrdinaryOuter.phase1InnerAdmissions <
-                        kAircraftOrdinaryPhase1InnerPriorityLimit;
+                        g_aircraftOrdinaryInnerPriorityLimit;
             }
             if (!admissionPriorityAllows) {
                 if (phase1Priority) {
-                    if (aircraftOrdinaryOuterBand)
+                    if (aircraftOrdinaryOuterBand) {
                         ++g_aircraftOrdinaryOuter.phase1OuterAdmissionStops;
-                    else
+                        if (aircraftOrdinaryOuterFarBand)
+                            ++g_aircraftOrdinaryOuter.farAdmissionStops;
+                        else
+                            ++g_aircraftOrdinaryOuter.nearAdmissionStops;
+                    } else {
                         ++g_aircraftOrdinaryOuter.phase1InnerAdmissionStops;
+                    }
+                } else if (outerPriorityPhase) {
+                    if (aircraftOrdinaryOuterFarBand)
+                        ++g_aircraftOrdinaryOuter.farAdmissionStops;
+                    else
+                        ++g_aircraftOrdinaryOuter.nearAdmissionStops;
                 }
                 return false;
             }
             if (g_aircraftOrdinaryHorizon.forcedVisible >=
-                    kAircraftOrdinaryHorizonForcedLimit) {
+                    g_aircraftOrdinaryFrameForcedLimit) {
                 ++g_aircraftOrdinaryHorizon.forceLimit;
                 if (aircraftOrdinaryOuterCall)
                     ++g_aircraftOrdinaryOuter.forceStops;
@@ -15224,6 +15391,10 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
             ++g_aircraftOrdinaryHorizon.forcedVisible;
             if (aircraftOrdinaryOuterBand) {
                 ++g_aircraftOrdinaryOuter.admitted;
+                if (aircraftOrdinaryOuterFarBand)
+                    ++g_aircraftOrdinaryOuter.farAdmissions;
+                else
+                    ++g_aircraftOrdinaryOuter.nearAdmissions;
                 if (stockVisible)
                     ++g_aircraftOrdinaryOuter.stockVisible;
             }
@@ -15479,6 +15650,7 @@ void OnScanWorld() {
     g_aircraftOrdinaryHorizonContextEntity = nullptr;
     g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
     g_aircraftOrdinaryHorizonContextOuterBand = false;
+    g_aircraftOrdinaryHorizonContextOuterFarBand = false;
     g_aircraftOrdinaryHorizonRangePromoted = false;
     g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
     g_aircraftOrdinaryHorizonMaxSlantM = 0.0f;
@@ -15486,6 +15658,13 @@ void OnScanWorld() {
     g_aircraftOrdinaryOuterPriorityActive = false;
     g_aircraftOrdinaryOuterMaxGroundM =
         kAircraftOrdinaryHorizonMaxGroundDistanceM;
+    g_aircraftOrdinaryInnerPriorityLimit =
+        kAircraftOrdinaryHorizonForcedLimit;
+    g_aircraftOrdinaryOuterPriorityLimit = 0;
+    g_aircraftOrdinaryOuterNearPriorityLimit = 0;
+    g_aircraftOrdinaryOuterFarPriorityLimit = 0;
+    g_aircraftOrdinaryFrameForcedLimit =
+        kAircraftOrdinaryHorizonForcedLimit;
     g_aircraftOrdinaryOuter = {};
     if (g_aircraftOrdinaryOuterSessionDisabled)
         g_aircraftOrdinaryOuter.faults = 1;
@@ -15500,9 +15679,9 @@ void OnScanWorld() {
             ? g_staticCullCone.forward.z
             : std::numeric_limits<float>::quiet_NaN();
     if (aircraftScanLod.active) {
-        // The horizontal footprint and 96-entry cap already bound candidate
-        // and render cost. Let the same altitude-compensated projection far plane
-        // be the slant ceiling so terrain relief cannot reopen a blue gap.
+        // The horizontal footprint and the 96 + ramped outer allowance bound
+        // candidate/render cost. Let the same altitude-compensated projection
+        // far plane be the slant ceiling so terrain relief cannot reopen a gap.
         g_aircraftOrdinaryHorizonMaxSlantM = aircraftScanLod.farClipM;
         if (!std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) ||
             g_aircraftOrdinaryHorizonMaxSlantM <= 0.0f) {
@@ -15529,11 +15708,14 @@ void OnScanWorld() {
         g_aircraftOrdinaryHorizonContextEntity = nullptr;
         g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
         g_aircraftOrdinaryHorizonContextOuterBand = false;
+        g_aircraftOrdinaryHorizonContextOuterFarBand = false;
         g_aircraftOrdinaryHorizonRangePromoted = false;
         g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
         g_aircraftOrdinaryHorizonScanActive = true;
         const float outerPriorityRadius =
             AircraftOrdinaryOuterRadiusForAltitude(aircraftScanLod.altitudeM);
+        const AircraftOrdinaryPriorityLimits priorityLimits =
+            AircraftOrdinaryPriorityForRadius(outerPriorityRadius);
         const bool outerPriorityRequested = std::isfinite(outerPriorityRadius) &&
             outerPriorityRadius >
                 kAircraftOrdinaryHorizonMaxGroundDistanceM + 0.01f;
@@ -15542,8 +15724,20 @@ void OnScanWorld() {
             if (AircraftOrdinaryOuterSupported()) {
                 g_aircraftOrdinaryOuterPriorityActive = true;
                 g_aircraftOrdinaryOuterMaxGroundM = outerPriorityRadius;
+                g_aircraftOrdinaryInnerPriorityLimit = priorityLimits.inner;
+                g_aircraftOrdinaryOuterPriorityLimit = priorityLimits.outer;
+                g_aircraftOrdinaryOuterNearPriorityLimit =
+                    priorityLimits.outerNear;
+                g_aircraftOrdinaryOuterFarPriorityLimit =
+                    priorityLimits.outerFar;
+                g_aircraftOrdinaryFrameForcedLimit = priorityLimits.total;
                 g_aircraftOrdinaryOuter.active = true;
                 g_aircraftOrdinaryOuter.radiusM = outerPriorityRadius;
+                g_aircraftOrdinaryOuter.innerLimit = priorityLimits.inner;
+                g_aircraftOrdinaryOuter.outerLimit = priorityLimits.outer;
+                g_aircraftOrdinaryOuter.nearLimit = priorityLimits.outerNear;
+                g_aircraftOrdinaryOuter.farLimit = priorityLimits.outerFar;
+                g_aircraftOrdinaryOuter.totalLimit = priorityLimits.total;
             } else {
                 ++g_aircraftOrdinaryOuter.faults;
                 g_aircraftOrdinaryOuterSessionDisabled = true;
@@ -15752,8 +15946,9 @@ void OnScanWorld() {
                  static_cast<double>(
                      g_aircraftOrdinaryHorizonFrameMaxSlantM),
                  static_cast<double>(kStaticCullConeHalfAngleDeg),
-                 kAircraftOrdinaryHorizonForcedLimit);
+                 g_aircraftOrdinaryFrameForcedLimit);
             LOGI("[lod.air.outer] active=%d radius=%.0f "
+                 "quota=i/o/n/f/t=%d/%d/%d/%d/%d "
                  "cells=c/s/cone/limit=%d/%d/%d/%d "
                  "probe=p/q/b/d/f/u=%d/%d/%d/%d/%d/%d "
                  "vis=stock/promo/admit=%d/%d/%d "
@@ -15761,9 +15956,16 @@ void OnScanWorld() {
                  "stop=force/cap=%d/%d faults=%d session_off=%d "
                  "prio=prom_i/o=%d/%d admit_i/o=%d/%d "
                  "quota_stop=pi/po/ai/ao=%d/%d/%d/%d "
+                 "ring=prom_n/f=%d/%d admit_n/f=%d/%d "
+                 "stop_pn/pf/an/af=%d/%d/%d/%d "
                  "time=wall/cpu=%.3f/%.3fms",
                  g_aircraftOrdinaryOuter.active ? 1 : 0,
                  static_cast<double>(g_aircraftOrdinaryOuter.radiusM),
+                 g_aircraftOrdinaryOuter.innerLimit,
+                 g_aircraftOrdinaryOuter.outerLimit,
+                 g_aircraftOrdinaryOuter.nearLimit,
+                 g_aircraftOrdinaryOuter.farLimit,
+                 g_aircraftOrdinaryOuter.totalLimit,
                  g_aircraftOrdinaryOuter.candidateSectors,
                  g_aircraftOrdinaryOuter.scannedSectors,
                  g_aircraftOrdinaryOuter.coneSkippedSectors,
@@ -15793,12 +15995,21 @@ void OnScanWorld() {
                  g_aircraftOrdinaryOuter.phase1OuterPromotionStops,
                  g_aircraftOrdinaryOuter.phase1InnerAdmissionStops,
                  g_aircraftOrdinaryOuter.phase1OuterAdmissionStops,
+                 g_aircraftOrdinaryOuter.nearPromotions,
+                 g_aircraftOrdinaryOuter.farPromotions,
+                 g_aircraftOrdinaryOuter.nearAdmissions,
+                 g_aircraftOrdinaryOuter.farAdmissions,
+                 g_aircraftOrdinaryOuter.nearPromotionStops,
+                 g_aircraftOrdinaryOuter.farPromotionStops,
+                 g_aircraftOrdinaryOuter.nearAdmissionStops,
+                 g_aircraftOrdinaryOuter.farAdmissionStops,
                  g_aircraftOrdinaryOuter.wallMs,
                  g_aircraftOrdinaryOuter.cpuMs);
         }
         g_aircraftOrdinaryHorizonContextEntity = nullptr;
         g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
         g_aircraftOrdinaryHorizonContextOuterBand = false;
+        g_aircraftOrdinaryHorizonContextOuterFarBand = false;
         g_aircraftOrdinaryHorizonScanActive = false;
         g_aircraftOrdinaryHorizonRangePromoted = false;
         g_aircraftOrdinaryHorizonMaxSlantM = 0.0f;
@@ -15807,6 +16018,13 @@ void OnScanWorld() {
         g_aircraftOrdinaryOuterPriorityActive = false;
         g_aircraftOrdinaryOuterMaxGroundM =
             kAircraftOrdinaryHorizonMaxGroundDistanceM;
+        g_aircraftOrdinaryInnerPriorityLimit =
+            kAircraftOrdinaryHorizonForcedLimit;
+        g_aircraftOrdinaryOuterPriorityLimit = 0;
+        g_aircraftOrdinaryOuterNearPriorityLimit = 0;
+        g_aircraftOrdinaryOuterFarPriorityLimit = 0;
+        g_aircraftOrdinaryFrameForcedLimit =
+            kAircraftOrdinaryHorizonForcedLimit;
     };
 
     if (aircraftScanLod.active) {
@@ -15991,8 +16209,8 @@ void OnScanWorld() {
     }
 
     // Phase 2 deliberately keeps the proven retail 300 m footprint and runs
-    // after phase 4, so it may backfill any part of the unchanged 96-entry
-    // budget that the sparse outer band did not use.
+    // after phase 4, so it may backfill any unused part of the bounded
+    // 96..128-entry altitude budget.
     RequestAircraftOrdinaryPrefetchCandidates();
     finalizeAircraftRootUnion();
     finishAircraftOrdinaryHorizon();

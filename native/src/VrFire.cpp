@@ -355,6 +355,29 @@ void AddGunShotEvent(void* shooter, int weaponType, Vec3 origin, Vec3 impact) {
     g.CEventGunShot_Destruct(storage);
 }
 
+// Retail SA shotguns are PELLET weapons: one trigger pull fires a cone of
+// pellets and every pellet applies the weapon's damage on its own line test
+// (CWeapon::FireInstantHit, 0x73FB10: 15 pellets for the pump/sawn-off,
+// 4 for the SPAS-12, spread rate 0.05). The single-ray physical path made
+// them hit like a pistol — one pellet per shot.
+int PelletsForWeapon(int weaponType) {
+    switch (weaponType) {
+    case 25: return 15;  // shotgun
+    case 26: return 15;  // sawn-off
+    case 27: return 4;   // SPAS-12
+    default: return 1;
+    }
+}
+
+float PelletSpreadForWeapon(int weaponType) {
+    switch (weaponType) {
+    case 25: return 0.05f;
+    case 26: return 0.09f;  // sawn-off: noticeably wider cone
+    case 27: return 0.05f;
+    default: return 0.0f;
+    }
+}
+
 bool FireControllerRay(void* weapon, void* shooter, int weaponType,
                        Vec3 origin, Vec3 direction) {
     int skill = g.CPed_GetWeaponSkill(shooter, weaponType);
@@ -371,6 +394,48 @@ bool FireControllerRay(void* weapon, void* shooter, int weaponType,
                    origin.y + direction.y * range,
                    origin.z + direction.z * range};
 
+    // Pellet weapons: derive a stable lateral basis once, then walk every
+    // pellet through the same line-test + DoBulletImpact path retail uses,
+    // scattering directions inside the spread cone.
+    const int pellets = PelletsForWeapon(weaponType);
+    const float spread = PelletSpreadForWeapon(weaponType);
+    Vec3 lateralA{0.0f, 0.0f, 1.0f};
+    Vec3 lateralB{1.0f, 0.0f, 0.0f};
+    if (pellets > 1) {
+        const Vec3 worldUp{0.0f, 0.0f, 1.0f};
+        lateralA = Normalize({direction.y * worldUp.z - direction.z * worldUp.y,
+                              direction.z * worldUp.x - direction.x * worldUp.z,
+                              direction.x * worldUp.y - direction.y * worldUp.x});
+        lateralB = {direction.y * lateralA.z - direction.z * lateralA.y,
+                    direction.z * lateralA.x - direction.x * lateralA.z,
+                    direction.x * lateralA.y - direction.y * lateralA.x};
+        if (!Finite(lateralA) || LengthSquared(lateralA) < 0.5f) {
+            lateralA = {0.0f, 0.0f, 1.0f};
+            lateralB = {1.0f, 0.0f, 0.0f};
+        }
+    }
+    static std::uint32_t pelletSeed = 0x1234567u;
+    auto pelletRand = []() -> float {
+        pelletSeed = pelletSeed * 1664525u + 1013904223u;
+        return (static_cast<float>((pelletSeed >> 8) & 0xFFFF) / 32768.0f) -
+               1.0f;
+    };
+
+    bool anyHit = false;
+    Vec3 firstImpact = end;
+    for (int pellet = 0; pellet < pellets; ++pellet) {
+        Vec3 pelletDir = direction;
+        if (pellet > 0 && spread > 0.0f) {
+            const float ox = pelletRand() * spread;
+            const float oy = pelletRand() * spread;
+            pelletDir = Normalize({direction.x + lateralA.x * ox + lateralB.x * oy,
+                                   direction.y + lateralA.y * ox + lateralB.y * oy,
+                                   direction.z + lateralA.z * ox + lateralB.z * oy});
+        }
+        const Vec3 pelletEnd{origin.x + pelletDir.x * range,
+                             origin.y + pelletDir.y * range,
+                             origin.z + pelletDir.z * range};
+
     // CColPoint is 0x2c bytes on this ARM64 build; round up for alignment and
     // zero it so the no-hit path is deterministic.
     alignas(16) std::uint8_t colPoint[0x30]{};
@@ -384,52 +449,58 @@ bool FireControllerRay(void* weapon, void* shooter, int weaponType,
             ? g.FindPlayerVehicle(-1, false) : nullptr;
         ScopedLineOptions options(ownVehicle ? ownVehicle : shooter);
         hit = g.CWorld_ProcessLineOfSight(
-            &origin, &end, colPoint, &victim,
+            &origin, &pelletEnd, colPoint, &victim,
             true, true, true, true, true, false, false, true);
         if (hit && victim &&
             ((*reinterpret_cast<const std::uint8_t*>(
                  reinterpret_cast<const std::uint8_t*>(victim) + 0x5A)) & 7) == 2 &&
             g.CWeapon_CheckForShootingVehicleOccupant) {
             g.CWeapon_CheckForShootingVehicleOccupant(
-                &victim, colPoint, weaponType, &origin, &end);
+                &victim, colPoint, weaponType, &origin, &pelletEnd);
         }
         // Restore before impact handling; DoBulletImpact can perform unrelated
         // world work and must see the caller's original line-test state.
         options.Restore();
     }
 
-    Vec3 impact = end;
+    Vec3 impact = pelletEnd;
     if (hit) {
         impact = *reinterpret_cast<const Vec3*>(colPoint); // m_vecPoint @ +0x00
     }
-    AddGunShotEvent(shooter, weaponType, origin, impact);
+    if (pellet == 0) firstImpact = impact;
+    anyHit = anyHit || hit;
 
-    // Mobile SA emits its native CBulletTrace from RenderEffects, after this
-    // mod's left/right eye RenderScene captures have already ended. Publish the
-    // exact physical ray as a short-lived LOCAL-space stereo tracer instead.
-    const float worldStart[3]{origin.x, origin.y, origin.z};
-    const float worldEnd[3]{impact.x, impact.y, impact.z};
-    float trackingStart[3]{}, trackingEnd[3]{};
-    if (vrcam::WorldPointToTracking(worldStart, trackingStart) &&
-        vrcam::WorldPointToTracking(worldEnd, trackingEnd)) {
-        xr::AddBulletTracer(trackingStart, trackingEnd, weaponType);
+    // Publish the first three pellets as stereo tracers: enough to read the
+    // cone without flooding the tracer pool on every SPAS burst.
+    if (pellet < 3) {
+        const float worldStart[3]{origin.x, origin.y, origin.z};
+        const float worldEnd[3]{impact.x, impact.y, impact.z};
+        float trackingStart[3]{}, trackingEnd[3]{};
+        if (vrcam::WorldPointToTracking(worldStart, trackingStart) &&
+            vrcam::WorldPointToTracking(worldEnd, trackingEnd)) {
+            xr::AddBulletTracer(trackingStart, trackingEnd, weaponType);
+        }
     }
 
     // This is the vanilla damage/effects path. It handles ped damage events,
-    // vehicle damage, tyres, glass, crime, bullet traces and a miss trace. Calling
-    // it once (including for a miss) avoids duplicating damage like the old PC
-    // experimental path did.
+    // vehicle damage, tyres, glass, crime, bullet traces and a miss trace.
+    // Retail fires it per PELLET for shotguns — that is where their damage
+    // comes from — so the loop calls it once per pellet here too.
     g.CWeapon_DoBulletImpact(
         weapon, shooter, hit ? victim : nullptr,
         &origin, &impact, colPoint, 0);
+    }  // pellet loop
+
+    AddGunShotEvent(shooter, weaponType, origin, firstImpact);
     g.CWeapon_DoWeaponEffect(weapon, origin, direction);
+    const bool hit = anyHit;
 
     static std::atomic<unsigned> shotCount{0};
     const unsigned n = shotCount.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n <= 6 || (n % 120) == 0) {
-        LOGI("[vr.fire] controller hitscan type=%d hand-ray hit=%d victim=%p "
+        LOGI("[vr.fire] controller hitscan type=%d pellets=%d hit=%d "
              "origin=(%.2f,%.2f,%.2f) dir=(%.2f,%.2f,%.2f)",
-             weaponType, hit ? 1 : 0, victim,
+             weaponType, pellets, hit ? 1 : 0,
              origin.x, origin.y, origin.z,
              direction.x, direction.y, direction.z);
     }

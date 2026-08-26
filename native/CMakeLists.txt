@@ -6,9 +6,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(OPENXR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/openxr)
 
+# The public source kit deliberately does not commit a prebuilt OpenXR loader.
+# The build wizard downloads the exact Khronos 1.1.43 AAR, verifies it, and
+# passes its arm64 library here. Developers can supply the same file manually.
+set(OPENXR_LOADER_SO "" CACHE FILEPATH
+    "Path to the Khronos Android arm64-v8a libopenxr_loader.so")
+if(NOT OPENXR_LOADER_SO AND DEFINED ENV{SAVR_OPENXR_LOADER_SO})
+    set(OPENXR_LOADER_SO "$ENV{SAVR_OPENXR_LOADER_SO}")
+endif()
+if(NOT EXISTS "${OPENXR_LOADER_SO}")
+    message(FATAL_ERROR
+        "OPENXR_LOADER_SO must point to the verified Khronos 1.1.43 "
+        "arm64-v8a libopenxr_loader.so. Run BUILD_AND_INSTALL or pass "
+        "-DOPENXR_LOADER_SO=<path>.")
+endif()
+
 add_library(openxr_loader SHARED IMPORTED)
 set_target_properties(openxr_loader PROPERTIES
-    IMPORTED_LOCATION ${OPENXR_DIR}/lib/${ANDROID_ABI}/libopenxr_loader.so
+    IMPORTED_LOCATION "${OPENXR_LOADER_SO}"
 )
 
 add_library(savr SHARED
