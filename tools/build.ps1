@@ -12,7 +12,8 @@ param(
     [string]$AudioSource,
     [string]$Keystore,
     [switch]$Package,
-    [switch]$AllowUnofficialSource
+    [switch]$AllowUnofficialSource,
+    [switch]$PersonalUpdateSource
 )
 
 $ErrorActionPreference = 'Stop'
@@ -154,6 +155,7 @@ if ($Package.IsPresent) {
         '--keystore', $Keystore
     )
     if ($AllowUnofficialSource.IsPresent) { $assembleArgs += '--allow-unofficial-source' }
+    if ($PersonalUpdateSource.IsPresent) { $assembleArgs += '--personal-update-source' }
     & $PythonExe @assembleArgs
     if ($LASTEXITCODE -ne 0) { throw "APK assembly failed: $LASTEXITCODE" }
 }

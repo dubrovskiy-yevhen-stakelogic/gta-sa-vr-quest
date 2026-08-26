@@ -855,6 +855,10 @@ def validate_audio(source: Path, work: Path, build_root: Path) -> AudioTree:
         except ValueError as error:
             raise KitError(f"audio file escapes the selected tree: {path}") from error
         relative = path.relative_to(audio_root).as_posix()
+        # The one-click installer creates this transport checksum locally.
+        # It is not part of the sound mod and may use CRLF in older packages.
+        if relative.lower() == "sha256sums":
+            continue
         actual[relative.lower()] = path
 
     if set(actual) != set(expected):
@@ -1055,6 +1059,23 @@ def next_dex_name(base: Path) -> str:
         index += 1
 
 
+def existing_savr_loader_dex(base: Path) -> str:
+    marker = b"Lcom/savr/SavrApplication;"
+    matches: list[str] = []
+    with zipfile.ZipFile(base) as archive:
+        for info in archive.infolist():
+            if not re.fullmatch(r"classes(?:\d+)?\.dex", info.filename):
+                continue
+            if marker in archive.read(info):
+                matches.append(info.filename)
+    if len(matches) != 1:
+        raise KitError(
+            "personal update source must contain exactly one existing SAVR loader DEX; "
+            f"found {matches}"
+        )
+    return matches[0]
+
+
 def output_name(apk: InputApk) -> str:
     if apk.split is None:
         return "base.apk"
@@ -1171,6 +1192,7 @@ def assemble_apks(
     native_lib: Path,
     loader_dex: Path,
     openxr_loader: Path,
+    personal_update_source: bool = False,
 ) -> tuple[list[dict], str]:
     for required in (native_lib, loader_dex, openxr_loader, tools.apktool):
         if not required.is_file():
@@ -1180,8 +1202,12 @@ def assemble_apks(
     if sha256_file(openxr_loader) != OPENXR_LOADER_SHA256:
         raise KitError("OpenXR loader hash mismatch; required Khronos 1.1.43 arm64 binary")
 
-    manifest = build_manifest(package.base.path, build, tools)
-    dex_name = next_dex_name(package.base.path)
+    manifest = None if personal_update_source else build_manifest(package.base.path, build, tools)
+    dex_name = (
+        existing_savr_loader_dex(package.base.path)
+        if personal_update_source
+        else next_dex_name(package.base.path)
+    )
     native_bytes = native_lib.read_bytes()
     loader_bytes = openxr_loader.read_bytes()
     dex_bytes = loader_dex.read_bytes()
@@ -1203,15 +1229,25 @@ def assemble_apks(
     for apk in package.apks:
         replacements: dict[str, bytes] = {}
         additions: dict[str, tuple[bytes, int]] = {}
+        with zipfile.ZipFile(apk.path) as input_apk:
+            existing_entries = {info.filename for info in input_apk.infolist()}
+
+        def add_or_replace(name: str, data: bytes, compression: int) -> None:
+            if name in existing_entries:
+                replacements[name] = data
+            else:
+                additions[name] = (data, compression)
+
         if apk.path == package.base.path:
-            replacements["AndroidManifest.xml"] = manifest
-            additions[dex_name] = (dex_bytes, zipfile.ZIP_STORED)
-            additions.update(default_settings)
+            if manifest is not None:
+                replacements["AndroidManifest.xml"] = manifest
+            add_or_replace(dex_name, dex_bytes, zipfile.ZIP_STORED)
+            for name, (data, compression) in default_settings.items():
+                add_or_replace(name, data, compression)
         if apk.path == package.arm64.path:
-            additions["lib/arm64-v8a/libsavr.so"] = (native_bytes, zipfile.ZIP_DEFLATED)
-            additions["lib/arm64-v8a/libopenxr_loader.so"] = (
-                loader_bytes,
-                zipfile.ZIP_DEFLATED,
+            add_or_replace("lib/arm64-v8a/libsavr.so", native_bytes, zipfile.ZIP_DEFLATED)
+            add_or_replace(
+                "lib/arm64-v8a/libopenxr_loader.so", loader_bytes, zipfile.ZIP_DEFLATED
             )
         destination = output / output_name(apk)
         rewrite_apk(apk.path, destination, replacements, additions)
@@ -1415,6 +1451,11 @@ def main() -> int:
         action="store_true",
         help="developer escape hatch; the public wizard does not enable this by default",
     )
+    parser.add_argument(
+        "--personal-update-source",
+        action="store_true",
+        help="rebuild an existing SAVR personal split set in place of clean retail inputs",
+    )
     args = parser.parse_args()
 
     build = Path(args.build_dir).expanduser().resolve()
@@ -1500,7 +1541,7 @@ def main() -> int:
         build / "input-apks",
         build,
         tools,
-        args.allow_unofficial_source,
+        args.allow_unofficial_source or args.personal_update_source,
     )
     say("==> validating separate audio mod")
     audio = validate_audio(
@@ -1521,7 +1562,13 @@ def main() -> int:
         native_lib,
         loader_dex,
         openxr_loader,
+        args.personal_update_source,
     )
+    if args.personal_update_source and output_signer != package.signer_sha256:
+        raise KitError(
+            "the supplied update keystore does not match the existing personal APK set. "
+            f"Input signer: {package.signer_sha256}; output signer: {output_signer}"
+        )
     payload_result = stage_payload(package, audio, payload, build)
     result = {
         "formatVersion": 1,

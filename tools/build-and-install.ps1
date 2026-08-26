@@ -7,8 +7,10 @@ param(
     [string]$JavaHome,
     [string]$Serial,
     [string]$LogPath,
+    [string]$Keystore,
     [switch]$BuildOnly,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$PersonalUpdate
 )
 
 Set-StrictMode -Version 2.0
@@ -736,7 +738,10 @@ function Resolve-ManifestFile {
 }
 
 function Assert-BuildArtifacts {
-    param([Parameter(Mandatory = $true)][string]$BuildRoot)
+    param(
+        [Parameter(Mandatory = $true)][string]$BuildRoot,
+        [switch]$PersonalUpdate
+    )
     $manifestPath = Join-Path $BuildRoot 'build-manifest.json'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         throw "Build manifest is missing: $manifestPath"
@@ -745,8 +750,15 @@ function Assert-BuildArtifacts {
     if ([string]$manifest.package -ne $script:PackageName) { throw 'Build manifest package is unexpected.' }
     if ([string]$manifest.versionCode -ne $script:ExpectedVersionCode) { throw 'Build manifest versionCode is unexpected.' }
     if ([string]$manifest.versionName -ne $script:ExpectedVersionName) { throw 'Build manifest versionName is unexpected.' }
-    if (-not [bool]$manifest.officialSource) { throw 'The selected APK set is not the verified official retail source.' }
-    if ([string]$manifest.sourceSignerSha256 -ne $script:ExpectedSourceSigner) { throw 'Official source signer hash changed.' }
+    if ($PersonalUpdate.IsPresent) {
+        if ([string]$manifest.sourceSignerSha256 -ne [string]$manifest.outputSignerSha256) {
+            throw 'Personal update output signer does not match the existing APK set.'
+        }
+    }
+    else {
+        if (-not [bool]$manifest.officialSource) { throw 'The selected APK set is not the verified official retail source.' }
+        if ([string]$manifest.sourceSignerSha256 -ne $script:ExpectedSourceSigner) { throw 'Official source signer hash changed.' }
+    }
     if ([string]$manifest.libGameSha256 -ne $script:ExpectedLibGame) { throw 'Official libGame.so hash changed.' }
     if ([string]::IsNullOrWhiteSpace([string]$manifest.outputSignerSha256)) { throw 'Output signer is missing from the build manifest.' }
 
@@ -1334,11 +1346,19 @@ function Invoke-Main {
     $openXrLoader = Resolve-OpenXrLoader -DownloadRoot $downloads -ToolsRoot $toolsRoot
     $resolvedSdk = Resolve-AndroidSdk -Requested $AndroidSdk -DefaultRoot $defaultSdk -DownloadRoot $downloads `
         -ToolsRoot $toolsRoot -ResolvedJavaHome $resolvedJavaHome
-    $keystore = Get-PersistentKeystorePath -ProjectRoot $projectRoot -ResolvedWorkDir $resolvedWorkDir
+    if ([string]::IsNullOrWhiteSpace($Keystore)) {
+        $keystore = Get-PersistentKeystorePath -ProjectRoot $projectRoot -ResolvedWorkDir $resolvedWorkDir
+    }
+    else {
+        $keystore = Get-FullPath $Keystore
+        if (-not (Test-Path -LiteralPath $keystore -PathType Leaf)) {
+            throw "Requested signing key does not exist: $keystore"
+        }
+    }
     Write-Host "Persistent personal signing key: $keystore"
 
     Write-Step 'Validating the selected GTA SA package and audio before compilation'
-    Invoke-NativeLive -FilePath $python -Arguments @(
+    $validateArguments = @(
         $assembleScript,
         '--game-package', $resolvedGamePackage,
         '--audio-source', $resolvedAudioSource,
@@ -1348,6 +1368,8 @@ function Invoke-Main {
         '--apktool', $apktool,
         '--validate-only'
     )
+    if ($PersonalUpdate.IsPresent) { $validateArguments += '--personal-update-source' }
+    Invoke-NativeLive -FilePath $python -Arguments $validateArguments
 
     Write-Step 'Building and assembling the verified personal APK set'
     & $buildScript `
@@ -1361,10 +1383,11 @@ function Invoke-Main {
         -GamePackage $resolvedGamePackage `
         -AudioSource $resolvedAudioSource `
         -Keystore $keystore `
-        -Package
+        -Package `
+        -PersonalUpdateSource:$PersonalUpdate.IsPresent
 
     Write-Step 'Hash-checking build outputs and staged Quest payloads'
-    $buildInfo = Assert-BuildArtifacts -BuildRoot $buildRoot
+    $buildInfo = Assert-BuildArtifacts -BuildRoot $buildRoot -PersonalUpdate:$PersonalUpdate.IsPresent
     Write-Host "Verified build manifest: $($buildInfo.ManifestPath)"
     if ($BuildOnly.IsPresent) {
         Write-Host "BuildOnly complete. APKs: $($buildInfo.OutputRoot)" -ForegroundColor Green
