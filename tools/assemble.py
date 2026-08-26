@@ -818,7 +818,16 @@ def materialize_audio_source(source: Path, work: Path, build_root: Path) -> Path
 
 
 def validate_audio(source: Path, work: Path, build_root: Path) -> AudioTree:
-    audio_root = materialize_audio_source(source, work, build_root)
+    try:
+        audio_root = materialize_audio_source(source, work, build_root)
+    except KitError as error:
+        raise KitError(
+            f"{error}\nRequired sound archive: "
+            "gta-sa-ps2-style-mod-pack_1786856007_737162.7z. "
+            "Download it from https://libertycity.net/files/gta-san-andreas-ios-android/"
+            "241069-gta-sa-classic-avanced-mod-pack.html and choose Original plan mod pack "
+            "(16 August 2026, 1.41 GB), not CLASSIC ADVANCED v1.0."
+        ) from error
     reference = load_audio_reference()
     expected = {entry["path"].lower(): entry for entry in reference["files"]}
 
@@ -846,10 +855,18 @@ def validate_audio(source: Path, work: Path, build_root: Path) -> AudioTree:
         path = actual[key]
         size = path.stat().st_size
         if size != spec["size"]:
-            raise KitError(f"audio size mismatch: {spec['path']} ({size} != {spec['size']})")
+            raise KitError(
+                f"audio size mismatch: {spec['path']} ({size} != {spec['size']}). "
+                "This is not the supported Original plan mod pack. Use "
+                "gta-sa-ps2-style-mod-pack_1786856007_737162.7z, not CLASSIC ADVANCED v1.0."
+            )
         digest = sha256_file(path)
         if digest != spec["sha256"].upper():
-            raise KitError(f"audio hash mismatch: {spec['path']} ({digest})")
+            raise KitError(
+                f"audio hash mismatch: {spec['path']} ({digest}). "
+                "This is not the supported Original plan mod pack. Use "
+                "gta-sa-ps2-style-mod-pack_1786856007_737162.7z, not CLASSIC ADVANCED v1.0."
+            )
         verified.append(
             {
                 "path": spec["path"],

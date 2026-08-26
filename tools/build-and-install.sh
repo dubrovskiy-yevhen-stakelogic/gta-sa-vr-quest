@@ -1050,7 +1050,10 @@ fi
 AUDIO_SOURCE_PROMPTED=0
 if [ -z "$AUDIO_SOURCE" ]; then
   [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 0 ] || die "--audio-source is required in non-interactive input"
-  read -r -p "Supported sound-mod folder or archive: " AUDIO_SOURCE
+  echo "Required sound archive: gta-sa-ps2-style-mod-pack_1786856007_737162.7z"
+  echo "Download page: https://libertycity.net/files/gta-san-andreas-ios-android/241069-gta-sa-classic-avanced-mod-pack.html"
+  echo "Choose Original plan mod pack (16 August 2026, 1.41 GB), NOT CLASSIC ADVANCED v1.0."
+  read -r -p "Required PS2-style sound archive or extracted audio folder: " AUDIO_SOURCE
   AUDIO_SOURCE_PROMPTED=1
 fi
 if [ "$GAME_PACKAGE_PROMPTED" -eq 1 ]; then GAME_PACKAGE="$(normalize_prompt_path "$GAME_PACKAGE")"; fi

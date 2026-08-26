@@ -93,6 +93,27 @@ $discordChannel = 'https://discord.com/channels/747967102895390741/1540234546182
 if ($readmeText -notmatch [regex]::Escape($discordChannel)) {
     throw 'The public Discord channel is missing from README.'
 }
+$audioDownloadPage = 'https://libertycity.net/files/gta-san-andreas-ios-android/241069-gta-sa-classic-avanced-mod-pack.html'
+$audioArchiveName = 'gta-sa-ps2-style-mod-pack_1786856007_737162.7z'
+foreach ($documentationText in @($readmeText, (Get-Content -LiteralPath (Join-Path $Root 'BUILDING.md') -Raw))) {
+    if ($documentationText -notmatch [regex]::Escape($audioDownloadPage) -or
+        $documentationText -notmatch [regex]::Escape($audioArchiveName) -or
+        $documentationText -notmatch [regex]::Escape('Original plan mod pack') -or
+        $documentationText -notmatch [regex]::Escape('CLASSIC ADVANCED v1.0')) {
+        throw 'The supported audio download instructions are incomplete or ambiguous.'
+    }
+}
+$assemblerText = Get-Content -LiteralPath (Join-Path $Root 'tools\assemble.py') -Raw
+$windowsMasterText = Get-Content -LiteralPath (Join-Path $Root 'tools\build-and-install.ps1') -Raw
+$shellMasterText = Get-Content -LiteralPath (Join-Path $Root 'tools\build-and-install.sh') -Raw
+foreach ($installerText in @($assemblerText, $windowsMasterText, $shellMasterText)) {
+    if ($installerText -notmatch [regex]::Escape($audioDownloadPage) -or
+        $installerText -notmatch [regex]::Escape($audioArchiveName) -or
+        $installerText -notmatch [regex]::Escape('Original plan mod pack') -or
+        $installerText -notmatch [regex]::Escape('CLASSIC ADVANCED v1.0')) {
+        throw 'A build path no longer identifies the exact supported audio download.'
+    }
+}
 $exportToolFiles = @('EXPORT_PLAY_APKS.bat', 'tools\export-play-apks.ps1')
 foreach ($relative in $exportToolFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $Root $relative) -PathType Leaf)) {

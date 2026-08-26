@@ -19,9 +19,14 @@ assets, the sound mod, a prebuilt APK, native binaries, or signing keys.
   archive. A single `base.apk` is not sufficient.
 - A separate archive or extracted directory containing the supported PS2-style
   sound mod. The recommended input is the exact file
-  `gta-sa-ps2-style-mod-pack_1786856007_737162.7z`. The wizard copies only 59
-  verified files from `CONFIG`, `SFX`, and `STREAMS`; CLEO scripts, saves,
-  models, launch configuration, and all other mod-pack content are ignored.
+  `gta-sa-ps2-style-mod-pack_1786856007_737162.7z`. Download it from the
+  [LibertyCity mod page](https://libertycity.net/files/gta-san-andreas-ios-android/241069-gta-sa-classic-avanced-mod-pack.html),
+  then select **Original plan mod pack** dated **16 August 2026** (1.41 GB).
+  Do **not** select the newer **CLASSIC ADVANCED v1.0** download on the same
+  page; its audio banks are different and are not supported. The wizard copies
+  only 59 verified files from `CONFIG`, `SFX`, and `STREAMS`; CLEO scripts,
+  saves, models, launch configuration, and all other mod-pack content are
+  ignored.
   In the original Play split set, `assets/audio` contains only the service
   `config` subset. The required `SFX` and `STREAMS` data is not present in the
   APKs, so seeing that directory in an archive browser or simply unpacking the
@@ -98,7 +103,9 @@ certificate and content checks still apply.
 1. Double-click `BUILD_AND_INSTALL.bat`.
 2. Select the APK, archive, or directory containing the complete original-game
    export.
-3. Select the sound-mod archive or directory.
+3. Select `gta-sa-ps2-style-mod-pack_1786856007_737162.7z` or its extracted
+   audio directory. On the LibertyCity page this is the **Original plan mod
+   pack**, not **CLASSIC ADVANCED v1.0**.
 4. Connect the Quest and approve USB debugging inside the headset.
 5. Review the installation summary.
 

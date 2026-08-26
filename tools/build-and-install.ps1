@@ -1292,8 +1292,12 @@ function Invoke-Main {
     $resolvedGamePackage = Resolve-RequiredInputPath -Value $GamePackage -Name 'GamePackage' `
         -Prompt 'Select your legally obtained GTA SA APK, split-APK folder, or APK archive' `
         -Filter 'GTA SA package (*.apk;*.zip;*.apks;*.xapk;*.apkm;*.7z;*.rar)|*.apk;*.zip;*.apks;*.xapk;*.apkm;*.7z;*.rar|All files (*.*)|*.*'
+    Write-Host ''
+    Write-Host 'Required sound archive: gta-sa-ps2-style-mod-pack_1786856007_737162.7z' -ForegroundColor Yellow
+    Write-Host 'Download page: https://libertycity.net/files/gta-san-andreas-ios-android/241069-gta-sa-classic-avanced-mod-pack.html'
+    Write-Host 'On that page select Original plan mod pack (16 August 2026, 1.41 GB), NOT CLASSIC ADVANCED v1.0.' -ForegroundColor Yellow
     $resolvedAudioSource = Resolve-RequiredInputPath -Value $AudioSource -Name 'AudioSource' `
-        -Prompt 'Select the supplied GTA SA sound-mod archive or extracted audio folder' `
+        -Prompt 'Select gta-sa-ps2-style-mod-pack_1786856007_737162.7z (Original plan mod pack) or its extracted audio folder' `
         -Filter 'Sound mod (*.zip;*.7z;*.rar)|*.zip;*.7z;*.rar|All files (*.*)|*.*'
 
     Write-Step 'Preparing pinned build tools'

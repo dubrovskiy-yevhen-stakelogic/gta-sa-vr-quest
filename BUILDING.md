@@ -26,7 +26,9 @@ Step-by-step ADB export commands for Windows, Linux, and macOS are provided in
 
 `-AudioSource`/`--audio-source` accepts a directory or archive. The recommended
 input is the exact archive
-`gta-sa-ps2-style-mod-pack_1786856007_737162.7z`. The validator searches for
+[`gta-sa-ps2-style-mod-pack_1786856007_737162.7z`](https://libertycity.net/files/gta-san-andreas-ios-android/241069-gta-sa-classic-avanced-mod-pack.html).
+On that page choose **Original plan mod pack** dated **16 August 2026** (1.41
+GB), not **CLASSIC ADVANCED v1.0**. The validator searches for
 the unique subtree containing `CONFIG/BankLkup.dat`, `SFX/GENRL.osw`, and
 `STREAMS/CUTSCENE.osw`, then compares all 59 paths, sizes and SHA-256 values
 against `tools/audio-reference.json`. Only the verified files under `CONFIG`,
