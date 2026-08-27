@@ -189,6 +189,14 @@ try {
     & $Adb -s $Serial push $src "$data/texdb/hdweapons/"
     if ($LASTEXITCODE -ne 0) { throw "Failed to copy HD weapon textures to '$Serial'." }
 
+    # Make the pushed tree readable/traversable by the GAME process. adb pushes
+    # as the "shell" user; on some devices the game app is NOT granted group
+    # access to shell-owned folders under Android/data, so the game's stat()
+    # fails with EACCES (Permission denied) and the mod shows < NO FILES > even
+    # though the files are clearly present. Opening read + directory-traverse
+    # for all fixes it, and is harmless where access already works.
+    & $Adb -s $Serial shell "chmod -R a+rX $data/hdweapons $data/texdb" 2>&1 | Out-Null
+
     # --- Verify the payload actually landed (drives the in-game
     #     'WEAPON MODELS < NO FILES >' check) --------------------------------
     $imgStat = (& $Adb -s $Serial shell "ls -l $data/hdweapons/hdweapons.img 2>/dev/null" | Out-String).Trim()
