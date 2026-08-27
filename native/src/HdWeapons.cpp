@@ -336,8 +336,17 @@ void Apply() {
 }  // namespace
 
 bool Available() {
-    static bool present = PayloadPresent();
-    return present;
+    // Re-check until the payload appears, then latch true. The game is almost
+    // always launched at least once BEFORE the HD models are installed, and on
+    // Quest the process survives taking the headset off (it only pauses), so a
+    // one-shot cache would stay "no files" for the whole session even after the
+    // files are pushed -- the menu would keep showing < NO FILES > until a full
+    // force-quit. Re-stat only while not-yet-found (cheap), then it is a pure
+    // atomic read.
+    static std::atomic<bool> present{false};
+    if (!present.load(std::memory_order_relaxed) && PayloadPresent())
+        present.store(true, std::memory_order_relaxed);
+    return present.load(std::memory_order_relaxed);
 }
 
 bool Applied() { return g_applied.load(std::memory_order_acquire); }
