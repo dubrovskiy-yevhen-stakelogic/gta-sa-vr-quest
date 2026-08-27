@@ -67,8 +67,9 @@ bool FlightCameraTilt();
 // the first-run ABOUT panel.
 bool WelcomeSeen();
 void MarkWelcomeSeen();
-bool CutsceneFirstPerson();
-void ToggleCutsceneFirstPerson();
+int  CutsceneMode();          // 0 cinema, 1 cinematic vr, 2 first person
+void CycleCutsceneMode(int direction);
+const char* CutsceneModeName();
 void ToggleFlightCameraTilt();
 
 // Rotate the physical left stick from the body frame into the current HMD

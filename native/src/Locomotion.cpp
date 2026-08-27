@@ -43,7 +43,9 @@ std::atomic<bool> g_flightCameraTilt{false};
 // Cutscenes from the first person (head-tracked stereo at the cutscene
 // camera) instead of the theater screen. Shipped OFF: theater remains the
 // comfort default.
-std::atomic<bool> g_cutsceneFirstPerson{false};
+// 0 = CINEMA (theater), 1 = CINEMATIC (head-tracked director camera),
+// 2 = FIRST PERSON (anchored on cutscene-CJ's head bone).
+std::atomic<int> g_cutsceneMode{0};
 std::atomic<bool> g_welcomeSeen{false};
 // Face-button bindings, VC-port layout tables: A/B/X/Y each name the action
 // they trigger on foot.
@@ -72,7 +74,7 @@ void Save() {
     std::fprintf(file,"ParachuteImmersiveControl=%d\n",
                  g_parachuteImmersiveControl.load()?1:0);
     std::fprintf(file,"FlightCameraTilt=%d\n",g_flightCameraTilt.load()?1:0);
-    std::fprintf(file,"CutsceneFirstPerson=%d\n",g_cutsceneFirstPerson.load()?1:0);
+    std::fprintf(file,"CutsceneMode=%d\n",g_cutsceneMode.load());
     std::fprintf(file,"WelcomeShown=%d\n",g_welcomeSeen.load()?1:0);
     std::fprintf(file,"BindA=%d\n",g_binding[0].load());
     std::fprintf(file,"BindB=%d\n",g_binding[1].load());
@@ -85,7 +87,7 @@ void Load() {
     int movement=MOVEMENT_HEAD,turn=TURN_SMOOTH,sensitivity=100,snap=30,bob=0;
     int chuteFollow=1,autoChute=0,chuteImmersive=0,flightTilt=0;
     int gestureRun=1,gestureSwim=1;
-    int cutsceneFp=0;
+    int cutsceneMode=0;
     int welcomeSeen=0;
     int bind[BIND_SRC_COUNT]={kBindingDefault[0],kBindingDefault[1],
                               kBindingDefault[2],kBindingDefault[3]};
@@ -109,7 +111,9 @@ void Load() {
             else if (std::sscanf(line,"FlightCameraTilt=%d",&value)==1)
                 flightTilt=value;
             else if (std::sscanf(line,"CutsceneFirstPerson=%d",&value)==1)
-                cutsceneFp=value;
+                cutsceneMode=value?2:0;   // legacy boolean key
+            else if (std::sscanf(line,"CutsceneMode=%d",&value)==1)
+                cutsceneMode=value;
             else if (std::sscanf(line,"WelcomeShown=%d",&value)==1)
                 welcomeSeen=value;
             else if (std::sscanf(line,"BindA=%d",&value)==1) bind[0]=value;
@@ -130,7 +134,7 @@ void Load() {
     g_autoParachute.store(autoChute!=0);
     g_parachuteImmersiveControl.store(chuteImmersive!=0);
     g_flightCameraTilt.store(flightTilt!=0);
-    g_cutsceneFirstPerson.store(cutsceneFp!=0);
+    g_cutsceneMode.store(cutsceneMode<0?0:(cutsceneMode>2?2:cutsceneMode));
     g_welcomeSeen.store(welcomeSeen!=0);
     for (int i=0;i<BIND_SRC_COUNT;++i)
         g_binding[i].store(
@@ -288,11 +292,18 @@ void MarkWelcomeSeen() {
     EnsureInit();
     if (!g_welcomeSeen.exchange(true)) Save();
 }
-bool CutsceneFirstPerson() { EnsureInit(); return g_cutsceneFirstPerson.load(); }
-void ToggleCutsceneFirstPerson() {
+int CutsceneMode() { EnsureInit(); return g_cutsceneMode.load(); }
+void CycleCutsceneMode(int direction) {
     EnsureInit();
-    g_cutsceneFirstPerson.store(!g_cutsceneFirstPerson.load());
+    g_cutsceneMode.store((g_cutsceneMode.load()+direction+3)%3);
     Save();
+}
+const char* CutsceneModeName() {
+    switch (CutsceneMode()) {
+        case 1:  return "CINEMATIC";
+        case 2:  return "FIRST PERSON";
+        default: return "CINEMA";
+    }
 }
 void ToggleFlightCameraTilt() {
     EnsureInit();
