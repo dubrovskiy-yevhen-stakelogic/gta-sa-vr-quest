@@ -240,6 +240,21 @@ struct GameSymbols {
     // 4 finishing). The linked-LOD prefetch uses it only as an idempotence and
     // request-budget witness; the game remains the sole owner of the table.
     std::uint8_t* CStreaming_ms_aInfoForModel;
+    // HD weapon model set: extra CD image registration + texture database in
+    // the engine's own loose-PNG text format (format 0).
+    int   (*CStreaming_AddImageToList)(const char* name, bool notPlayerImg);
+    void  (*CStreaming_RemoveModel)(int modelId);
+    void  (*CStreaming_FlushChannels)();
+    std::uint8_t* CStreaming_ms_files;   // stride 0x30, 8 slots, +0x2c handle
+    void* (*CModelInfo_GetModelInfoByName)(const char* name, int* outIndex);
+    void* (*TextureDatabaseRuntime_Load)(const char* name, bool preload,
+                                         int format);
+    void* (*TextureDatabaseRuntime_GetDatabase)(const char* name);
+    void* TextureDatabaseRuntime_SortEntries;  // hook target, see HdWeapons
+    // Cutscene actors: pointer array + count. CJ's actor is the entry whose
+    // CEntity::m_nModelIndex (u16 at +0x32) is 0 — the player model.
+    std::uint8_t* CCutsceneMgr_ms_pCutsceneObjects;
+    std::int32_t* CCutsceneMgr_ms_numCutsceneObjs;
     void* (*CClumpModelInfo_CreateInstance)(void* modelInfo);
     void  (*CBaseModelInfo_AddRef)(void* modelInfo);
     void  (*CBaseModelInfo_RemoveRef)(void* modelInfo);
