@@ -2474,12 +2474,21 @@ bool MobileMenuOpen() {
 }
 
 bool ShouldRunStereo() {
+    // Retail deliberately skips ConstructRenderList/RenderScene at a fully
+    // opaque camera fade, but continues updating the flat GameSurface with
+    // DoFade/UI. Follow that path in theater instead of letting XR reject a
+    // frozen stereo pair as black. This function is called only on GameThread.
+    if (g.CCamera_GetScreenFadeStatus && g.TheCamera &&
+        g.CCamera_GetScreenFadeStatus(g.TheCamera) == 2) {
+        return false;
+    }
     if (g.FindPlayerPed == nullptr) return false;
     if (g.FindPlayerPed(-1) == nullptr) return false;   // not in gameplay
     if (g.CCutsceneMgr_ms_running != nullptr && *g.CCutsceneMgr_ms_running) {
-        // Optional: head-tracked stereo from the cutscene camera (the widely
-        // liked "first person cutscenes"); theater stays the shipped default.
-        return locomotion::CutsceneFirstPerson();
+        // Optional: head-tracked stereo during cutscenes — CINEMATIC rides the
+        // director camera, FIRST PERSON sits on cutscene-CJ's head; theater
+        // (CINEMA) stays the shipped default.
+        return locomotion::CutsceneMode() != 0;
     }
     // Pause menu: the player ped still exists, but the world stops rendering,
     // so the stereo ring would freeze on its last pair while the menu draws
@@ -2589,11 +2598,20 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
             // gets rebuilt around the first-person anchor below.
             const CamBasis stockCamera = base;
 
+            // First-person cutscenes ride the DIRECTOR camera: the cutscene
+            // system parks the real player ped in a staging spot, so the
+            // player anchor below would view an empty holding room instead of
+            // the shot. Keeping `base` at the stock camera gives head-tracked
+            // stereo from wherever the game itself is filming.
+            const bool cutsceneRunning = g.CCutsceneMgr_ms_running &&
+                *g.CCutsceneMgr_ms_running;
+
             // Stable first-person anchor. Vehicle state is deliberately resolved
             // before the ped matrix: during enter-car the seated skin and vehicle
             // are already valid while CPed::m_matrix can still be null/stale. A
             // ped-first gate here used to leave `base` at the stock chase camera.
-            if (void* ped = (g.FindPlayerPed ? g.FindPlayerPed(-1) : nullptr)) {
+            if (void* ped = (!cutsceneRunning && g.FindPlayerPed)
+                    ? g.FindPlayerPed(-1) : nullptr) {
                 void* vehicle = g.FindPlayerVehicle ?
                     g.FindPlayerVehicle(-1, false) : nullptr;
                 const bool enteringVehicle = g.PlayerIsEnteringCar &&
@@ -3164,6 +3182,94 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                         // matrix (it must not inherit head pitch/roll).
                         g_vrBase = base; g_vrBaseValid = true;
                         driving::RefreshVisualTracking();
+                }
+            }
+
+            // FIRST PERSON cutscenes sit on the CUTSCENE CJ's live head bone.
+            // The visible CJ is a CCutsceneObject actor (the real player ped
+            // is parked off-stage during cutscenes); his entry is the actor
+            // with the player model index 0. Yaw comes from the actor root so
+            // the view faces where CJ faces; the director camera stays for
+            // CINEMATIC and whenever the actor/bone is missing this frame.
+            if (cutsceneRunning && locomotion::CutsceneMode() == 2 &&
+                g.CCutsceneMgr_ms_pCutsceneObjects &&
+                g.CCutsceneMgr_ms_numCutsceneObjs &&
+                g.GetAnimHierarchyFromSkinClump && g.RpHAnimIDGetIndex &&
+                g.RpHAnimHierarchyGetMatrixArray) {
+                // CJ's actor uses the dedicated cutscene player model
+                // ("csplay" from cuts.img), not the streamed player model 0.
+                static int csplayModelId = -1;
+                if (csplayModelId < 0 && g.CModelInfo_GetModelInfoByName) {
+                    int resolved = -1;
+                    if (g.CModelInfo_GetModelInfoByName("csplay", &resolved) &&
+                        resolved >= 0) {
+                        csplayModelId = resolved;
+                        LOGI("[cutscene.fp] csplay model id=%d", resolved);
+                    }
+                }
+                std::uint8_t* actor = nullptr;
+                const int actorCount =
+                    std::clamp(*g.CCutsceneMgr_ms_numCutsceneObjs, 0, 50);
+                auto** actors = reinterpret_cast<std::uint8_t**>(
+                    g.CCutsceneMgr_ms_pCutsceneObjects);
+                for (int i = 0; i < actorCount; ++i) {
+                    std::uint8_t* candidate = actors[i];
+                    if (candidate == nullptr) continue;
+                    const int candidateModel =
+                        *reinterpret_cast<std::uint16_t*>(candidate + 0x32);
+                    if (candidateModel == csplayModelId ||
+                        candidateModel == 0) {
+                        actor = candidate;
+                        break;
+                    }
+                }
+                static unsigned int actorLogCounter = 0;
+                if ((++actorLogCounter % 120u) == 1u) {
+                    char ids[128]{};
+                    int len = 0;
+                    for (int i = 0; i < actorCount && len < 100; ++i) {
+                        len += std::snprintf(ids + len, sizeof(ids) - len,
+                            " %d", actors[i] ? static_cast<int>(
+                                *reinterpret_cast<std::uint16_t*>(
+                                    actors[i] + 0x32)) : -1);
+                    }
+                    LOGI("[cutscene.fp] actors=%d csplay=%d anchor=%d ids:%s",
+                         actorCount, csplayModelId, actor != nullptr, ids);
+                }
+                void* actorClump = actor
+                    ? *reinterpret_cast<void**>(actor + 0x20) : nullptr;
+                void* hierarchy = actorClump
+                    ? g.GetAnimHierarchyFromSkinClump(actorClump) : nullptr;
+                const int headIndex = hierarchy
+                    ? g.RpHAnimIDGetIndex(hierarchy, 5 /* BONE_HEAD */) : -1;
+                auto* boneMatrices = headIndex >= 0
+                    ? static_cast<RwMat*>(
+                          g.RpHAnimHierarchyGetMatrixArray(hierarchy))
+                    : nullptr;
+                if (boneMatrices != nullptr) {
+                    const RwMat& headBone = boneMatrices[headIndex];
+                    const V3 head{headBone.t[0], headBone.t[1], headBone.t[2]};
+                    float fx = 0.0f, fy = 0.0f;
+                    const std::uintptr_t actorMtx =
+                        *reinterpret_cast<std::uintptr_t*>(actor + 0x18);
+                    if (actorMtx != 0) {
+                        fx = *reinterpret_cast<float*>(actorMtx + 0x10);
+                        fy = *reinterpret_cast<float*>(actorMtx + 0x14);
+                    }
+                    const float yawLen = std::sqrt(fx * fx + fy * fy);
+                    if (Finite(head) && Dot(head, head) > 0.01f &&
+                        std::isfinite(yawLen) && yawLen > 0.1f) {
+                        const V3 fwd{fx / yawLen, fy / yawLen, 0.0f};
+                        // right = up x forward (the game's handedness); the
+                        // opposite cross mirrored the view left/right.
+                        base.right   = V3{-fwd.y, fwd.x, 0.0f};
+                        base.forward = fwd;
+                        base.up      = V3{0.0f, 0.0f, 1.0f};
+                        base.pos     = head + V3{0.0f, 0.0f, 0.06f} +
+                                       fwd * 0.05f;
+                        g_vrBase = base;
+                        g_vrBaseValid = true;
+                    }
                 }
             }
 
@@ -16698,15 +16804,36 @@ void OnRenderScene(bool underwater) {
     // for both eyes and the flat mirror; the animation pass rebuilds them
     // next frame. IMMERSIVE driving hides the whole body instead. The chase
     // view sees CJ from outside — his head must stay on there.
-    if (playerPed && playerInVehicle &&
-        driving::GetMode() != driving::MODE_IMMERSIVE &&
-        !driving::ThirdPersonViewActive() &&
+    const bool cutsceneFirstPersonHead = g.CCutsceneMgr_ms_running &&
+        *g.CCutsceneMgr_ms_running && locomotion::CutsceneMode() == 2;
+    // In first-person cutscenes the camera sits on the CUTSCENE CJ actor
+    // (player model index 0 in the actor list), so that is the head to
+    // collapse; in a vehicle it is the ordinary player ped.
+    void* headHideClump = nullptr;
+    if (cutsceneFirstPersonHead && g.CCutsceneMgr_ms_pCutsceneObjects &&
+        g.CCutsceneMgr_ms_numCutsceneObjs) {
+        const int actorCount =
+            std::clamp(*g.CCutsceneMgr_ms_numCutsceneObjs, 0, 50);
+        auto** actors = reinterpret_cast<std::uint8_t**>(
+            g.CCutsceneMgr_ms_pCutsceneObjects);
+        for (int i = 0; i < actorCount; ++i) {
+            std::uint8_t* candidate = actors[i];
+            if (candidate != nullptr &&
+                *reinterpret_cast<std::uint16_t*>(candidate + 0x32) == 0) {
+                headHideClump = *reinterpret_cast<void**>(candidate + 0x20);
+                break;
+            }
+        }
+    } else if (playerPed && playerInVehicle &&
+               driving::GetMode() != driving::MODE_IMMERSIVE &&
+               !driving::ThirdPersonViewActive()) {
+        headHideClump = *reinterpret_cast<void**>(
+            static_cast<char*>(playerPed) + 0x20);
+    }
+    if (headHideClump &&
         g.GetAnimHierarchyFromSkinClump && g.RpHAnimIDGetIndex &&
         g.RpHAnimHierarchyGetMatrixArray) {
-        void* pedClump = *reinterpret_cast<void**>(
-            static_cast<char*>(playerPed) + 0x20);
-        void* hierarchy = pedClump
-            ? g.GetAnimHierarchyFromSkinClump(pedClump) : nullptr;
+        void* hierarchy = g.GetAnimHierarchyFromSkinClump(headHideClump);
         const int headIndex = hierarchy
             ? g.RpHAnimIDGetIndex(hierarchy, 5 /* BONE_HEAD */) : -1;
         if (headIndex >= 0) {

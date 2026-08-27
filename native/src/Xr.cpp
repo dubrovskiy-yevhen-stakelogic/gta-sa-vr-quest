@@ -4712,7 +4712,7 @@ void BuildLocomotionMenu() {
     std::snprintf(rows[10],sizeof(rows[10]),"FLIGHT CAMERA   < %s >",
                   locomotion::FlightCameraTilt()?"FULL TILT":"LEVEL");
     std::snprintf(rows[11],sizeof(rows[11]),"CUTSCENES   < %s >",
-                  locomotion::CutsceneFirstPerson()?"FIRST PERSON":"CINEMA");
+                  locomotion::CutsceneModeName());
     std::snprintf(rows[12],sizeof(rows[12]),"RECENTER VIEW");
     std::snprintf(rows[13],sizeof(rows[13]),"BACK");
     // 13 rows on the 512px panel: the old 52px pitch already pushed the

@@ -1263,7 +1263,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             else if (locomotionSel==10&&(step||enter))
                 savr::locomotion::ToggleFlightCameraTilt();
             else if (locomotionSel==11&&(step||enter))
-                savr::locomotion::ToggleCutsceneFirstPerson();
+                savr::locomotion::CycleCutsceneMode(step<0?-1:+1);
             else if (locomotionSel==12&&enter)
                 vrcam::RequestRecenter();
             else if (locomotionSel==13&&enter)
@@ -1751,17 +1751,9 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         }
     }
 
-    // Keep the authored intro and later cutscenes. A remains an explicit,
-    // reliable headset skip even when the mobile touch prompt is unavailable.
-    if (g.CCutsceneMgr_ms_running != nullptr && g.CCutsceneMgr_Skip != nullptr) {
-        static bool skipWasDown=false;
-        const bool running = *g.CCutsceneMgr_ms_running;
-        if (running&&in.a&&!skipWasDown) {
-            LOGI("cutscene skip requested by A");
-            g.CCutsceneMgr_Skip();
-        }
-        skipWasDown=running&&in.a;
-    }
+    // Cutscene skipping is owned by the game's own on-screen arrow; a face
+    // button here kept skipping scenes people were actually watching in the
+    // first-person modes.
 }
 
 void OnDrawFrame(JNIEnv* env, jclass clazz, jfloat deltaTime) {
