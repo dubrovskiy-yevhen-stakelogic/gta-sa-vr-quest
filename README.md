@@ -237,6 +237,15 @@ the wizard.
 
 See [BUILDING.md](BUILDING.md) and [NOTICE.md](NOTICE.md) for details.
 
+## Credits
+
+The VR layer is written independently against the retail mobile game binary,
+but understanding the original San Andreas behaviour is much easier thanks to
+the community reverse-engineering of the PC version,
+[gta-reversed / gta-reversed-modern](https://github.com/gta-reversed/gta-reversed-modern),
+which we consult as a behavioural reference. Thanks to its authors and
+contributors. Full attribution is in [NOTICE.md](NOTICE.md).
+
 ## Validation boundary
 
 The source kit validates sources, builds, signatures, APK payloads, and file

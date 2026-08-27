@@ -13,6 +13,17 @@
   models, copyright VRMADA, MIT License. Provenance and license are preserved
   beside the assets.
 
+## Acknowledgements
+
+- **gta-reversed / gta-reversed-modern** — the community reverse-engineering of
+  the PC version of GTA San Andreas
+  (https://github.com/gta-reversed/gta-reversed-modern). We consult it as a
+  behavioural reference to understand the original game's logic (physics,
+  vehicles, missions, streaming, etc.) when reproducing that behaviour for VR.
+  No source code from that project is copied into or distributed with this kit:
+  the VR layer targets the retail mobile ARM64 binary and is written
+  independently. Credit and thanks to its authors and contributors.
+
 This repository contains no GTA San Andreas APK, Rockstar source code or game
 assets, no extracted `libGame.so`, and no sound-mod archive or audio banks.
 Users must provide their own lawful inputs locally.
