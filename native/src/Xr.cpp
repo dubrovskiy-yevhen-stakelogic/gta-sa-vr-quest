@@ -52,9 +52,10 @@ namespace {
 
 constexpr char kModVersion[] = "0.1.1.0";  // internal build id (4th digit)
 #ifdef SAVR_DEV
-constexpr const char* kModVersionShown = kModVersion;
+constexpr const char* kModVersionShown = "0.1.1 WEAPONS FIX";
 #else
-constexpr const char* kModVersionShown = "0.1.1";  // players see the release id
+// Temporary tester marker (revert to plain "0.1.1" for the real release).
+constexpr const char* kModVersionShown = "0.1.1 WEAPONS FIX";
 #endif
 
 JavaVM*   g_hudTextVm{};
