@@ -14,6 +14,7 @@
 #include "HdWeapons.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -68,7 +69,26 @@ struct DirEntry {
 
 bool PayloadPresent() {
     struct stat st{};
-    return stat(kImgPathReal, &st) == 0 && stat(kTexDbListing, &st) == 0;
+    const int imgRc = stat(kImgPathReal, &st);
+    const int imgErr = errno;
+    const int txtRc = stat(kTexDbListing, &st);
+    const int txtErr = errno;
+    const bool ok = imgRc == 0 && txtRc == 0;
+    // Throttled diagnostic while the payload is not visible: the file manager /
+    // adb (shell view) can show the files while the game process (app view)
+    // still cannot stat them. errno pinpoints why -- ENOENT = wrong path / the
+    // app's view does not have them, EACCES = directory traversal / permission.
+    if (!ok) {
+        static int logged = 0;
+        if (logged < 5) {
+            ++logged;
+            LOGE("[hdweapons] payload NOT visible to the game: "
+                 "img rc=%d errno=%d(%s) [%s] | txt rc=%d errno=%d(%s) [%s]",
+                 imgRc, imgErr, std::strerror(imgErr), kImgPathReal,
+                 txtRc, txtErr, std::strerror(txtErr), kTexDbListing);
+        }
+    }
+    return ok;
 }
 
 // On-device breadcrumb: the boot-time apply races the logcat ring buffer, so
