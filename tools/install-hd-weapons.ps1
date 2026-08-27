@@ -23,7 +23,7 @@ function Find-Tool([string]$underTools, [string]$onPath) {
 }
 
 $Python = Find-Tool 'python-3.12.10-embed-amd64\python.exe' 'python'
-$Adb    = Find-Tool 'platform-tools\adb.exe' 'adb'
+$Adb    = Find-Tool 'platform-tools-37.0.1\platform-tools\adb.exe' 'adb'
 $SevenZip = Join-Path $ToolsRoot '7zr-26.02.exe'
 
 if (-not $Python -or -not $Adb) {
