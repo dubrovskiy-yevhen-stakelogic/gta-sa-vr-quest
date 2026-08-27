@@ -223,11 +223,18 @@ and load only while the option is on, so you can turn them off any time.
    files (for example the "Original HD Weapons" mobile pack).
    `<< add the exact download link here >>`
 3. Connect the Quest and double-click **`INSTALL_HD_WEAPONS.bat`**. Drag the
-   downloaded archive into the window when it asks, and press Enter. The
-   installer extracts the pack, builds the weapon image + textures, and copies
-   everything to the headset on its own.
+   downloaded pack into the window when it asks, and press Enter. The installer
+   builds the weapon image + textures and copies everything to the headset on
+   its own, then verifies the files landed.
+   - You can drag in **either the archive** (`.zip`/`.7z`) **or an
+     already-extracted folder**. If it says it can't open a `.7z`/`.rar`
+     (no 7‑Zip installed), just extract the pack yourself — right-click →
+     Extract — and drag the extracted **folder** in instead.
 4. Put on the headset, open the VR menu → **GRAPHICS** → set
-   **WEAPON MODELS** to **HD**, then fully restart the game.
+   **WEAPON MODELS** to **HD** (the row shows a **[RESTART]** tag), then fully
+   close and reopen the game. Re-open GRAPHICS: the tag is gone once HD is
+   active. If the row shows **< NO FILES >**, the payload did not land — rerun
+   the installer.
 
 To go back to the stock weapons, set **WEAPON MODELS** to **ORIGINAL** (a
 restart applies it), or delete the `files/hdweapons` and
@@ -242,9 +249,9 @@ Notes:
 - A couple of very large models in some packs are skipped automatically (they
   exceed the game's streaming buffer) and keep their original model; everything
   else swaps. Prefer optimised, lower-poly packs for best VR performance.
-- Advanced: `tools/install-hd-weapons.ps1 -Archive <path>` runs it head-less,
-  and `tools/build_hdweapons.py <pack-folder> --out <dir>` builds the payload
-  without pushing.
+- Advanced: `tools/install-hdweapons.ps1 -Archive <path-or-folder>` runs it
+  head-less, and `tools/build_hdweapons.py <pack-folder> --out <dir>` builds the
+  payload without pushing.
 
 ## Supported original game
 
