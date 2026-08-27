@@ -27,10 +27,11 @@ namespace {
 
 constexpr char kEffectsProperty[] = "debug.savr.effects";
 constexpr char kFxProbeProperty[] = "debug.savr.fxprobe";
-// Keep parallel performance work bit-identical until the effect A/B is
-// explicitly requested on the device. Profile 1 is the intended candidate,
-// but process-start opt-in avoids silently contaminating another agent's run.
-constexpr int kDefaultProfile = 0;
+// Profile 1 is the intended, shipping candidate (fire, parachute ropes, glass,
+// skidmarks). Default it ON so players get effects without setting a property;
+// the debug.savr.effects property still overrides -- set it to 0 for a clean
+// perf A/B baseline, or 2/3 for the heavier candidates.
+constexpr int kDefaultProfile = 1;
 constexpr std::uint64_t kReportIntervalCalls = 240; // 120 stereo frames
 constexpr std::uint64_t kFlameLifecycleGraceMs = 120;
 
