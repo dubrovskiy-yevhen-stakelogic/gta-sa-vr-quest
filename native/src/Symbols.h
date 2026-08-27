@@ -255,6 +255,10 @@ struct GameSymbols {
     // CEntity::m_nModelIndex (u16 at +0x32) is 0 — the player model.
     std::uint8_t* CCutsceneMgr_ms_pCutsceneObjects;
     std::int32_t* CCutsceneMgr_ms_numCutsceneObjs;
+    // Per-model streaming read buffer size (sectors). A model larger than this
+    // overflows ms_pStreamingBuffer when streamed. LoadCdDirectory grows it at
+    // boot for the base archive; direct HD repoints must respect the value.
+    std::int32_t* CStreaming_ms_streamingBufferSize;
     void* (*CClumpModelInfo_CreateInstance)(void* modelInfo);
     void  (*CBaseModelInfo_AddRef)(void* modelInfo);
     void  (*CBaseModelInfo_RemoveRef)(void* modelInfo);

@@ -1,6 +1,6 @@
 # GTA San Andreas VR for Quest — Source Kit
 
-Version `0.1.0 alpha`.
+Version `0.1.1 alpha`.
 
 This repository contains the source code and build/install tools for the GTA
 San Andreas VR Quest mod. It does **not** contain GTA San Andreas, Rockstar
@@ -201,13 +201,50 @@ word `RESET`. It then stops GTA SA, removes only the eight exact VR settings
 files listed in [BUILDING.md](BUILDING.md), and verifies the result. Saves,
 `audio`, `vrhands`, game data, APKs, and performance CSV files remain intact.
 The game is not launched; new compiled defaults take effect after the next
-manual start. Version 0.1.0 embeds the author's release-Quest menu,
+manual start. Version 0.1.1 embeds the author's release-Quest menu,
 weapon, HUD, holster, and vehicle calibration as its defaults. The sole quality
 override is the eye-buffer resolution, which resets to `100%`.
 
 For automation, use `-Yes -NonInteractive` in PowerShell or
 `--yes --non-interactive` in Bash. With multiple devices, specify
 `-Serial`/`--serial`.
+
+## HD weapon models (optional)
+
+The mod can swap the low-poly weapons for higher-detail models. The models are
+**not** part of this kit — you download a community weapon pack yourself and an
+installer builds it into the game's own format and copies it to the headset.
+Nothing in the game APK is changed: the models live in the app's files folder
+and load only while the option is on, so you can turn them off any time.
+
+1. Install and run the mod once (`BUILD_AND_INSTALL.bat`) so Python and adb are
+   available and the game has been started at least once.
+2. Download a weapon model pack — an archive that contains the weapon `.dff`
+   files (for example the "Original HD Weapons" mobile pack).
+   `<< add the exact download link here >>`
+3. Connect the Quest and double-click **`INSTALL_HD_WEAPONS.bat`**. Drag the
+   downloaded archive into the window when it asks, and press Enter. The
+   installer extracts the pack, builds the weapon image + textures, and copies
+   everything to the headset on its own.
+4. Put on the headset, open the VR menu → **GRAPHICS** → set
+   **WEAPON MODELS** to **HD**, then fully restart the game.
+
+To go back to the stock weapons, set **WEAPON MODELS** to **ORIGINAL** (a
+restart applies it), or delete the `files/hdweapons` and
+`files/texdb/hdweapons` folders on the headset.
+
+Notes:
+
+- Each weapon keeps a **separate** grip/aim calibration per model set, so tuning
+  the HD models never disturbs your original-weapon calibration, and vice versa.
+  Sensible HD defaults ship compiled in, so most models are placed correctly out
+  of the box.
+- A couple of very large models in some packs are skipped automatically (they
+  exceed the game's streaming buffer) and keep their original model; everything
+  else swaps. Prefer optimised, lower-poly packs for best VR performance.
+- Advanced: `tools/install-hd-weapons.ps1 -Archive <path>` runs it head-less,
+  and `tools/build_hdweapons.py <pack-folder> --out <dir>` builds the payload
+  without pushing.
 
 ## Supported original game
 

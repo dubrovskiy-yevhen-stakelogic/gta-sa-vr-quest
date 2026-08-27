@@ -17,7 +17,13 @@ constexpr int kMaxWeapons = 64;      // SA has ~47 weapon types; round up
 constexpr int kHands      = 2;       // 0 = LEFT, 1 = RIGHT
 constexpr int kMasterHand = 1;       // RIGHT is canonical; LEFT mirrors it
 
-WeaponCalib      g_calib[kHands][kMaxWeapons];
+// Two calibration profiles: [0] original models, [1] HD/modern models. A weapon
+// keeps its own grip/aim per model set because the HD meshes have different
+// pivots — switching the WEAPON MODELS option must not clobber the other set.
+// g_calib is the ACTIVE view (original 2D shape), repointed by SetModelSet.
+WeaponCalib      g_calibSets[2][kHands][kMaxWeapons];
+WeaponCalib      (*g_calib)[kMaxWeapons] = g_calibSets[0];
+std::atomic<int> g_modelSet{0};
 HolsterCalib     g_holsterCalib[kMaxWeapons];
 bool             g_supportConfigured[kMaxWeapons]{};
 std::atomic<int> g_active{0};
@@ -90,9 +96,58 @@ constexpr int kFieldOrder[F_COUNT] = {
     F_SUP_STYLE,
 };
 
+// Baked HD/modern weapon calibration defaults, captured from the
+// reference device so players get correctly-placed HD models out of the
+// box. Seeded into the HD profile (set 1) at Init; a saved "wm" row or a
+// live edit overrides per weapon. Values are the 19 fields in kFieldOrder.
+constexpr struct HdDefault { int type; int16_t v[F_COUNT]; } kHdDefaults[] = {
+    { 2, {   0,   1,   0,   0,   0,   1, -16,  -4, -10,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0}},  // GOLF CLUB
+    { 4, {   0,   0,   0,   0,   0,   0,   4,  -6,  -7,   0,  36,   0,   0,   0,   0,   0,   0,   0,   0}},  // KNIFE
+    { 5, {   0,   0,   0,   0,   0,   0,   7,  -5, -10, -18,  45,   0,   0,   0,   0,   0,   0,   0,   0}},  // BASEBALL BAT
+    { 9, {   0,   0,   0,   0,   0,   0,  25, -10,  -7,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0}},  // CHAINSAW
+    {18, {   0,   0,   0,   0,   0,   0,  28,  -6, -10, -26,   0,   0,   0,   0,   0,   0,   0,   0,   0}},  // MOLOTOV
+    {24, {  18,   3,  25,  -5,   0,   0,   0,  -7,  -9,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0}},  // DESERT EAGLE
+    {25, {  25,   3,  10, -13,  17,   0,  -3,  -2, -10,   0,   0,  -7, -16,  85,  -8,   0,-360,-360,   1}},  // SHOTGUN
+    {27, {  37,  -6, 100, -13,  17,   0,  -5,  -2, -10,   0,   0,   0, -15,  74,  -9,   0, 360,-298,   1}},  // SPAS12
+    {28, {  16,   2,  -8,  -7,   8,   0,   2,   1,  -6,   0,   0,   0,   0,  60, -10,   0, 360,   0,   0}},  // MICRO UZI
+    {29, {  30,   1,   0, -14,  15,   0,  -3,  -6,  -8,   0,   0,   0, -26,  60,  -9,   0, 360,-334,   1}},  // MP5
+    {30, {  17,   5,  92,   3,   0,   0,  -1,   4,  -6,   0,   0,   0, -11,  69,  -2,   0, 360,-329,   1}},  // AK47
+    {33, {  21,   5,  -8, -13,  15,   0,  -3,   0, -11,   0,   0,   0, -19,  76, -10, -19, 360,-169,   0}},  // RIFLE
+    {34, {  39,  -9, 100, -11,  20,   0,  -2,  -3,  -9,   0,   0,   0, -16,  60, -10,   0, 360,-337,   1}},  // SNIPER
+    {35, {   0,   0,   0,   0,   0,   0,  -6,  27,  -9,   0,   0,   0,   0,  17,  -1,   0, 360,   0,   0}},  // RPG
+    {37, {   0,   0,   0,   0,   0,   0,  11,  -5, -12,   0,  66,   0, -38,  44,   3, -21, 190,   7,   1}},  // FLAMETHROWER
+    {38, {  79,  -6, 100, -11,  75,   0,   4,  -3,  -2,   1,  76,   0, -56,  55,  -3, -31, 209,  33,   1}},  // MINIGUN
+    {39, {   0,   0,   0,   0,   0,   0,  14,  46, -37, 180,   0,-341,   0,  60, -10,   0, 360,   0,   0}},  // SATCHEL
+};
+
 bool IsDefault(const WeaponCalib& c) {
     const WeaponCalib d{};
     return std::memcmp(&c, &d, sizeof(WeaponCalib)) == 0;
+}
+
+// READ source for the active model set. When the HD/modern profile (set 1) for
+// a weapon is still untouched, fall back to the ORIGINAL profile (set 0) so HD
+// weapons start from the player's existing calibration instead of blank
+// defaults — otherwise switching WEAPON MODELS to HD made every gun look
+// uncalibrated at once. g_calibMutex is held by every caller.
+const WeaponCalib& EffectiveSource(int clampedType) {
+    const int s = g_modelSet.load(std::memory_order_relaxed);
+    if (s != 0 && IsDefault(g_calibSets[s][kMasterHand][clampedType]) &&
+        !IsDefault(g_calibSets[0][kMasterHand][clampedType]))
+        return g_calibSets[0][kMasterHand][clampedType];
+    return g_calibSets[s][kMasterHand][clampedType];
+}
+
+// WRITE target for the active model set. Before the first edit of an untouched
+// HD weapon, seed its profile from the original so adjustments start at the
+// fallback value (not zero); the original set is never modified.
+WeaponCalib& EditableProfile(int clampedType) {
+    const int s = g_modelSet.load(std::memory_order_relaxed);
+    WeaponCalib& active = g_calibSets[s][kMasterHand][clampedType];
+    if (s != 0 && IsDefault(active) &&
+        !IsDefault(g_calibSets[0][kMasterHand][clampedType]))
+        active = g_calibSets[0][kMasterHand][clampedType];
+    return active;
 }
 
 void ApplyEffectiveSupportDefaults(WeaponCalib& c, bool configured) {
@@ -138,9 +193,19 @@ const char* WeaponNameRaw(int t) {
 
 void Init() {
     std::lock_guard<std::mutex> guard(g_calibMutex);
-    for (int h = 0; h < kHands; ++h)
-        for (int t = 0; t < kMaxWeapons; ++t)
-            g_calib[h][t] = WeaponCalib{};
+    for (int s = 0; s < 2; ++s)
+        for (int h = 0; h < kHands; ++h)
+            for (int t = 0; t < kMaxWeapons; ++t)
+                g_calibSets[s][h][t] = WeaponCalib{};
+    // Seed the HD/modern profile with the baked calibration defaults so HD
+    // models are placed correctly before the player touches anything. A saved
+    // wm row (parsed below) or a live edit overrides these per weapon.
+    for (const HdDefault& hd : kHdDefaults) {
+        const int t = ClampType(hd.type);
+        WeaponCalib& c = g_calibSets[1][kMasterHand][t];
+        for (int i = 0; i < F_COUNT; ++i)
+            if (int16_t* p = FieldPtr(c, kFieldOrder[i])) *p = hd.v[i];
+    }
     for (int t = 0; t < kMaxWeapons; ++t)
         g_holsterCalib[t] = HolsterCalib{};
     for (int t = 0; t < kMaxWeapons; ++t) {
@@ -153,8 +218,8 @@ void Init() {
     if (!f) { LOGI("[calib] no profile file, defaults"); return; }
     char line[512];
     int loaded = 0;
-    bool seen[kHands][kMaxWeapons]{};
-    bool supportSeen[kHands][kMaxWeapons]{};
+    bool seen[2][kHands][kMaxWeapons]{};
+    bool supportSeen[2][kHands][kMaxWeapons]{};
     bool lockSeen[kMaxWeapons]{};
     bool anyTypedLockSeen = false;
     bool legacyLaserLocked = false;
@@ -217,43 +282,51 @@ void Init() {
             continue;
         }
         if (line[0] != 'w') continue;                       // not a profile row
+        // "w ..." = original model set; "wm ..." = HD/modern model set.
+        int set = 0;
+        const char* rest = line + 1;
+        if (line[1] == 'm') { set = 1; rest = line + 2; }
         int t, h, v[F_COUNT];
-        const int got = std::sscanf(line,
-            "w %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
+        const int got = std::sscanf(rest,
+            " %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
             &t, &h,
             &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
             &v[10], &v[11], &v[12], &v[13], &v[14], &v[15], &v[16], &v[17], &v[18]);
         if (got != 2 + F_COUNT) continue;                   // 21 = 2 + 19; skip malformed
         if (t < 0 || t >= kMaxWeapons || h < 0 || h >= kHands) continue;
-        WeaponCalib& c = g_calib[h][t];
+        WeaponCalib& c = g_calibSets[set][h][t];
         c = WeaponCalib{};                                  // start from defaults
         for (int i = 0; i < F_COUNT; ++i) {
             int lo, hi; FieldRange(kFieldOrder[i], lo, hi);
             int val = v[i] < lo ? lo : (v[i] > hi ? hi : v[i]);
             if (int16_t* p = FieldPtr(c, kFieldOrder[i])) *p = static_cast<int16_t>(val);
         }
-        seen[h][t] = true;
-        supportSeen[h][t] = c.supOffX != 0 || c.supOffY != 0 || c.supOffZ != 0 ||
+        seen[set][h][t] = true;
+        supportSeen[set][h][t] = c.supOffX != 0 || c.supOffY != 0 || c.supOffZ != 0 ||
                             c.supRotX != 0 || c.supRotY != 0 || c.supRotZ != 0 ||
                             c.supStyle != SUPPORT_MAGAZINE;
-        if (h == kMasterHand && supportSeen[h][t])
+        if (h == kMasterHand && supportSeen[set][h][t])
             g_supportConfigured[t] = true;
         ++loaded;
     }
     std::fclose(f);
 
     int migrated = 0;
-    for (int t = 0; t < kMaxWeapons; ++t) {
-        if (seen[0][t] && !seen[kMasterHand][t]) {
-            g_calib[kMasterHand][t] = g_calib[0][t];
-            if (supportSeen[0][t]) g_supportConfigured[t] = true;
-            ++migrated;
+    for (int s = 0; s < 2; ++s)
+        for (int t = 0; t < kMaxWeapons; ++t) {
+            if (seen[s][0][t] && !seen[s][kMasterHand][t]) {
+                g_calibSets[s][kMasterHand][t] = g_calibSets[s][0][t];
+                if (supportSeen[s][0][t]) g_supportConfigured[t] = true;
+                ++migrated;
+            }
         }
+    for (int t = 0; t < kMaxWeapons; ++t) {
+        const bool anySeen = seen[0][0][t] || seen[0][kMasterHand][t] ||
+                             seen[1][0][t] || seen[1][kMasterHand][t];
         // v5 stored one global cosmetic flag and could not identify its weapon.
         // Preserve the old SAVED indication for existing profiles; the next AIM
         // edit immediately makes only that weapon dirty under the v6 scheme.
-        if (legacyLaserLocked && !anyTypedLockSeen && !lockSeen[t] &&
-            (seen[0][t] || seen[kMasterHand][t]))
+        if (legacyLaserLocked && !anyTypedLockSeen && !lockSeen[t] && anySeen)
             g_laserLocked[t].store(true, std::memory_order_relaxed);
     }
     LOGI("[calib] loaded %d weapon profiles, migrated %d left-only profiles",
@@ -285,15 +358,20 @@ void Save() {
         // that made a perfectly calibrated ray jump back after every restart.
         // The per-type lock remains a useful UI confirmation marker, not a
         // second persistence gate.
-        WeaponCalib c = g_calib[kMasterHand][t];
         if (g_supportConfigured[t])
             std::fprintf(f, "support_configured %d 1\n", t);
-        if (IsDefault(c)) continue;                          // only touched slots
-        std::fprintf(f, "w %d %d", t, kMasterHand);
-        for (int i = 0; i < F_COUNT; ++i)
-            std::fprintf(f, " %d", static_cast<int>(*FieldPtr(c, kFieldOrder[i])));
-        std::fputc('\n', f);
-        ++saved;
+        // Persist both model-set profiles: "w" original, "wm" HD/modern. A set
+        // is written only where it was actually touched, so calibrating one
+        // never rewrites the other.
+        for (int s = 0; s < 2; ++s) {
+            WeaponCalib c = g_calibSets[s][kMasterHand][t];
+            if (IsDefault(c)) continue;
+            std::fprintf(f, "%s %d %d", s == 1 ? "wm" : "w", t, kMasterHand);
+            for (int i = 0; i < F_COUNT; ++i)
+                std::fprintf(f, " %d", static_cast<int>(*FieldPtr(c, kFieldOrder[i])));
+            std::fputc('\n', f);
+            ++saved;
+        }
     }
     int holsterSaved = 0;
     for (int t = 0; t < kMaxWeapons; ++t) {
@@ -319,11 +397,21 @@ void Save() {
 }
 
 void SetActiveWeapon(int weaponType) { g_active.store(ClampType(weaponType), std::memory_order_relaxed); }
+
+void SetModelSet(int set) {
+    const int clamped = (set == 1) ? 1 : 0;
+    if (g_modelSet.exchange(clamped, std::memory_order_relaxed) == clamped) return;
+    // Repoint the active 2D view so every runtime g_calib[hand][type] access
+    // now reads/writes the selected profile. Aligned pointer store is atomic on
+    // arm64; the set only flips once per session when HD applies.
+    g_calib = g_calibSets[clamped];
+    LOGI("[calib] active model set -> %s", clamped == 1 ? "HD" : "ORIGINAL");
+}
 int  ActiveWeapon() { return g_active.load(std::memory_order_relaxed); }
 
 WeaponCalib Snapshot(int /*hand*/, int type) {
     std::lock_guard<std::mutex> guard(g_calibMutex);
-    WeaponCalib effective = g_calib[kMasterHand][ClampType(type)];
+    WeaponCalib effective = EffectiveSource(ClampType(type));
     ApplyEffectiveSupportDefaults(effective, g_supportConfigured[ClampType(type)]);
     return effective;
 }
@@ -450,7 +538,7 @@ void FieldRange(int field, int& lo, int& hi) {
 int16_t GetField(int hand, int type, int field) {
     (void)hand;
     std::lock_guard<std::mutex> guard(g_calibMutex);
-    WeaponCalib effective = g_calib[kMasterHand][ClampType(type)];
+    WeaponCalib effective = EffectiveSource(ClampType(type));
     ApplyEffectiveSupportDefaults(effective, g_supportConfigured[ClampType(type)]);
     int16_t* p = FieldPtr(effective, field);
     return p ? *p : 0;
@@ -459,7 +547,7 @@ int16_t GetField(int hand, int type, int field) {
 void SetField(int hand, int type, int field, int value) {
     (void)hand;
     std::lock_guard<std::mutex> guard(g_calibMutex);
-    WeaponCalib& profile = g_calib[kMasterHand][ClampType(type)];
+    WeaponCalib& profile = EditableProfile(ClampType(type));
     if (field >= F_SUP_OX && field <= F_SUP_STYLE) {
         ApplyEffectiveSupportDefaults(profile, g_supportConfigured[ClampType(type)]);
         g_supportConfigured[ClampType(type)] = true;
@@ -480,7 +568,7 @@ void AdjustField(int hand, int type, int field, int steps) {
     {
         std::lock_guard<std::mutex> guard(g_calibMutex);
         const int clampedType = ClampType(type);
-        WeaponCalib& profile = g_calib[kMasterHand][clampedType];
+        WeaponCalib& profile = EditableProfile(clampedType);
         if (field >= F_SUP_OX && field <= F_SUP_STYLE) {
             ApplyEffectiveSupportDefaults(profile, g_supportConfigured[clampedType]);
             g_supportConfigured[clampedType] = true;

@@ -178,6 +178,7 @@ bool ResolveGameSymbols(void* handle) {
         {"_ZN22TextureDatabaseRuntime11SortEntriesEb",                           reinterpret_cast<void**>(&g.TextureDatabaseRuntime_SortEntries),    false},
         {"_ZN12CCutsceneMgr19ms_pCutsceneObjectsE",                              reinterpret_cast<void**>(&g.CCutsceneMgr_ms_pCutsceneObjects),      false},
         {"_ZN12CCutsceneMgr18ms_numCutsceneObjsE",                               reinterpret_cast<void**>(&g.CCutsceneMgr_ms_numCutsceneObjs),       false},
+        {"_ZN10CStreaming22ms_streamingBufferSizeE",                             reinterpret_cast<void**>(&g.CStreaming_ms_streamingBufferSize),     false},
         {"_ZN15CClumpModelInfo14CreateInstanceEv",                               reinterpret_cast<void**>(&g.CClumpModelInfo_CreateInstance),        false},
         {"_ZN14CBaseModelInfo6AddRefEv",                                         reinterpret_cast<void**>(&g.CBaseModelInfo_AddRef),                  false},
         {"_ZN14CBaseModelInfo9RemoveRefEv",                                      reinterpret_cast<void**>(&g.CBaseModelInfo_RemoveRef),               false},

@@ -3,6 +3,7 @@
 #include "Cheats.h"
 #include "Driving.h"
 #include "FrameTarget.h"
+#include "HdWeapons.h"
 #include "Holster.h"
 #include "HudSettings.h"
 #include "Locomotion.h"
@@ -1399,8 +1400,9 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_GRAPHICS: {
-            // scale, CPU, GPU, neon, grading, distances, defaults, Back
-            const int N = 8;
+            // scale, CPU, GPU, neon, grading, weapon models, distances,
+            // defaults, Back
+            const int N = 9;
             if (navUp)   gfxSel = (gfxSel - 1 + N) % N;
             if (navDown) gfxSel = (gfxSel + 1) % N;
             const int step = minus ? -1 : (plus ? 1 : 0);
@@ -1415,18 +1417,23 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 vrcam::SetNeonSignsEnabled(step > 0);
             } else if (step && gfxSel == 4) {
                 vrcam::SetColorGradingEnabled(step > 0);
+            } else if (step && gfxSel == 5 && savr::hdweapons::Available()) {
+                vrcam::SetHdWeaponsEnabled(step > 0);
             }
             if (enter && !step && gfxSel == 3) {
                 vrcam::SetNeonSignsEnabled(!vrcam::AreNeonSignsEnabled());
             } else if (enter && !step && gfxSel == 4) {
                 vrcam::SetColorGradingEnabled(!vrcam::IsColorGradingEnabled());
-            } else if (enter && gfxSel == 5) {
+            } else if (enter && !step && gfxSel == 5) {
+                if (savr::hdweapons::Available())
+                    vrcam::SetHdWeaponsEnabled(!vrcam::IsHdWeaponsEnabled());
+            } else if (enter && gfxSel == 6) {
                 menuPage = PG_GRAPHICS_DISTANCES;
                 gfxDistanceSel = 0;
-            } else if (enter && gfxSel == 6) {
+            } else if (enter && gfxSel == 7) {
                 vrcam::ResetGraphicsDefaults();
                 xr::SetPerfLevels(3, 3);
-            } else if (enter && gfxSel == 7) {
+            } else if (enter && gfxSel == 8) {
                 menuPage = PG_MAIN;
             }
             if (back) menuPage = PG_MAIN;
@@ -1557,6 +1564,13 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
 
     // The left stick drives the menu, not the player, while a menu is up.
     vrcam::SetInputBlocked(anyMenu);
+
+    // HD weapon model set: registers its image + textures once the engine is
+    // ready, before any weapon streams in. Runs outside the gameplay gate so
+    // load screens cannot outrun it. Weapon calibration then follows the model
+    // set actually rendered, so HD tuning stays in its own profile.
+    savr::hdweapons::Tick(vrcam::IsHdWeaponsEnabled());
+    savr::calib::SetModelSet(savr::hdweapons::Applied() ? 1 : 0);
 
     // Physical ownership keeps running while on foot so throws can expire and
     // respawn. Menus/open chords only block transitions and firing; they do not

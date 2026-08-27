@@ -53,6 +53,7 @@ add_library(savr SHARED
     src/Driving.cpp
     src/GestureMove.cpp
     src/GraphicsEffects.cpp
+    src/HdWeapons.cpp
     src/Holster.cpp
     src/Melee.cpp
     src/PerfTelemetry.cpp

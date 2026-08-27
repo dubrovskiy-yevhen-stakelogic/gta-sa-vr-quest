@@ -93,6 +93,8 @@ bool AreNeonSignsEnabled();
 void SetNeonSignsEnabled(bool enabled);
 bool IsColorGradingEnabled();
 void SetColorGradingEnabled(bool enabled);
+bool IsHdWeaponsEnabled();
+void SetHdWeaponsEnabled(bool enabled);
 int  GetGraphicsDistanceSettingCount();
 const char* GetGraphicsDistanceSettingName(int field);
 int  GetGraphicsDistanceSettingMeters(int field);

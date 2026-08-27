@@ -533,6 +533,7 @@ std::array<std::atomic<int>, GFXDIST_COUNT> g_graphicsDistanceChoice{};
 std::atomic<int> g_requestedRenderScaleIndex{kDefaultRenderScaleIndex};
 std::atomic<bool> g_neonSignsEnabled{true};
 std::atomic<bool> g_colorGradingEnabled{true};
+std::atomic<bool> g_hdWeaponsEnabled{false};
 std::atomic<std::uint32_t> g_neonSignsSeenMask{0};
 int g_currentRenderScaleIndex = kDefaultRenderScaleIndex;
 
@@ -565,6 +566,7 @@ void LoadGraphicsSettings() {
     int renderScale = kDefaultRenderScaleIndex;
     bool neonSigns = true;
     bool colorGrading = true;
+    bool hdWeapons = false;
     std::array<int, GFXDIST_COUNT> choices{};
     for (int i = 0; i < GFXDIST_COUNT; ++i)
         choices[i] = kGraphicsDistanceSpecs[i].defaultChoice;
@@ -587,6 +589,10 @@ void LoadGraphicsSettings() {
                 colorGrading = value != 0;
                 continue;
             }
+            if (std::strcmp(key, "HdWeapons") == 0) {
+                hdWeapons = value != 0;
+                continue;
+            }
             for (int i = 0; i < GFXDIST_COUNT; ++i) {
                 if (std::strcmp(key, kGraphicsDistanceSpecs[i].key) == 0) {
                     choices[i] = NearestDistanceChoice(i, value);
@@ -602,6 +608,7 @@ void LoadGraphicsSettings() {
     g_requestedRenderScaleIndex.store(renderScale, std::memory_order_release);
     g_neonSignsEnabled.store(neonSigns, std::memory_order_release);
     g_colorGradingEnabled.store(colorGrading, std::memory_order_release);
+    g_hdWeaponsEnabled.store(hdWeapons, std::memory_order_release);
     for (int i = 0; i < GFXDIST_COUNT; ++i) {
         g_graphicsDistanceChoice[i].store(
             ClampDistanceChoice(i, choices[i]), std::memory_order_release);
@@ -663,6 +670,9 @@ void SaveGraphicsSettings() {
                               ? 1 : 0) >= 0 && ok;
         ok = std::fprintf(file, "ColorGrading=%d\n",
                           g_colorGradingEnabled.load(std::memory_order_acquire)
+                              ? 1 : 0) >= 0 && ok;
+        ok = std::fprintf(file, "HdWeapons=%d\n",
+                          g_hdWeaponsEnabled.load(std::memory_order_acquire)
                               ? 1 : 0) >= 0 && ok;
         for (int i = 0; i < GFXDIST_COUNT; ++i) {
             ok = std::fprintf(file, "%s=%d\n", kGraphicsDistanceSpecs[i].key,
@@ -21034,6 +21044,21 @@ void SetColorGradingEnabled(bool enabled) {
     LOGI("[graphics.grade] enabled=%d", enabled ? 1 : 0);
 }
 
+bool IsHdWeaponsEnabled() {
+    EnsureGraphicsSettingsLoaded();
+    return g_hdWeaponsEnabled.load(std::memory_order_acquire);
+}
+
+void SetHdWeaponsEnabled(bool enabled) {
+    EnsureGraphicsSettingsLoaded();
+    if (g_hdWeaponsEnabled.exchange(enabled, std::memory_order_acq_rel) ==
+        enabled) {
+        return;
+    }
+    SaveGraphicsSettings();
+    LOGI("[hdweapons] enabled=%d (applies on next start)", enabled ? 1 : 0);
+}
+
 const char* GetGraphicsDistanceSettingName(int field) {
     if (field < 0 || field >= GFXDIST_COUNT) return "UNKNOWN";
     return kGraphicsDistanceSpecs[field].label;
@@ -21076,6 +21101,7 @@ void ResetGraphicsDefaults() {
         kDefaultRenderScaleIndex, std::memory_order_release);
     g_neonSignsEnabled.store(true, std::memory_order_release);
     g_colorGradingEnabled.store(true, std::memory_order_release);
+    g_hdWeaponsEnabled.store(false, std::memory_order_release);
     for (int i = 0; i < GFXDIST_COUNT; ++i) {
         g_graphicsDistanceChoice[i].store(
             kGraphicsDistanceSpecs[i].defaultChoice,

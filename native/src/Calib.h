@@ -73,6 +73,10 @@ void Save();
 // the menu edits — and the renderer applies — the right profile.
 void SetActiveWeapon(int weaponType);
 int  ActiveWeapon();
+// Select which weapon-calibration profile is live: 0 = original models,
+// 1 = HD/modern models. Call each frame with the set actually being rendered
+// so grip/aim edits land in the matching profile and never cross over.
+void SetModelSet(int set);
 
 // Thread-safe immutable profile copy for the renderer. `hand` is accepted for
 // source compatibility; both values deliberately select the RIGHT/master data.

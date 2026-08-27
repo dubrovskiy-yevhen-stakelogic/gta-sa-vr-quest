@@ -5,6 +5,7 @@
 #include "Cheats.h"
 #include "Driving.h"
 #include "FrameTarget.h"
+#include "HdWeapons.h"
 #include "Holster.h"
 #include "HudSettings.h"
 #include "Locomotion.h"
@@ -49,11 +50,11 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.1.0.13";  // internal build id (4th digit)
+constexpr char kModVersion[] = "0.1.1.0";  // internal build id (4th digit)
 #ifdef SAVR_DEV
 constexpr const char* kModVersionShown = kModVersion;
 #else
-constexpr const char* kModVersionShown = "0.1.0";  // players see the release id
+constexpr const char* kModVersionShown = "0.1.1";  // players see the release id
 #endif
 
 JavaVM*   g_hudTextVm{};
@@ -4403,7 +4404,7 @@ void BuildGraphicsMenu() {
     const int sel = g_gfxSel.load(std::memory_order_relaxed);
     const int cpu = g_cpuPerfIdx.load(std::memory_order_relaxed);
     const int gpu = g_gpuPerfIdx.load(std::memory_order_relaxed);
-    char rows[8][64];
+    char rows[9][64];
     std::snprintf(rows[0], sizeof(rows[0]), "RENDER SCALE  < %d%% >",
                   vrcam::GetRenderScalePercent());
     std::snprintf(rows[1], sizeof(rows[1]), "CPU  < %s >", kPerfNames[cpu]);
@@ -4412,11 +4413,20 @@ void BuildGraphicsMenu() {
                   vrcam::AreNeonSignsEnabled() ? "ON" : "OFF");
     std::snprintf(rows[4], sizeof(rows[4]), "COLOR GRADING  < %s >",
                   vrcam::IsColorGradingEnabled() ? "ON" : "OFF");
-    std::snprintf(rows[5], sizeof(rows[5]), "DRAW DISTANCES");
-    std::snprintf(rows[6], sizeof(rows[6]), "RESET DEFAULTS");
-    std::snprintf(rows[7], sizeof(rows[7]), "BACK");
-    const int top = 82, rowH = 48;
-    for (int i = 0; i < 8; ++i) {
+    if (!hdweapons::Available()) {
+        std::snprintf(rows[5], sizeof(rows[5]),
+                      "WEAPON MODELS  < NO FILES >");
+    } else {
+        const bool hd = vrcam::IsHdWeaponsEnabled();
+        std::snprintf(rows[5], sizeof(rows[5]), "WEAPON MODELS  < %s >%s",
+                      hd ? "HD" : "ORIGINAL",
+                      hd != hdweapons::Applied() ? "  [RESTART]" : "");
+    }
+    std::snprintf(rows[6], sizeof(rows[6]), "DRAW DISTANCES");
+    std::snprintf(rows[7], sizeof(rows[7]), "RESET DEFAULTS");
+    std::snprintf(rows[8], sizeof(rows[8]), "BACK");
+    const int top = 78, rowH = 44;
+    for (int i = 0; i < 9; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
         const int c = (i == sel) ? 255 : 200;
