@@ -13,7 +13,11 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  SAVR_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  SAVR_TAG, __VA_ARGS__)
 #else
-#define LOGI(...) ((void)0)
-#define LOGW(...) ((void)0)
+// Keep arguments type-checked and considered used in player builds while the
+// compile-time false branch guarantees that no logging call or argument work
+// reaches the binary. This also keeps the release build warning-clean without
+// scattering diagnostic-only casts throughout gameplay code.
+#define LOGI(...) do { if constexpr (false) { __android_log_print(ANDROID_LOG_INFO, SAVR_TAG, __VA_ARGS__); } } while (false)
+#define LOGW(...) do { if constexpr (false) { __android_log_print(ANDROID_LOG_WARN, SAVR_TAG, __VA_ARGS__); } } while (false)
 #endif
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, SAVR_TAG, __VA_ARGS__)

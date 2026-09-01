@@ -38,6 +38,13 @@ the required `SFX` and `STREAMS` payload is not present in those APKs. Seeing an
 `assets/audio` directory in an archive browser is therefore not proof that the
 sound input is complete.
 
+The validation pass also builds the aircraft HLOD from the verified
+`data_main` split. It extracts `assets/texdb/gta3.img` only into the disposable
+build directory and writes `aircraft-hlod-global/aircraft.hlod` there before
+native compilation. The generated pack is intentionally ignored by Git: the
+public repository contains the generator and renderer, not Rockstar geometry.
+The normal Windows and Linux/macOS masters perform this step automatically.
+
 ## Pinned build environment
 
 The Windows master can download and verify:
@@ -192,6 +199,7 @@ Only these persisted settings are removed:
 
 ```text
 vr_appearance.ini
+vr_basketball.ini
 vr_calib.ini
 vr_calib.ini.tmp
 vr_driving.ini

@@ -57,7 +57,7 @@ if ($loaderHash -ne $expectedLoaderHash) {
 
 New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
 
-Write-Host "==> libsavr.so ($Configuration, arm64-v8a)"
+Write-Host "==> libsavr.so ($Configuration, arm64-v8a, SAVR_DEV=OFF)"
 & $CMake `
     -S (Join-Path $ProjectRoot 'native') `
     -B $NativeBuild `
@@ -67,8 +67,19 @@ Write-Host "==> libsavr.so ($Configuration, arm64-v8a)"
     "-DOPENXR_LOADER_SO=$OpenXrLoader" `
     '-DANDROID_ABI=arm64-v8a' `
     '-DANDROID_PLATFORM=android-28' `
+    '-DSAVR_DEV=OFF' `
+    '-DSAVR_EXPERIMENTAL_BACKPRESSURE=ON' `
     "-DCMAKE_BUILD_TYPE=$Configuration"
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
+
+$CMakeCache = Join-Path $NativeBuild 'CMakeCache.txt'
+$ExpectedSavrDev = 'SAVR_DEV:BOOL=OFF'
+$ExpectedBackpressure = 'SAVR_EXPERIMENTAL_BACKPRESSURE:BOOL=ON'
+if (-not (Test-Path -LiteralPath $CMakeCache) -or
+    -not (Select-String -LiteralPath $CMakeCache -SimpleMatch $ExpectedSavrDev -Quiet) -or
+    -not (Select-String -LiteralPath $CMakeCache -SimpleMatch $ExpectedBackpressure -Quiet)) {
+    throw "CMake cache did not retain requested player settings: $ExpectedSavrDev, $ExpectedBackpressure"
+}
 
 & $CMake --build $NativeBuild
 if ($LASTEXITCODE -ne 0) { throw "Native build failed: $LASTEXITCODE" }

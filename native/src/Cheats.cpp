@@ -1,5 +1,6 @@
 #include "Cheats.h"
 
+#include "Basketball.h"
 #include "Holster.h"
 #include "Log.h"
 #include "PhysicalWeapon.h"
@@ -7,7 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
-#include <algorithm>
+#include <cmath>
 #include <dlfcn.h>
 #include <cstdint>
 #include <cstdio>
@@ -23,7 +24,8 @@ namespace {
 // streaming, wanted, weather and ped logic.
 enum class Kind : unsigned char { Plain, Vehicle, GodMode, UnlockCities, Reset,
                                   MissionSkip, TutorialSkip, MissionSelect,
-                                  MissionLaunch, Respect, NeverTired };
+                                  MissionLaunch, Respect, NeverTired,
+                                  Teleport, Basketball };
 
 struct Entry {
     const char* label;
@@ -136,13 +138,22 @@ Entry g_cheats[] = {
     // END: CategoryForIndex uses hardcoded index ranges, so inserting rows
     // mid-table shifts every category after the insertion point.
     {"MAX RESPECT",            "_ZN6CStats12SetStatValueEtf",          -1, Kind::Respect, nullptr},
-    // CWorld::Players[0] + 0x189 (CPlayerInfo stride 0x1D8) = the byte the
+    // CWorld::Players[0] + 0x188 (CPlayerInfo stride 0x1D8) = the byte the
     // SET_PLAYER_NEVER_GETS_TIRED opcode writes. Latched per-frame: scripts
     // and save loads reset it.
     {"INFINITE SPRINT",        "_ZN6CWorld7PlayersE",                  -1, Kind::NeverTired, nullptr},
     {"MISSION GROUP",          nullptr,                                -1, Kind::MissionSelect, nullptr},
     {"MISSION NUMBER",         nullptr,                                -1, Kind::MissionSelect, nullptr},
     {"LAUNCH MISSION",         "DoMissionSkip",                        -1, Kind::MissionLaunch, nullptr},
+    // Ganton double court, right BESIDE a hoop stand: the basketball brain
+    // (streamed script 15, mainV1 opcode 0929) attaches to the HOOP models
+    // 946/947/3496/3497, and the start prompt + ball only appear next to
+    // the stand (hoop 946 at 2290.64,-1541.61 in lae2_stream1.ipl).
+    {"TELEPORT BBALL COURT",   "_ZN4CPed8TeleportE7CVectorh",          -1, Kind::Teleport, nullptr},
+    // Custom immersive basketball: spawns a real physical BBALL_ingame in
+    // front of the player — grab with a hand, throw with the hand's motion,
+    // dribble off the ground. No story script involved.
+    {"SPAWN BASKETBALL",       "_ZN7CObject6CreateEib",                -1, Kind::Basketball, nullptr},
 
 };
 
@@ -478,9 +489,229 @@ void Activate(int index) {
         return;
     }
     Entry& cheat = g_cheats[index];
+    if (cheat.kind == Kind::Basketball) {
+        savr::basketball::SpawnBall();
+        LOGI("cheat: basketball spawn requested");
+        return;
+    }
+    if (cheat.kind == Kind::Teleport) {
+        if (cheat.fn == nullptr) { LOGW("teleport unavailable"); return; }
+        if (g.FindPlayerVehicle && g.FindPlayerVehicle(-1, false)) {
+            LOGW("teleport ignored: leave the vehicle first");
+            return;
+        }
+        // Basketball-glitch repair + diagnosis. Story scripts (the известный
+        // "no basketballs after Madd Dogg" bug) can switch the object brain
+        // entries off in CTheScripts::ScriptsForBrains, after which no court
+        // ever prompts again. Dump the live table, and re-enable any
+        // inactive entry with the basketball activation radius (70.0 — the
+        // opcode-0929 registrations for hoop models 946/947/3496/3497).
+        // Entry layout disasm-verified (AddNewScriptBrain @0x437974):
+        // stride 20; +0 u16 streamedIndex (0xFFFF = free), +2 s8 type,
+        // +3 s8 groupingId, +4 u8 active, +8 f32 radius, +0xC u16 model.
+        if (g.CTheScripts_ScriptsForBrains != nullptr) {
+            auto* table =
+                static_cast<unsigned char*>(g.CTheScripts_ScriptsForBrains);
+            for (int i = 0; i < 70; ++i) {
+                unsigned char* e = table + i * 20;
+                std::uint16_t streamedIndex;
+                std::memcpy(&streamedIndex, e, sizeof(streamedIndex));
+                if (streamedIndex == 0xFFFFu) continue;
+                float radius;
+                std::memcpy(&radius, e + 8, sizeof(radius));
+                std::uint16_t model;
+                std::memcpy(&model, e + 0xC, sizeof(model));
+                const bool active = e[4] != 0;
+                LOGI("[cheat.bball] brain[%d] script=%u type=%d group=%d "
+                     "active=%d radius=%.1f model=%d",
+                     i, streamedIndex, static_cast<signed char>(e[2]),
+                     static_cast<signed char>(e[3]), active ? 1 : 0,
+                     static_cast<double>(radius),
+                     static_cast<std::int16_t>(model));
+                if (!active && radius > 69.0f && radius < 71.0f) {
+                    e[4] = 1;
+                    LOGI("[cheat.bball] brain[%d] re-enabled", i);
+                }
+            }
+        } else {
+            LOGW("[cheat.bball] ScriptsForBrains symbol missing");
+        }
+        // Script-global gates. basketb.scm only shows the court prompt while
+        // $33b0 == 0 ("no basketball challenge running") — the BBCHAL thread
+        // sets it to 1 at startup (@0x1b721 in mainV1) and back to 0 only on
+        // its own termination (@0x1c0fc). Globals are SAVED, so a latch stuck
+        // at 1 kills basketball on every court in that save forever. Dump the
+        // whole family and clear the latch.
+        if (g.CTheScripts_ScriptSpace != nullptr) {
+            auto* space =
+                static_cast<unsigned char*>(g.CTheScripts_ScriptSpace);
+            const auto DumpFix = [&](unsigned off, bool fixZero) {
+                std::int32_t value;
+                std::memcpy(&value, space + off, sizeof(value));
+                LOGI("[cheat.bball] global $%04x = %d%s", off, value,
+                     (fixZero && value != 0) ? " -> 0" : "");
+                if (fixZero && value != 0) {
+                    const std::int32_t zero = 0;
+                    std::memcpy(space + off, &zero, sizeof(zero));
+                }
+            };
+            DumpFix(0x33b0, true);   // challenge-running latch (prompt gate)
+            DumpFix(0x33b4, false);
+            DumpFix(0x33b8, false);
+            DumpFix(0x33bc, false);
+            DumpFix(0x33c0, false);
+            // Both handshakes get poisoned by the restart storm itself (every
+            // dying instance leaves them claimed) — clear them too.
+            DumpFix(0x33cc, true);   // basketb brain handshake
+            DumpFix(0x3368, true);   // brain busy flag
+            DumpFix(0x0660, false);  // basketb exit gate (likely $ONMISSION)
+            // Runtime used-object table: basketb.scm's hoop-model checks
+            // resolve refs -30..-33 through CTheScripts::UsedObjectArray
+            // (disasm 09CC handler @0x4483b8: entry stride 0x1C, resolved
+            // model id at +0x18). Dump the basketball window to see what the
+            // names actually resolved to in this environment.
+            if (void* gameHandle =
+                    dlopen("libGame.so", RTLD_NOLOAD | RTLD_NOW)) {
+                if (auto* usedObjects = static_cast<unsigned char*>(dlsym(
+                        gameHandle, "_ZN11CTheScripts15UsedObjectArrayE"))) {
+                    for (int i = 28; i <= 35; ++i) {
+                        char objName[25]{};
+                        std::memcpy(objName, usedObjects + i * 28, 24);
+                        for (char& c : objName) {
+                            if (c != '\0' && (c < 0x20 || c > 0x7e)) c = '?';
+                        }
+                        std::int32_t modelId;
+                        std::memcpy(&modelId, usedObjects + i * 28 + 0x18,
+                                    sizeof(modelId));
+                        LOGI("[cheat.bball] usedobj[%d] name=%s model=%d",
+                             i, objName, modelId);
+                    }
+                }
+                dlclose(gameHandle);
+            }
+            // Streaming states for the hoop models: basketb.scm's accept
+            // path requires HAS_MODEL_LOADED(hoop) — if the state is not 1
+            // (LOADED) the brain exits even though the hoop OBJECT stands
+            // right there. CStreamingInfo stride 20, state byte at +0x10
+            // (disasm ProcessWaitingForScriptBrainArray @0x438528).
+            if (g.CStreaming_ms_aInfoForModel != nullptr) {
+                for (const int modelId :
+                     {946, 947, 3496, 3497, 26230 + 7}) {
+                    const std::uint8_t state =
+                        g.CStreaming_ms_aInfoForModel[modelId * 20 + 0x10];
+                    LOGI("[cheat.bball] streaming model=%d state=%u",
+                         modelId, state);
+                    // The court brain HARD-REQUIRES the hoop model loaded
+                    // (HAS_MODEL_LOADED gate) - something unloads it around
+                    // the court. Pin the hoop models: MISSION_REQUIRED(0x4)
+                    // | KEEP_IN_MEMORY(0x8), same flag family the engine
+                    // uses for script-brain resources.
+                    if (modelId < 26230 && state != 1u &&
+                        g.CStreaming_RequestModel) {
+                        g.CStreaming_RequestModel(modelId, 0x0C);
+                        LOGI("[cheat.bball] requested model=%d (pin 0x0C)",
+                             modelId);
+                    }
+                }
+                // Service the requests synchronously and report the result:
+                // if a pinned hoop model STILL is not loaded afterwards, its
+                // standalone DFF is effectively unreachable in this build
+                // (mobile bakes some props into sector meshes) and the fix
+                // must go through a court whose hoop model does stream.
+                if (void* gameHandle2 =
+                        dlopen("libGame.so", RTLD_NOLOAD | RTLD_NOW)) {
+                    if (auto* loadAll = reinterpret_cast<void (*)(bool)>(
+                            dlsym(gameHandle2,
+                                  "_ZN10CStreaming22LoadAllRequestedModelsEb"))) {
+                        loadAll(false);
+                        for (const int modelId : {946, 3496, 3497}) {
+                            LOGI("[cheat.bball] post-load model=%d state=%u",
+                                 modelId,
+                                 g.CStreaming_ms_aInfoForModel[modelId * 20 +
+                                                              0x10]);
+                        }
+                    }
+                    dlclose(gameHandle2);
+                }
+            }
+            // Live script walk: list every ACTIVE script with its current
+            // instruction offset. If a bball instance is ALIVE holding the
+            // $33cc ownership while parked at another court, it shows here
+            // with its exact wait location. CRunningScript: next @+0, name
+            // @+0x10, base @+0x18, ip @+0x20 (disasm-verified).
+            if (void* gameHandle3 =
+                    dlopen("libGame.so", RTLD_NOLOAD | RTLD_NOW)) {
+                if (auto* listHead = static_cast<unsigned char**>(dlsym(
+                        gameHandle3, "_ZN11CTheScripts14pActiveScriptsE"))) {
+                    int scriptCount = 0;
+                    for (unsigned char* s = *listHead;
+                         s != nullptr && scriptCount < 96; ++scriptCount) {
+                        char scriptName[9]{};
+                        std::memcpy(scriptName, s + 0x10, 8);
+                        for (char& c : scriptName) {
+                            if (c != '\0' && (c < 0x20 || c > 0x7e)) c = '?';
+                        }
+                        std::uintptr_t base, ip;
+                        std::memcpy(&base, s + 0x18, sizeof(base));
+                        std::memcpy(&ip, s + 0x20, sizeof(ip));
+                        const long off = (base && ip >= base)
+                            ? static_cast<long>(ip - base) : -1;
+                        LOGI("[cheat.bball] active[%d] name=%s ip_off=%ld",
+                             scriptCount, scriptName, off);
+                        std::memcpy(&s, s, sizeof(s));   // next
+                    }
+                }
+                dlclose(gameHandle3);
+            }
+            // $070c = story-progress counter (incremented on mission passes:
+            // SWEET_1/GAN1/... M_PASS blocks). basketb.scm's start gate is
+            // "$3368 == 0 AND $070c > 7" — with fewer than 8 story missions
+            // passed the brain exits instantly (shutdown ip_off=0xac1), which
+            // is exactly the no-prompt symptom. Raise it to 8 so the court
+            // unlocks for testing; story saves past that point are untouched.
+            {
+                std::int32_t progress;
+                std::memcpy(&progress, space + 0x070c, sizeof(progress));
+                if (progress < 8) {
+                    const std::int32_t unlocked = 8;
+                    std::memcpy(space + 0x070c, &unlocked, sizeof(unlocked));
+                    LOGI("[cheat.bball] global $070c = %d -> 8 "
+                         "(unlock basketball progression gate)", progress);
+                } else {
+                    LOGI("[cheat.bball] global $070c = %d (already unlocked)",
+                         progress);
+                }
+            }
+        }
+        void* ped = g.FindPlayerPed(-1);
+        // The BSKBALLHUB_LAX01 (947) court in East LS: on this mobile build
+        // the Ganton hoops' standalone model (946) never streams (baked into
+        // the sector mesh), so its brain always fails HAS_MODEL_LOADED. The
+        // 947 hub model DOES stream — its court can pass the script's model
+        // gate. Hub at (2533.88, -1667.58, 16.29) in lae2_stream0.ipl.
+        GameSymbols::Vec3 pos{2533.9f, -1665.6f, 17.5f};
+        // Stream the destination FIRST: querying ground Z before the scene
+        // is resident returned garbage and dropped CJ under the map.
+        if (g.CStreaming_LoadScene) g.CStreaming_LoadScene(&pos);
+        if (g.CWorld_FindGroundZForCoord) {
+            const float ground = g.CWorld_FindGroundZForCoord(pos.x, pos.y);
+            if (std::isfinite(ground) && ground > 10.0f && ground < 25.0f)
+                pos.z = ground + 1.0f;
+        }
+        // CPed::Teleport(CVector, bool clearOrientation): CVector is the
+        // usual 3-float HFA, flattened like every other binding.
+        reinterpret_cast<void (*)(void*, float, float, float, unsigned char)>(
+            cheat.fn)(ped, pos.x, pos.y, pos.z, 1);
+        LOGI("teleport: basketball court (%.1f %.1f %.1f)",
+             pos.x, pos.y, pos.z);
+        return;
+    }
     if (cheat.kind == Kind::NeverTired) {
         if (cheat.fn == nullptr) { LOGW("infinite sprint unavailable"); return; }
-        g_neverTiredByte = static_cast<unsigned char*>(cheat.fn) + 0x189;
+        // 0x188, not 0x189: the retail SET_PLAYER_NEVER_GETS_TIRED handler
+        // (disasm @0x41c3b4: strb [players + id*0x1D8 + 0x188]) — the old
+        // off-by-one wrote a neighbouring byte and did nothing.
+        g_neverTiredByte = static_cast<unsigned char*>(cheat.fn) + 0x188;
         const bool enabled = !g_neverTiredActive.load(std::memory_order_acquire);
         g_neverTiredActive.store(enabled, std::memory_order_release);
         *g_neverTiredByte = enabled ? 1 : 0;

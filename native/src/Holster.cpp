@@ -40,6 +40,8 @@ const PointMetadata kMetadata[POINT_COUNT] = {
 };
 
 std::atomic<int> gPointSlots[POINT_COUNT] = {4, 2, 3, 1, 8, 7, 5};
+std::atomic<bool> gPointVisible[POINT_COUNT] = {
+    true, true, true, true, true, true, true};
 std::atomic<bool> gGripMarkersEnabled{true};
 // Reach for pulling a weapon off a body socket. The old fixed 27cm sphere
 // kept catching a holster during ordinary hand movement, so it is smaller by
@@ -153,6 +155,7 @@ void LoadSettings() {
     bool markers = true;
     int grabRadiusCm = kDefaultGrabRadiusCm;
     bool gripLock = false;
+    bool visible[POINT_COUNT] = {true, true, true, true, true, true, true};
 
     FILE* f = std::fopen(kSettingsPath, "r");
     const bool hadFile = f != nullptr;
@@ -173,6 +176,13 @@ void LoadSettings() {
             int lock = 0;
             if (std::sscanf(line, "grip_lock %d", &lock) == 1) {
                 gripLock = lock != 0;
+                continue;
+            }
+            int visiblePoint = -1, visibleValue = 1;
+            if (std::sscanf(line, "visible %d %d", &visiblePoint,
+                            &visibleValue) == 2) {
+                if (ValidPoint(visiblePoint))
+                    visible[visiblePoint] = visibleValue != 0;
                 continue;
             }
             int point = -1;
@@ -201,6 +211,8 @@ void LoadSettings() {
     }
     for (int i = 0; i < POINT_COUNT; ++i)
         gPointSlots[i].store(proposed[i], std::memory_order_release);
+    for (int i = 0; i < POINT_COUNT; ++i)
+        gPointVisible[i].store(visible[i], std::memory_order_release);
     gGripMarkersEnabled.store(markers, std::memory_order_release);
 
     if (hadFile) LOGI("[holster] loaded %s", kSettingsPath);
@@ -225,6 +237,8 @@ void SaveSettingsLocked() {
             ? kCenterThrowableSlot
             : gPointSlots[point].load(std::memory_order_acquire);
         std::fprintf(f, "p %d %d\n", point, slot);
+        std::fprintf(f, "visible %d %d\n", point,
+                     gPointVisible[point].load(std::memory_order_acquire) ? 1 : 0);
     }
     std::fclose(f);
 }
@@ -251,6 +265,26 @@ const char* PointName(int point) {
 }
 
 bool IsPointFixed(int point) { return point == CHEST_CENTER; }
+
+bool PointVisible(int point) {
+    Init();
+    return ValidPoint(point) &&
+           gPointVisible[point].load(std::memory_order_acquire);
+}
+
+void SetPointVisible(int point, bool visible) {
+    Init();
+    if (!ValidPoint(point) ||
+        gPointVisible[point].exchange(visible, std::memory_order_acq_rel) == visible)
+        return;
+    std::lock_guard<std::mutex> lock(gSettingsMutex);
+    SaveSettingsLocked();
+    LOGI("[holster] %s %s", PointName(point), visible ? "shown" : "hidden");
+}
+
+void TogglePointVisible(int point) {
+    if (ValidPoint(point)) SetPointVisible(point, !PointVisible(point));
+}
 
 int PointSlot(int point) {
     Init();
@@ -510,6 +544,10 @@ void Update() {
         }
 
         const int slot = PointSlot(point);
+        if (!PointVisible(point)) {
+            available[point] = false;
+            continue;
+        }
         available[point] = slot > 0 && slot != activeSlot && WeaponTypeInSlot(ped, slot) != 0;
         if (available[point]) {
             for (int c = 0; c < 3; ++c) markers[markerCount][c] = anchors[point][c];

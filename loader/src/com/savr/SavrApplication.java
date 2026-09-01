@@ -44,6 +44,7 @@ public final class SavrApplication extends Application {
     private static final String[] DEFAULT_SETTINGS = {
             "vr_driving.ini",
             "vr_appearance.ini",
+            "vr_basketball.ini",
             "vr_calib.ini",
             "vr_graphics.ini",
             "vr_holsters.ini",

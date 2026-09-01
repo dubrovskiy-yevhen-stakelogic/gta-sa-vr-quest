@@ -20,10 +20,12 @@ namespace savr::perf {
 namespace {
 
 constexpr int kMaxWindowSamples = 256;
+#ifdef SAVR_DEV
 constexpr const char* kGameCsvPath =
     "/sdcard/Android/data/com.rockstargames.gtasa/files/savr_game_perf_v2.csv";
 constexpr const char* kXrCsvPath =
     "/sdcard/Android/data/com.rockstargames.gtasa/files/savr_xr_perf_v2.csv";
+#endif
 
 struct DebugStatsAtomic {
     std::atomic<std::uint64_t> revision{0};
@@ -237,12 +239,20 @@ struct DebugStatsAtomic {
     std::atomic<double> runtimeGpuMs{0.0};
     std::atomic<int> endFailures{0};
     std::atomic<int> ringRaces{0};
+    std::atomic<double> freshHz{0.0};
     std::atomic<int> fresh{0};
     std::atomic<int> repeated{0};
+    std::atomic<int> writeClaimBusyDrops{0};
+    std::atomic<int> writeClaimRescues{0};
     std::atomic<int> stereoSyncWaits{0};
     std::atomic<int> stereoSyncRescued{0};
     std::atomic<int> stereoSyncTimeouts{0};
     std::atomic<double> stereoSyncWaitMs{0.0};
+    std::atomic<int> stereoStaleRejects{0};
+    std::atomic<int> stereoBlackFallbacks{0};
+    std::atomic<int> stereoRepeatStreakMax{0};
+    std::atomic<int> stereoLivenessState{0};
+    std::atomic<int> stereoRecoveryProgress{0};
     std::atomic<bool> fxaaRequested{false};
     std::atomic<bool> fxaaActive{false};
     std::atomic<int> fxaaDraws{0};
@@ -261,6 +271,7 @@ std::mutex g_debugStatsMutex;
 // Preserve the just-finished process' canonical summary before the new process
 // opens the same path with "w". This runs at most once per stream/process and
 // does not add any per-frame I/O.
+#ifdef SAVR_DEV
 bool ArchivePreviousCsv(const char* canonicalPath, const char* streamName) {
     struct stat canonicalInfo{};
     if (::stat(canonicalPath, &canonicalInfo) != 0) {
@@ -324,6 +335,7 @@ bool ArchivePreviousCsv(const char* canonicalPath, const char* streamName) {
         return false;
     }
 }
+#endif
 
 struct Series {
     std::array<double, kMaxWindowSamples> values{};
@@ -366,6 +378,16 @@ struct GameWindow {
     int freshStereoFrames{};
     int sequenceJumps{};
     int renderSceneCalls{};
+    int noRenderFade0{};
+    int noRenderFade1{};
+    int noRenderFade2{};
+    int noRenderFadeUnknown{};
+    int noRenderCutscene0{};
+    int noRenderCutscene1{};
+    int noRenderCutsceneUnknown{};
+    int noRenderMenu0{};
+    int noRenderMenu1{};
+    int noRenderMenuUnknown{};
     int wrapperSwapCalls{};
     int wrapperSwapFailures{};
     Series callbackPeriod;
@@ -674,11 +696,18 @@ struct GameWindow {
 };
 
 GameWindow g_gameWindow{};
+#ifdef SAVR_DEV
 FILE* g_gameCsv = nullptr;
 bool g_gameCsvAttempted = false;
 std::array<char, 64 * 1024> g_gameCsvBuffer{};
+#endif
 
 FILE* OpenGameCsv() {
+#ifndef SAVR_DEV
+    // Player builds keep the in-memory pacing counters used by the runtime,
+    // but never create developer capture files on the user's headset.
+    return nullptr;
+#else
     if (g_gameCsv || g_gameCsvAttempted) return g_gameCsv;
     g_gameCsvAttempted = true;
     if (!ArchivePreviousCsv(kGameCsvPath, "game")) {
@@ -692,9 +721,11 @@ FILE* OpenGameCsv() {
     }
     std::setvbuf(g_gameCsv, g_gameCsvBuffer.data(), _IOFBF, g_gameCsvBuffer.size());
     std::fprintf(g_gameCsv,
-        "window_s,callbacks,callback_hz,rendered,rendered_hz,gate_skips,gate_skip_pct,"
+        "window_s,callbacks,callback_hz,rendered,rendered_hz,no_render_callbacks,no_render_pct,"
         "stereo_fresh,seq_jumps,render_scene_calls,"
         "cap_fps,gta_fps,timestep,timestep_nc,frame_counter,skip_process,skip_frame,cpu_core,stereo_active,"
+        "fade_status,cutscene_running,mobile_menu_open,no_rs_fade0,no_rs_fade1,no_rs_fade2,no_rs_fade_unknown,"
+        "no_rs_cutscene0,no_rs_cutscene1,no_rs_cutscene_unknown,no_rs_menu0,no_rs_menu1,no_rs_menu_unknown,"
         "period_avg,period_p95,period_max,callback_work_avg,callback_work_p95,callback_work_max,"
         "java_delta_ms_avg,render_gap_avg,render_gap_p95,render_gap_max,"
         "render_wall_avg,render_wall_p95,render_wall_max,render_cpu_avg,render_blocked_avg,"
@@ -891,6 +922,7 @@ FILE* OpenGameCsv() {
         "aircraft_ordinary_outer_radial_sector_overflow_avg\n");
     LOGI("[perf.init] game summary CSV: %s", kGameCsvPath);
     return g_gameCsv;
+#endif
 }
 
 void EmitGameWindow(double endMs) {
@@ -1339,7 +1371,7 @@ void EmitGameWindow(double endMs) {
     }
 
     LOGI("[perf.game] v2 win=%.2fs calls=%d(%.1fHz) rendered=%d(%.1fHz) "
-         "gateSkip=%d(%.0f%%) stereoFresh=%d jumps=%d rsCalls=%d "
+         "noRS=%d(%.0f%%) stereoFresh=%d jumps=%d rsCalls=%d "
          "cap=%d gta=%.1f step=%.3f/%.3f "
          "frame=%u flags=%d/%d core=%d stereo=%d",
          seconds, w.callbacks, callbackHz, w.renderedCallbacks, renderedHz,
@@ -1348,6 +1380,15 @@ void EmitGameWindow(double endMs) {
          w.last.gameFps, w.last.timeStep, w.last.timeStepNonClipped,
          w.last.gameFrameCounter, w.last.skipProcess, w.last.skipFrame,
          w.last.cpuCore, w.last.stereoActive ? 1 : 0);
+    LOGI("[perf.game.gate] noRS fade0/1/2/u=%d/%d/%d/%d "
+         "cut0/1/u=%d/%d/%d menu0/1/u=%d/%d/%d last=%d/%d/%d",
+         w.noRenderFade0, w.noRenderFade1, w.noRenderFade2,
+         w.noRenderFadeUnknown,
+         w.noRenderCutscene0, w.noRenderCutscene1,
+         w.noRenderCutsceneUnknown,
+         w.noRenderMenu0, w.noRenderMenu1, w.noRenderMenuUnknown,
+         w.last.fadeStatus,
+         w.last.cutsceneRunning, w.last.mobileMenuOpen);
     LOGI("[perf.game.t] period=%.2f/%.2f/%.2f cbWork=%.2f/%.2f/%.2f "
          "javaDt=%.2f gap=%.2f/%.2f/%.2f "
          "renderW=%.2f/%.2f/%.2f renderCPU=%.2f block=%.2f "
@@ -1806,6 +1847,7 @@ void EmitGameWindow(double endMs) {
     if (FILE* file = OpenGameCsv()) {
         std::fprintf(file,
             "%.3f,%d,%.3f,%d,%.3f,%d,%.2f,%d,%d,%d,%d,%.3f,%.5f,%.5f,%u,%d,%d,%d,%d,"
+            "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
             "%.4f,%.4f,%.4f,%.4f,%.4f,"
             "%.4f,%.4f,%.4f,%.4f,%.4f,"
@@ -1825,6 +1867,12 @@ void EmitGameWindow(double endMs) {
             w.last.timeStepNonClipped, w.last.gameFrameCounter,
             w.last.skipProcess, w.last.skipFrame, w.last.cpuCore,
             w.last.stereoActive ? 1 : 0,
+            w.last.fadeStatus, w.last.cutsceneRunning, w.last.mobileMenuOpen,
+            w.noRenderFade0, w.noRenderFade1, w.noRenderFade2,
+            w.noRenderFadeUnknown,
+            w.noRenderCutscene0, w.noRenderCutscene1,
+            w.noRenderCutsceneUnknown,
+            w.noRenderMenu0, w.noRenderMenu1, w.noRenderMenuUnknown,
             w.callbackPeriod.Average(), w.callbackPeriod.P95(), w.callbackPeriod.maximum,
             w.callbackWork.Average(), w.callbackWork.P95(), w.callbackWork.maximum,
             w.javaDelta.Average(),
@@ -2192,6 +2240,8 @@ void EmitGameWindow(double endMs) {
 }
 
 int g_lastSubmittedStereoSequence = -1;
+constexpr int kStereoProjectionOutcomeCount =
+    static_cast<int>(StereoProjectionOutcome::Count);
 
 struct PresentWindow {
     double startMs{};
@@ -2199,6 +2249,20 @@ struct PresentWindow {
     int successfulPresents{};
     int endFailures{};
     int generationRaces{};
+    int writeClaimBusyDrops{};
+    int writeClaimRescues{};
+    int writeFencePollAttempts{};
+    int writeFencePollSkipped{};
+    int writeFencePollLockBusy{};
+    int writeFencePollMatched{};
+    int writeFencePollRetired{};
+    int writeFencePollTimeouts{};
+    int writeFencePollWaitFailed{};
+    int writeFenceWaitAttempts{};
+    int writeFenceWaitCalls{};
+    int writeFenceWaitSatisfied{};
+    int writeFenceWaitTimeouts{};
+    int writeFenceWaitFailed{};
     int freshSequences{};
     int repeatedSequences{};
     int noStereoSequence{};
@@ -2206,6 +2270,28 @@ struct PresentWindow {
     int stereoSyncWaits{};
     int stereoSyncRescued{};
     int stereoSyncTimeouts{};
+    std::array<int, kStereoProjectionOutcomeCount> projectionOutcomes{};
+    int fallbackGameSurface{};
+    int fallbackBlack{};
+    int fallbackFailed{};
+    int staleRejects{};
+    int releaseFailuresLeft{};
+    int releaseFailuresRight{};
+    int zeroCopyRepeatAttempts{};
+    int zeroCopyRepeatAccepted{};
+    int repeatCopyFallbacks{};
+    int repeatStreakMax{};
+    int recoveryProgressMax{};
+    int candidateAgeLe25{};
+    int candidateAge25To50{};
+    int candidateAge50To100{};
+    int candidateAge100To500{};
+    int candidateAgeOver500{};
+    int candidateAgeUnknown{};
+    int presentPathSwitches{};
+    StereoFallbackSource lastFallbackSource{StereoFallbackSource::None};
+    bool haveLastPresentPath{};
+    bool lastPresentWasProjection{};
     int noLayers{};
     int shouldNotRender{};
     int fxaaDraws{};
@@ -2221,16 +2307,29 @@ struct PresentWindow {
     Series predictedDelta;
     Series stereoSyncWait;
     Series submittedStereoAge;
+    Series candidateStereoAge;
     Series fxaaSubmitWall;
+    Series writeFencePollWall;
+    Series writeFencePollCpu;
+    Series writeFenceWaitWall;
+    Series writeFenceWaitCpu;
+    Series writeFenceWaitAge;
     PresentFrameSample last{};
 };
 
 PresentWindow g_presentWindow{};
+#ifdef SAVR_DEV
 FILE* g_xrCsv = nullptr;
 bool g_xrCsvAttempted = false;
 std::array<char, 64 * 1024> g_xrCsvBuffer{};
+#endif
 
 FILE* OpenXrCsv() {
+#ifndef SAVR_DEV
+    // The XR aggregates remain live for adaptive pacing; persistent CSV output
+    // is a developer-only capture facility.
+    return nullptr;
+#else
     if (g_xrCsv || g_xrCsvAttempted) return g_xrCsv;
     g_xrCsvAttempted = true;
     if (!ArchivePreviousCsv(kXrCsvPath, "XR")) {
@@ -2244,7 +2343,7 @@ FILE* OpenXrCsv() {
     }
     std::setvbuf(g_xrCsv, g_xrCsvBuffer.data(), _IOFBF, g_xrCsvBuffer.size());
     std::fprintf(g_xrCsv,
-        "window_s,attempts,presented,present_hz,end_failures,last_end_result,ring_races,"
+        "window_s,attempts,presented,present_hz,end_failures,last_end_result,ring_races,write_claim_busy,"
         "fresh,repeated,no_stereo,seq_jumps,no_layers,should_not_render,theater,"
         "sync_waits,sync_rescued,sync_timeouts,sync_wait_avg,sync_wait_p95,sync_wait_max,"
         "stereo_age_avg,stereo_age_p95,stereo_age_max,"
@@ -2254,9 +2353,28 @@ FILE* OpenXrCsv() {
         "wait_avg,wait_p95,wait_max,work_avg,work_p95,work_max,"
         "end_avg,end_p95,end_max,present_thread_cpu_avg,"
         "fxaa_requested,fxaa_active,fxaa_draws,fxaa_fallbacks,fxaa_errors,"
-        "fxaa_submit_avg,fxaa_submit_p95,fxaa_submit_max\n");
+        "fxaa_submit_avg,fxaa_submit_p95,fxaa_submit_max,"
+        "proj_not_attempted,proj_submitted,proj_no_swapchains,proj_no_safe_pair,"
+        "proj_generation_pre,proj_no_timestamp,proj_stale_rejected,proj_bad_dimensions,"
+        "proj_missing_pose,proj_acquire_l,proj_wait_l,proj_release_l,"
+        "proj_acquire_r,proj_wait_r,proj_release_r,proj_generation_post,proj_recovery_hold,proj_read_lease_conflict,"
+        "fallback_game_surface,fallback_black,fallback_failed,"
+        "release_fail_l,release_fail_r,stale_rejects,repeat_streak_max,"
+        "stereo_gate_state,recovery_progress_max,candidate_age_avg,candidate_age_p95,"
+        "candidate_age_max,candidate_age_le25,candidate_age_25_50,"
+        "candidate_age_50_100,candidate_age_100_500,candidate_age_over500,"
+        "candidate_age_unknown,present_path_switches,"
+        "write_claim_rescued,write_poll_attempts,write_poll_skipped,write_poll_lock_busy,"
+        "write_poll_matched,write_poll_retired,write_poll_timeouts,write_poll_wait_failed,"
+        "write_poll_wall_avg,write_poll_wall_p95,write_poll_wall_max,write_poll_cpu_avg,"
+        "write_wait_attempts,write_wait_calls,write_wait_satisfied,write_wait_timeouts,"
+        "write_wait_failed,write_wait_wall_avg,write_wait_wall_p95,write_wait_wall_max,"
+        "write_wait_cpu_avg,write_wait_fence_age_avg,write_wait_fence_age_p95,"
+        "write_wait_fence_age_max,"
+        "fresh_hz,repeat_zc_attempts,repeat_zc_accepted,repeat_copy_fallbacks\n");
     LOGI("[perf.init] XR summary CSV: %s", kXrCsvPath);
     return g_xrCsv;
+#endif
 }
 
 void EmitPresentWindow(double endMs) {
@@ -2264,10 +2382,14 @@ void EmitPresentWindow(double endMs) {
     if (w.attempts == 0 || w.startMs <= 0.0 || endMs <= w.startMs) return;
     const double seconds = (endMs - w.startMs) / 1000.0;
     const double presentHz = w.successfulPresents / seconds;
+    const double freshHz = w.freshSequences / seconds;
     const float metaCpu = w.last.runtimeCpuValid ? w.last.runtimeCpuMs : -1.0f;
     const float metaGpu = w.last.runtimeGpuValid ? w.last.runtimeGpuMs : -1.0f;
     const double budgetMs = w.last.displayRefreshValid && w.last.displayRefreshHz > 0.1f
         ? 1000.0 / static_cast<double>(w.last.displayRefreshHz) : 0.0;
+    const auto outcomeCount = [&](StereoProjectionOutcome outcome) {
+        return w.projectionOutcomes[static_cast<int>(outcome)];
+    };
 
     {
     std::lock_guard<std::mutex> debugLock(g_debugStatsMutex);
@@ -2286,8 +2408,13 @@ void EmitPresentWindow(double endMs) {
         std::memory_order_relaxed);
     g_debugStats.endFailures.store(w.endFailures, std::memory_order_relaxed);
     g_debugStats.ringRaces.store(w.generationRaces, std::memory_order_relaxed);
+    g_debugStats.freshHz.store(freshHz, std::memory_order_relaxed);
     g_debugStats.fresh.store(w.freshSequences, std::memory_order_relaxed);
     g_debugStats.repeated.store(w.repeatedSequences, std::memory_order_relaxed);
+    g_debugStats.writeClaimBusyDrops.store(w.writeClaimBusyDrops,
+                                           std::memory_order_relaxed);
+    g_debugStats.writeClaimRescues.store(w.writeClaimRescues,
+                                         std::memory_order_relaxed);
     g_debugStats.stereoSyncWaits.store(w.stereoSyncWaits,
                                       std::memory_order_relaxed);
     g_debugStats.stereoSyncRescued.store(w.stereoSyncRescued,
@@ -2296,6 +2423,17 @@ void EmitPresentWindow(double endMs) {
                                          std::memory_order_relaxed);
     g_debugStats.stereoSyncWaitMs.store(w.stereoSyncWait.Average(),
                                        std::memory_order_relaxed);
+    g_debugStats.stereoStaleRejects.store(w.staleRejects,
+                                         std::memory_order_relaxed);
+    g_debugStats.stereoBlackFallbacks.store(w.fallbackBlack,
+                                           std::memory_order_relaxed);
+    g_debugStats.stereoRepeatStreakMax.store(w.repeatStreakMax,
+                                            std::memory_order_relaxed);
+    g_debugStats.stereoLivenessState.store(
+        static_cast<int>(w.last.stereoLivenessState),
+        std::memory_order_relaxed);
+    g_debugStats.stereoRecoveryProgress.store(w.last.stereoRecoveryProgress,
+                                             std::memory_order_relaxed);
     g_debugStats.fxaaRequested.store(w.last.fxaaRequested, std::memory_order_relaxed);
     g_debugStats.fxaaActive.store(w.last.fxaaActive, std::memory_order_relaxed);
     g_debugStats.fxaaDraws.store(w.fxaaDraws, std::memory_order_relaxed);
@@ -2307,16 +2445,38 @@ void EmitPresentWindow(double endMs) {
     g_debugStats.revision.fetch_add(1, std::memory_order_release);
     }
 
-    LOGI("[perf.xr] v2 win=%.2fs present=%d(%.1fHz) attempts=%d endFail=%d lastEnd=%d ringRace=%d "
-         "fresh=%d repeat=%d "
+    LOGI("[perf.xr] v2 win=%.2fs present=%d(%.1fHz) attempts=%d endFail=%d lastEnd=%d ringRace=%d writeBusy/rescue=%d/%d "
+         "fresh=%d(%.1fHz) repeat=%d "
          "noStereo=%d jumps=%d layers0=%d should0=%d theater=%d display=%d/%.1fHz "
          "budget=%.2f metaCPU=%.2f metaGPU=%.2f",
          seconds, w.successfulPresents, presentHz, w.attempts,
-         w.endFailures, w.last.endResult, w.generationRaces, w.freshSequences,
-         w.repeatedSequences, w.noStereoSequence, w.sequenceJumps,
+         w.endFailures, w.last.endResult, w.generationRaces,
+         w.writeClaimBusyDrops, w.writeClaimRescues, w.freshSequences,
+         freshHz, w.repeatedSequences, w.noStereoSequence, w.sequenceJumps,
          w.noLayers, w.shouldNotRender, w.last.theaterMode ? 1 : 0,
          w.last.displayRefreshValid ? 1 : 0, w.last.displayRefreshHz, budgetMs,
          metaCpu, metaGpu);
+    LOGI("[perf.xr.writer] poll/skip/lock/match/retire/timeout/fail=%d/%d/%d/%d/%d/%d/%d "
+         "rescue/busy=%d/%d wall=%.4f/%.4f/%.4fms cpu=%.4fms",
+         w.writeFencePollAttempts, w.writeFencePollSkipped,
+         w.writeFencePollLockBusy, w.writeFencePollMatched,
+         w.writeFencePollRetired, w.writeFencePollTimeouts,
+         w.writeFencePollWaitFailed, w.writeClaimRescues,
+         w.writeClaimBusyDrops, w.writeFencePollWall.Average(),
+         w.writeFencePollWall.P95(), w.writeFencePollWall.maximum,
+         w.writeFencePollCpu.Average());
+    LOGI("[perf.xr.writer.wait] attempt/call/satisfy/timeout/fail=%d/%d/%d/%d/%d "
+         "wall=%.4f/%.4f/%.4fms cpu=%.4fms age=%.2f/%.2f/%.2fms",
+         w.writeFenceWaitAttempts, w.writeFenceWaitCalls,
+         w.writeFenceWaitSatisfied, w.writeFenceWaitTimeouts,
+         w.writeFenceWaitFailed, w.writeFenceWaitWall.Average(),
+         w.writeFenceWaitWall.P95(), w.writeFenceWaitWall.maximum,
+         w.writeFenceWaitCpu.Average(), w.writeFenceWaitAge.Average(),
+         w.writeFenceWaitAge.P95(), w.writeFenceWaitAge.maximum);
+    LOGI("[perf.xr.repeat] zc attempt/accepted/endfail=%d/%d/%d copy_fallback=%d",
+         w.zeroCopyRepeatAttempts, w.zeroCopyRepeatAccepted,
+         w.zeroCopyRepeatAttempts - w.zeroCopyRepeatAccepted,
+         w.repeatCopyFallbacks);
     LOGI("[perf.xr.fxaa] requested=%d active=%d draws=%d fallback=%d errors=%d "
          "submitW=%.3f/%.3f/%.3fms (CPU/driver)",
          w.last.fxaaRequested ? 1 : 0, w.last.fxaaActive ? 1 : 0,
@@ -2329,6 +2489,42 @@ void EmitPresentWindow(double endMs) {
          w.stereoSyncWait.Average(), w.stereoSyncWait.P95(),
          w.stereoSyncWait.maximum, w.submittedStereoAge.Average(),
          w.submittedStereoAge.P95(), w.submittedStereoAge.maximum);
+    LOGI("[perf.xr.path] proj ok/notry/noswap/nopair/genpre/notime/stale/size/pose="
+         "%d/%d/%d/%d/%d/%d/%d/%d/%d "
+         "swap aL/wL/rL/aR/wR/rR/genpost=%d/%d/%d/%d/%d/%d/%d recover=%d lease=%d "
+         "fallback game/black/fail=%d/%d/%d releaseFail=%d/%d stale=%d "
+         "streak=%d gate=%d recovery=%d switches=%d candAge=%.1f/%.1f/%.1fms "
+         "buckets=%.0f/%.0f/%.0f/%.0f/%.0f/u%d",
+         outcomeCount(StereoProjectionOutcome::Submitted),
+         outcomeCount(StereoProjectionOutcome::NotAttempted),
+         outcomeCount(StereoProjectionOutcome::NoSwapchains),
+         outcomeCount(StereoProjectionOutcome::NoSafePair),
+         outcomeCount(StereoProjectionOutcome::GenerationPre),
+         outcomeCount(StereoProjectionOutcome::NoTimestamp),
+         outcomeCount(StereoProjectionOutcome::StaleRejected),
+         outcomeCount(StereoProjectionOutcome::BadDimensions),
+         outcomeCount(StereoProjectionOutcome::MissingPose),
+         outcomeCount(StereoProjectionOutcome::AcquireLeft),
+         outcomeCount(StereoProjectionOutcome::WaitLeft),
+         outcomeCount(StereoProjectionOutcome::ReleaseLeft),
+         outcomeCount(StereoProjectionOutcome::AcquireRight),
+         outcomeCount(StereoProjectionOutcome::WaitRight),
+         outcomeCount(StereoProjectionOutcome::ReleaseRight),
+         outcomeCount(StereoProjectionOutcome::GenerationPost),
+         outcomeCount(StereoProjectionOutcome::RecoveryHold),
+         outcomeCount(StereoProjectionOutcome::ReadLeaseConflict),
+         w.fallbackGameSurface, w.fallbackBlack, w.fallbackFailed,
+         w.releaseFailuresLeft, w.releaseFailuresRight, w.staleRejects,
+         w.repeatStreakMax, static_cast<int>(w.last.stereoLivenessState),
+         w.last.stereoRecoveryProgress, w.presentPathSwitches,
+         w.candidateStereoAge.Average(), w.candidateStereoAge.P95(),
+         w.candidateStereoAge.maximum,
+         static_cast<double>(w.candidateAgeLe25),
+         static_cast<double>(w.candidateAge25To50),
+         static_cast<double>(w.candidateAge50To100),
+         static_cast<double>(w.candidateAge100To500),
+         static_cast<double>(w.candidateAgeOver500),
+         w.candidateAgeUnknown);
     LOGI("[perf.xr.t] loop=%.2f/%.2f/%.2f pred=%.2f/%.2f/%.2f "
          "updateW=%.2f/%.2f/%.2f updateCPU=%.2f "
          "wait=%.2f/%.2f/%.2f work=%.2f/%.2f/%.2f "
@@ -2344,16 +2540,17 @@ void EmitPresentWindow(double endMs) {
 
     if (FILE* file = OpenXrCsv()) {
         std::fprintf(file,
-            "%.3f,%d,%d,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
+            "%.3f,%d,%d,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
             "%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
             "%d,%.3f,%.4f,%d,%.4f,%d,%.4f,"
             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
             "%.4f,%.4f,%.4f,%.4f,"
             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
             "%.4f,%.4f,%.4f,%.4f,"
-            "%d,%d,%d,%d,%d,%.4f,%.4f,%.4f\n",
+            "%d,%d,%d,%d,%d,%.4f,%.4f,%.4f",
             seconds, w.attempts, w.successfulPresents, presentHz,
             w.endFailures, w.last.endResult, w.generationRaces,
+            w.writeClaimBusyDrops,
             w.freshSequences,
             w.repeatedSequences, w.noStereoSequence, w.sequenceJumps,
             w.noLayers, w.shouldNotRender, w.last.theaterMode ? 1 : 0,
@@ -2376,6 +2573,54 @@ void EmitPresentWindow(double endMs) {
             w.fxaaDraws, w.fxaaFallbacks, w.fxaaErrors,
             w.fxaaSubmitWall.Average(), w.fxaaSubmitWall.P95(),
             w.fxaaSubmitWall.maximum);
+        std::fprintf(file,
+            ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
+            "%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,"
+            "%d,%d,%d,%d,%d,%d,%d,"
+            "%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,"
+            "%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d\n",
+            outcomeCount(StereoProjectionOutcome::NotAttempted),
+            outcomeCount(StereoProjectionOutcome::Submitted),
+            outcomeCount(StereoProjectionOutcome::NoSwapchains),
+            outcomeCount(StereoProjectionOutcome::NoSafePair),
+            outcomeCount(StereoProjectionOutcome::GenerationPre),
+            outcomeCount(StereoProjectionOutcome::NoTimestamp),
+            outcomeCount(StereoProjectionOutcome::StaleRejected),
+            outcomeCount(StereoProjectionOutcome::BadDimensions),
+            outcomeCount(StereoProjectionOutcome::MissingPose),
+            outcomeCount(StereoProjectionOutcome::AcquireLeft),
+            outcomeCount(StereoProjectionOutcome::WaitLeft),
+            outcomeCount(StereoProjectionOutcome::ReleaseLeft),
+            outcomeCount(StereoProjectionOutcome::AcquireRight),
+            outcomeCount(StereoProjectionOutcome::WaitRight),
+            outcomeCount(StereoProjectionOutcome::ReleaseRight),
+            outcomeCount(StereoProjectionOutcome::GenerationPost),
+            outcomeCount(StereoProjectionOutcome::RecoveryHold),
+            outcomeCount(StereoProjectionOutcome::ReadLeaseConflict),
+            w.fallbackGameSurface, w.fallbackBlack, w.fallbackFailed,
+            w.releaseFailuresLeft, w.releaseFailuresRight, w.staleRejects,
+            w.repeatStreakMax, static_cast<int>(w.last.stereoLivenessState),
+            w.recoveryProgressMax,
+            w.candidateStereoAge.Average(), w.candidateStereoAge.P95(),
+            w.candidateStereoAge.maximum,
+            w.candidateAgeLe25, w.candidateAge25To50,
+            w.candidateAge50To100, w.candidateAge100To500,
+            w.candidateAgeOver500, w.candidateAgeUnknown,
+            w.presentPathSwitches, w.writeClaimRescues,
+            w.writeFencePollAttempts, w.writeFencePollSkipped,
+            w.writeFencePollLockBusy, w.writeFencePollMatched,
+            w.writeFencePollRetired, w.writeFencePollTimeouts,
+            w.writeFencePollWaitFailed, w.writeFencePollWall.Average(),
+            w.writeFencePollWall.P95(), w.writeFencePollWall.maximum,
+            w.writeFencePollCpu.Average(),
+            w.writeFenceWaitAttempts, w.writeFenceWaitCalls,
+            w.writeFenceWaitSatisfied, w.writeFenceWaitTimeouts,
+            w.writeFenceWaitFailed, w.writeFenceWaitWall.Average(),
+            w.writeFenceWaitWall.P95(), w.writeFenceWaitWall.maximum,
+            w.writeFenceWaitCpu.Average(), w.writeFenceWaitAge.Average(),
+            w.writeFenceWaitAge.P95(), w.writeFenceWaitAge.maximum,
+            freshHz, w.zeroCopyRepeatAttempts, w.zeroCopyRepeatAccepted,
+            w.repeatCopyFallbacks);
         static int rowsSinceFlush = 0;
         if (++rowsSinceFlush >= 5) {
             std::fflush(file);
@@ -2817,8 +3062,13 @@ DebugStatsSnapshot GetDebugStats() {
     snapshot.runtimeGpuMs = g_debugStats.runtimeGpuMs.load(std::memory_order_relaxed);
     snapshot.endFailures = g_debugStats.endFailures.load(std::memory_order_relaxed);
     snapshot.ringRaces = g_debugStats.ringRaces.load(std::memory_order_relaxed);
+    snapshot.freshHz = g_debugStats.freshHz.load(std::memory_order_relaxed);
     snapshot.fresh = g_debugStats.fresh.load(std::memory_order_relaxed);
     snapshot.repeated = g_debugStats.repeated.load(std::memory_order_relaxed);
+    snapshot.writeClaimBusyDrops =
+        g_debugStats.writeClaimBusyDrops.load(std::memory_order_relaxed);
+    snapshot.writeClaimRescues =
+        g_debugStats.writeClaimRescues.load(std::memory_order_relaxed);
     snapshot.stereoSyncWaits =
         g_debugStats.stereoSyncWaits.load(std::memory_order_relaxed);
     snapshot.stereoSyncRescued =
@@ -2827,6 +3077,16 @@ DebugStatsSnapshot GetDebugStats() {
         g_debugStats.stereoSyncTimeouts.load(std::memory_order_relaxed);
     snapshot.stereoSyncWaitMs =
         g_debugStats.stereoSyncWaitMs.load(std::memory_order_relaxed);
+    snapshot.stereoStaleRejects =
+        g_debugStats.stereoStaleRejects.load(std::memory_order_relaxed);
+    snapshot.stereoBlackFallbacks =
+        g_debugStats.stereoBlackFallbacks.load(std::memory_order_relaxed);
+    snapshot.stereoRepeatStreakMax =
+        g_debugStats.stereoRepeatStreakMax.load(std::memory_order_relaxed);
+    snapshot.stereoLivenessState =
+        g_debugStats.stereoLivenessState.load(std::memory_order_relaxed);
+    snapshot.stereoRecoveryProgress =
+        g_debugStats.stereoRecoveryProgress.load(std::memory_order_relaxed);
     snapshot.fxaaRequested =
         g_debugStats.fxaaRequested.load(std::memory_order_relaxed);
     snapshot.fxaaActive = g_debugStats.fxaaActive.load(std::memory_order_relaxed);
@@ -2886,6 +3146,27 @@ void SubmitGameFrame(const GameFrameSample& sample) {
     }
 
     const bool rendered = sample.renderSceneCalls > 0;
+    // Rare-frame tracing is deliberately event driven.  Normal 72 Hz frames do
+    // no formatting or logging; at most four over-budget frames per second are
+    // expanded below so logcat itself cannot become the next hitch source.
+    constexpr double kHitchTraceThresholdMs = 16.0;
+    constexpr int kHitchTraceMaxPerSecond = 4;
+    static double hitchTraceWindowStartMs = 0.0;
+    static int hitchTraceWindowLogs = 0;
+    bool hitchTraceRequested = false;
+    bool hitchTraceDetailed = false;
+    if (rendered && std::isfinite(sample.implWallMs) &&
+        sample.implWallMs >= kHitchTraceThresholdMs) {
+        if (hitchTraceWindowStartMs <= 0.0 ||
+            sample.monoMs - hitchTraceWindowStartMs >= 1000.0) {
+            hitchTraceWindowStartMs = sample.monoMs;
+            hitchTraceWindowLogs = 0;
+        }
+        if (hitchTraceWindowLogs < kHitchTraceMaxPerSecond) {
+            ++hitchTraceWindowLogs;
+            hitchTraceRequested = true;
+        }
+    }
     w.renderSceneCalls += std::max(0, sample.renderSceneCalls);
     if (rendered) {
         ++w.renderedCallbacks;
@@ -2899,6 +3180,22 @@ void SubmitGameFrame(const GameFrameSample& sample) {
         w.renderSleepActual.Add(sample.sleepActualMs);
     } else {
         ++w.limiterSkips;
+        switch (sample.fadeStatus) {
+            case 0: ++w.noRenderFade0; break;
+            case 1: ++w.noRenderFade1; break;
+            case 2: ++w.noRenderFade2; break;
+            default: ++w.noRenderFadeUnknown; break;
+        }
+        switch (sample.cutsceneRunning) {
+            case 0: ++w.noRenderCutscene0; break;
+            case 1: ++w.noRenderCutscene1; break;
+            default: ++w.noRenderCutsceneUnknown; break;
+        }
+        switch (sample.mobileMenuOpen) {
+            case 0: ++w.noRenderMenu0; break;
+            case 1: ++w.noRenderMenu1; break;
+            default: ++w.noRenderMenuUnknown; break;
+        }
         w.skipWall.Add(sample.implWallMs);
         w.skipCpu.Add(sample.implCpuMs);
         w.skipBlocked.Add(std::max(0.0, sample.implWallMs - sample.implCpuMs));
@@ -3215,6 +3512,69 @@ void SubmitGameFrame(const GameFrameSample& sample) {
                     g_latestStereo.renderQueueWaitAfterScanCpuMs);
                 w.renderQueueWaitMaxUsedKiB.Add(
                     g_latestStereo.renderQueueWaitMaxUsedKiB);
+
+                if (hitchTraceRequested) {
+                    const double implBlocked = std::max(
+                        0.0, sample.implWallMs - sample.implCpuMs);
+                    const double finishBlocked = std::max(
+                        0.0, g_latestStereo.renderQueueFinishWallMs -
+                                 g_latestStereo.renderQueueFinishCpuMs);
+                    const double flushBlocked = std::max(
+                        0.0, g_latestStereo.renderQueueFlushWallMs -
+                                 g_latestStereo.renderQueueFlushCpuMs);
+                    LOGI("[perf.hitch] frame=%u seq=%d period=%.3f "
+                         "impl W/CPU/block=%.3f/%.3f/%.3f core=%d>%d "
+                         "phase W=%.3f/%.3f/%.3f/%.3f/%.3f "
+                         "CPU=%.3f/%.3f/%.3f/%.3f/%.3f "
+                         "pre W=%.3f/%.3f/%.3f/%.3f "
+                         "CPU=%.3f/%.3f/%.3f/%.3f "
+                         "eyes W/CPU=%.3f+%.3f/%.3f+%.3f "
+                         "rq finish c/W/CPU/block/max=%d/%.3f/%.3f/%.3f/%.3f "
+                         "flush c/W/CPU/block/max=%d/%.3f/%.3f/%.3f/%.3f "
+                         "stage W=%.3f/%.3f/%.3f overlap/drain=%.3f/%.3f "
+                         "scene ent/lod/super=%d/%d/%d stream=%d/%d",
+                         sample.gameFrameCounter, currentSequence,
+                         sample.callbackPeriodMs,
+                         sample.implWallMs, sample.implCpuMs, implBlocked,
+                         sample.cpuCoreStart, sample.cpuCore,
+                         enginePreWall, stereoPrepareWall,
+                         g_latestStereo.recordWallMs, stereoTailWall,
+                         enginePostWall,
+                         enginePreCpu, stereoPrepareCpu,
+                         g_latestStereo.recordCpuMs, stereoTailCpu,
+                         enginePostCpu,
+                         beforeScanWall, mainScanWall,
+                         g_latestStereo.enginePreStockScanWallMs,
+                         afterScanWall,
+                         beforeScanCpu, mainScanCpu,
+                         g_latestStereo.enginePreStockScanCpuMs,
+                         afterScanCpu,
+                         g_latestStereo.sceneLeftMs,
+                         g_latestStereo.sceneRightMs,
+                         g_latestStereo.sceneLeftCpuMs,
+                         g_latestStereo.sceneRightCpuMs,
+                         g_latestStereo.renderQueueFinishCalls,
+                         g_latestStereo.renderQueueFinishWallMs,
+                         g_latestStereo.renderQueueFinishCpuMs,
+                         finishBlocked,
+                         g_latestStereo.renderQueueFinishMaxWallMs,
+                         g_latestStereo.renderQueueFlushCalls,
+                         g_latestStereo.renderQueueFlushWallMs,
+                         g_latestStereo.renderQueueFlushCpuMs,
+                         flushBlocked,
+                         g_latestStereo.renderQueueFlushMaxWallMs,
+                         g_latestStereo.renderQueueWaitBeforeScanWallMs,
+                         g_latestStereo.renderQueueWaitMainScanWallMs,
+                         g_latestStereo.renderQueueWaitAfterScanWallMs,
+                         g_latestStereo.renderQueueFinishOverlapWallMs,
+                         g_latestStereo.renderQueueFinishDrainWallMs,
+                         g_latestStereo.visibleEntities,
+                         g_latestStereo.visibleLods,
+                         g_latestStereo.visibleSuperLods,
+                         g_latestStereo.streamingRequests,
+                         g_latestStereo.streamingPriorityRequests);
+                    hitchTraceDetailed = true;
+                }
             } else {
                 ++w.enginePreBreakdownFaults;
             }
@@ -3633,6 +3993,19 @@ void SubmitGameFrame(const GameFrameSample& sample) {
         w.pedAmbientSuccesses.Add(g_latestStereo.pedAmbientSuccesses);
         w.pedAmbientBlocked.Add(g_latestStereo.pedAmbientBlocked);
     }
+
+    if (hitchTraceRequested && !hitchTraceDetailed) {
+        LOGI("[perf.hitch] frame=%u seq=%d period=%.3f "
+             "impl W/CPU/block=%.3f/%.3f/%.3f core=%d>%d "
+             "phase=unavailable fresh=%d stereo=%d render_calls=%d",
+             sample.gameFrameCounter, currentSequence,
+             sample.callbackPeriodMs,
+             sample.implWallMs, sample.implCpuMs,
+             std::max(0.0, sample.implWallMs - sample.implCpuMs),
+             sample.cpuCoreStart, sample.cpuCore,
+             freshStereo ? 1 : 0, sample.stereoActive ? 1 : 0,
+             sample.renderSceneCalls);
+    }
 }
 
 void ResetGameTelemetry() {
@@ -3662,6 +4035,51 @@ void SubmitPresentFrame(const PresentFrameSample& sample) {
     PresentWindow& w = g_presentWindow;
     ++w.attempts;
     w.last = sample;
+    w.writeClaimBusyDrops += std::max(0, sample.stereoWriteClaimBusyDrops);
+    w.writeClaimRescues += std::max(0, sample.stereoWriteClaimRescues);
+    w.writeFencePollAttempts +=
+        std::max(0, sample.stereoWriteFencePollAttempts);
+    w.writeFencePollSkipped +=
+        std::max(0, sample.stereoWriteFencePollSkipped);
+    w.writeFencePollLockBusy +=
+        std::max(0, sample.stereoWriteFencePollLockBusy);
+    w.writeFencePollMatched +=
+        std::max(0, sample.stereoWriteFencePollMatched);
+    w.writeFencePollRetired +=
+        std::max(0, sample.stereoWriteFencePollRetired);
+    w.writeFencePollTimeouts +=
+        std::max(0, sample.stereoWriteFencePollTimeouts);
+    w.writeFencePollWaitFailed +=
+        std::max(0, sample.stereoWriteFencePollWaitFailed);
+    if (sample.stereoWriteFencePollWallMs > 0.0 ||
+        sample.stereoWriteFencePollCpuMs > 0.0) {
+        w.writeFencePollWall.Add(
+            std::max(0.0, sample.stereoWriteFencePollWallMs));
+        w.writeFencePollCpu.Add(
+            std::max(0.0, sample.stereoWriteFencePollCpuMs));
+    }
+    w.writeFenceWaitAttempts +=
+        std::max(0, sample.stereoWriteFenceWaitAttempts);
+    w.writeFenceWaitCalls +=
+        std::max(0, sample.stereoWriteFenceWaitCalls);
+    w.writeFenceWaitSatisfied +=
+        std::max(0, sample.stereoWriteFenceWaitSatisfied);
+    w.writeFenceWaitTimeouts +=
+        std::max(0, sample.stereoWriteFenceWaitTimeouts);
+    w.writeFenceWaitFailed +=
+        std::max(0, sample.stereoWriteFenceWaitFailed);
+    if (sample.stereoWriteFenceWaitWallMs > 0.0 ||
+        sample.stereoWriteFenceWaitCpuMs > 0.0) {
+        w.writeFenceWaitWall.Add(
+            std::max(0.0, sample.stereoWriteFenceWaitWallMs));
+        w.writeFenceWaitCpu.Add(
+            std::max(0.0, sample.stereoWriteFenceWaitCpuMs));
+    }
+    if (sample.stereoWriteFenceWaitAgeSamples > 0) {
+        w.writeFenceWaitAge.Add(std::max(
+            0.0, sample.stereoWriteFenceWaitAgeMs /
+                     static_cast<double>(sample.stereoWriteFenceWaitAgeSamples)));
+    }
     if (sample.loopPeriodMs > 0.0) w.loopPeriod.Add(sample.loopPeriodMs);
     w.consumerUpdate.Add(sample.consumerUpdateMs);
     w.consumerUpdateCpu.Add(sample.consumerUpdateCpuMs);
@@ -3676,8 +4094,55 @@ void SubmitPresentFrame(const PresentFrameSample& sample) {
     }
     if (sample.stereoSyncWaitRescued) ++w.stereoSyncRescued;
     if (sample.stereoSyncWaitTimedOut) ++w.stereoSyncTimeouts;
-    if (sample.submittedStereoSequenceAgeMs > 0.0)
+    if (sample.stereoProjectionOutcome == StereoProjectionOutcome::Submitted &&
+        sample.submittedStereoSequence >= 0 &&
+        sample.submittedStereoSequenceAgeMs > 0.0)
         w.submittedStereoAge.Add(sample.submittedStereoSequenceAgeMs);
+    const int projectionOutcome = std::clamp(
+        static_cast<int>(sample.stereoProjectionOutcome), 0,
+        kStereoProjectionOutcomeCount - 1);
+    ++w.projectionOutcomes[projectionOutcome];
+    switch (sample.stereoFallbackSource) {
+        case StereoFallbackSource::GameSurface: ++w.fallbackGameSurface; break;
+        case StereoFallbackSource::Black:       ++w.fallbackBlack; break;
+        case StereoFallbackSource::Failed:      ++w.fallbackFailed; break;
+        case StereoFallbackSource::None:        break;
+    }
+    if (sample.staleStereoRejected) ++w.staleRejects;
+    if ((sample.eyeReleaseFailureMask & 1u) != 0) ++w.releaseFailuresLeft;
+    if ((sample.eyeReleaseFailureMask & 2u) != 0) ++w.releaseFailuresRight;
+    w.repeatStreakMax = std::max(
+        w.repeatStreakMax, std::max(0, sample.consecutiveStereoRepeats));
+    w.recoveryProgressMax = std::max(
+        w.recoveryProgressMax, std::max(0, sample.stereoRecoveryProgress));
+    if (!sample.theaterMode && sample.shouldRender) {
+        if (sample.candidateStereoSequenceAgeMs > 0.0) {
+            const double age = sample.candidateStereoSequenceAgeMs;
+            w.candidateStereoAge.Add(age);
+            if (age <= 25.0) ++w.candidateAgeLe25;
+            else if (age <= 50.0) ++w.candidateAge25To50;
+            else if (age <= 100.0) ++w.candidateAge50To100;
+            else if (age <= 500.0) ++w.candidateAge100To500;
+            else ++w.candidateAgeOver500;
+        } else {
+            ++w.candidateAgeUnknown;
+        }
+        const bool projection = sample.stereoProjectionOutcome ==
+            StereoProjectionOutcome::Submitted;
+        const bool pathSubmitted = projection ||
+            sample.stereoFallbackSource == StereoFallbackSource::Black ||
+            sample.stereoFallbackSource == StereoFallbackSource::GameSurface;
+        if (pathSubmitted) {
+            if (w.haveLastPresentPath &&
+                projection != w.lastPresentWasProjection) {
+                ++w.presentPathSwitches;
+            }
+            w.haveLastPresentPath = true;
+            w.lastPresentWasProjection = projection;
+        }
+    } else {
+        w.haveLastPresentPath = false;
+    }
     w.fxaaDraws += std::max(0, sample.fxaaDraws);
     w.fxaaFallbacks += std::max(0, sample.fxaaFallbacks);
     // Error count is a persistent gauge from the XR renderer, not a per-frame
@@ -3688,12 +4153,15 @@ void SubmitPresentFrame(const PresentFrameSample& sample) {
     if (!sample.shouldRender) ++w.shouldNotRender;
     if (sample.layerCount == 0) ++w.noLayers;
     if (sample.stereoGenerationRace) ++w.generationRaces;
+    if (sample.stereoZeroCopyRepeat) ++w.zeroCopyRepeatAttempts;
+    if (sample.stereoRepeatCopyFallback) ++w.repeatCopyFallbacks;
 
     if (!sample.endSucceeded) {
         ++w.endFailures;
         return;
     }
     ++w.successfulPresents;
+    if (sample.stereoZeroCopyRepeat) ++w.zeroCopyRepeatAccepted;
 
     const int sequence = sample.submittedStereoSequence;
     if (sequence < 0) {

@@ -1,5 +1,8 @@
 #include "VrFire.h"
 
+#include "Basketball.h"
+
+#include "Calib.h"
 #include "Driving.h"
 #include "Log.h"
 #include "ScopeAim.h"
@@ -169,7 +172,7 @@ bool GetPhysicalRay(void* shooter, int weaponType, Vec3& origin, Vec3& direction
     // DEFAULT driving keeps the vanilla drive-by ownership rules.
     if (!g.FindPlayerVehicle) return false;
     if (g.FindPlayerVehicle(-1, false) != nullptr &&
-        driving::GetMode() != driving::MODE_IMMERSIVE)
+        !driving::VehicleWeaponsImmersive())
         return false;
 
     const PhysicalFireQuery query =
@@ -205,7 +208,7 @@ bool GetPhysicalTrigger(void* ped, int& weaponType, int& hand, float& level) {
     if (!ped || !g.FindPlayerPed || ped != g.FindPlayerPed(-1)) return false;
     const bool inVehicle =
         g.FindPlayerVehicle && g.FindPlayerVehicle(-1, false) != nullptr;
-    if (inVehicle && driving::GetMode() != driving::MODE_IMMERSIVE)
+    if (inVehicle && !driving::VehicleWeaponsImmersive())
         return false;
 
     const auto* bytes = reinterpret_cast<const std::uint8_t*>(ped);
@@ -393,6 +396,16 @@ bool FireControllerRay(void* weapon, void* shooter, int weaponType,
         reinterpret_cast<const std::uint8_t*>(wi) + 0x08);
     if (!std::isfinite(range)) return false;
     range = std::clamp(range, 1.0f, 300.0f);
+
+    const float recoilAmp = calib::RecoilAmplitude();
+    if (recoilAmp > 0.0f) {
+        const PhysicalFireQuery recoilQuery =
+            g_physicalFireQuery.load(std::memory_order_acquire);
+        int recoilHand = -1;
+        if (recoilQuery && recoilQuery(weaponType, &recoilHand) &&
+            recoilHand >= 0 && recoilHand <= 1)
+            xr::TriggerHaptic(recoilHand, recoilAmp, 120.0f, 60.0f);
+    }
     const Vec3 end{origin.x + direction.x * range,
                    origin.y + direction.y * range,
                    origin.z + direction.z * range};
@@ -516,6 +529,8 @@ bool OnFireInstantHit(void* weapon, void* firingEntity,
                       Vec3* driveByOrigin, bool arg6, bool muzzle) {
     if (!g_origFireInstantHit) return false;
     if (g_insideHook || !weapon) {
+        if (!g_insideHook && origin && target)
+            basketball::OnBulletShot(&origin->x, &target->x, true);
         return g_origFireInstantHit(weapon, firingEntity, origin, muzzlePos,
                                     targetEntity, target, driveByOrigin,
                                     arg6, muzzle);
@@ -528,10 +543,15 @@ bool OnFireInstantHit(void* weapon, void* firingEntity,
     if (!GetPhysicalRay(firingEntity, weaponType, vrOrigin, vrDirection,
                         &suppressShot)) {
         if (suppressShot) return false;
+        if (origin && target)
+            basketball::OnBulletShot(&origin->x, &target->x, true);
         return g_origFireInstantHit(weapon, firingEntity, origin, muzzlePos,
                                     targetEntity, target, driveByOrigin,
                                     arg6, muzzle);
     }
+
+    // The basketball listens to every shot: a hit deflates it.
+    basketball::OnBulletShot(&vrOrigin.x, &vrDirection.x, false);
 
     g_insideHook = true;
     const bool fired = FireControllerRay(
@@ -539,6 +559,8 @@ bool OnFireInstantHit(void* weapon, void* firingEntity,
     g_insideHook = false;
     if (fired) return true;
     if (suppressShot) return false;
+    if (origin && target)
+        basketball::OnBulletShot(&origin->x, &target->x, true);
     return g_origFireInstantHit(weapon, firingEntity, origin, muzzlePos,
                                 targetEntity, target, driveByOrigin,
                                 arg6, muzzle);
@@ -681,7 +703,7 @@ void Update(bool blocked) {
         !g.CWeapon_Fire || !g.CTimer_m_snTimeInMilliseconds ||
         !g.FindPlayerPed ||
         (g.FindPlayerVehicle && g.FindPlayerVehicle(-1, false) &&
-         driving::GetMode() != driving::MODE_IMMERSIVE)) {
+         !driving::VehicleWeaponsImmersive())) {
         ResetDirectTrigger();
         return;
     }

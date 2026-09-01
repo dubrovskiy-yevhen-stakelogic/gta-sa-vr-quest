@@ -1,6 +1,6 @@
 # GTA San Andreas VR for Quest — Source Kit
 
-Version `0.1.1 alpha`.
+Version `0.1.2 alpha`.
 
 This repository contains the source code and build/install tools for the GTA
 San Andreas VR Quest mod. It does **not** contain GTA San Andreas, Rockstar
@@ -9,7 +9,7 @@ assets, the sound mod, a prebuilt APK, native binaries, or signing keys.
 > [!TIP]
 > **Join the Flat2VR Discord!** Development updates, player feedback, testing,
 > and discussion of the mod take place in the
-> [GTA San Andreas VR discussion channel](https://discord.com/channels/747967102895390741/1540234546182750228).
+> [GTA San Andreas VR discussion channel](https://discord.com/channels/747967102895390741/1543691482861408276).
 > Join the Flat2VR server first if the channel link does not open for you.
 
 ## Requirements
@@ -120,6 +120,11 @@ changing anything on Quest. It installs the APK set, deploys `data_main`, audio,
 and VR hands, verifies the resulting hashes, and leaves the game stopped. It
 never launches the game automatically.
 
+During validation, the wizard also generates the distant aircraft HLOD from
+the selected, verified retail `data_main` split. Generated geometry stays in
+the ignored per-run build directory; the repository ships only the open source
+generator and runtime renderer.
+
 The original Play APKs must be signed with a personal key. A first installation
 may therefore require removal of an installed copy that uses a different
 signature. The wizard backs up accessible saves and settings first and **always
@@ -197,11 +202,11 @@ Remove old player overrides after compiled calibration defaults change:
 - Linux/macOS: run `bash RESET_VR_SETTINGS.sh`.
 
 The script selects the connected Quest, prints the exact plan, and asks for the
-word `RESET`. It then stops GTA SA, removes only the eight exact VR settings
+word `RESET`. It then stops GTA SA, removes only the nine exact VR settings
 files listed in [BUILDING.md](BUILDING.md), and verifies the result. Saves,
 `audio`, `vrhands`, game data, APKs, and performance CSV files remain intact.
 The game is not launched; new compiled defaults take effect after the next
-manual start. Version 0.1.1 embeds the author's release-Quest menu,
+manual start. Version 0.1.2 embeds the author's release-Quest menu,
 weapon, HUD, holster, and vehicle calibration as its defaults. The sole quality
 override is the eye-buffer resolution, which resets to `100%`.
 

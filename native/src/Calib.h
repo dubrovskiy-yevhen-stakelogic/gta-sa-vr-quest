@@ -101,6 +101,13 @@ const char*  HolsterFieldUnit(int field);                                // CM /
 bool LaserEnabled();
 void SetLaserEnabled(bool enabled);   // persists immediately when changed
 void ToggleLaser();                   // persists immediately
+
+// Controller recoil kick per shot. Level 0..3 (OFF/LOW/MEDIUM/HIGH).
+int RecoilLevel();
+const char* RecoilLevelName();
+float RecoilAmplitude();
+void SetRecoilLevel(int level);       // persists immediately when changed
+void CycleRecoil(int direction);      // wraps OFF..HIGH, persists
 bool LaserLocked(int weaponType);
 bool LaserLocked();
 void MarkLaserDirty();                // active weapon's working AIM is unconfirmed

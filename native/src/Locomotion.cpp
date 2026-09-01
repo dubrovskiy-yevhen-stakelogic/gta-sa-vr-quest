@@ -6,7 +6,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <mutex>
+#include <string>
 
 namespace savr::locomotion {
 namespace {
@@ -46,16 +48,27 @@ std::atomic<bool> g_flightCameraTilt{false};
 // 0 = CINEMA (theater), 1 = CINEMATIC (head-tracked director camera),
 // 2 = FIRST PERSON (anchored on cutscene-CJ's head bone).
 std::atomic<int> g_cutsceneMode{0};
+// GAMEPLAY cutscenes: scripted mission cameras that run mid-gameplay
+// (player controls disabled + widescreen borders, CCutsceneMgr NOT running).
+// Separate knob from story cutscenes because players commonly want
+// cinematic story scenes but first-person in-mission shots. Default is
+// FIRST PERSON: stay in CJ's head instead of dropping to the theater.
+std::atomic<int> g_gameCutsceneMode{2};
 std::atomic<bool> g_welcomeSeen{false};
-// Face-button bindings, VC-port layout tables: A/B/X/Y each name the action
-// they trigger on foot.
+std::map<std::string, int> g_cutsceneCameras;
+// Gameplay bindings. L3/R3 are included but raw stick-click chords used by
+// menus, recentering and cutscenes are deliberately handled before this map.
 constexpr int kBindingDefault[BIND_SRC_COUNT]={
-    BIND_ACT_SPRINT, BIND_ACT_ATTACK, BIND_ACT_JUMP, BIND_ACT_ENTER};
+    BIND_ACT_SPRINT, BIND_ACT_ATTACK, BIND_ACT_JUMP, BIND_ACT_ENTER,
+    BIND_ACT_CROUCH, BIND_ACT_NONE};
 constexpr int kBindingSwapped[BIND_SRC_COUNT]={
-    BIND_ACT_JUMP, BIND_ACT_ENTER, BIND_ACT_SPRINT, BIND_ACT_ATTACK};
+    BIND_ACT_JUMP, BIND_ACT_ENTER, BIND_ACT_SPRINT, BIND_ACT_ATTACK,
+    BIND_ACT_CROUCH, BIND_ACT_NONE};
 std::atomic<int> g_binding[BIND_SRC_COUNT]={
     {kBindingDefault[0]},{kBindingDefault[1]},
-    {kBindingDefault[2]},{kBindingDefault[3]}};
+    {kBindingDefault[2]},{kBindingDefault[3]},
+    {kBindingDefault[4]},{kBindingDefault[5]}};
+std::atomic<bool> g_stickOption[STICK_OPT_COUNT]{};
 
 void Save() {
     std::lock_guard<std::mutex> lock(g_saveMutex);
@@ -75,11 +88,21 @@ void Save() {
                  g_parachuteImmersiveControl.load()?1:0);
     std::fprintf(file,"FlightCameraTilt=%d\n",g_flightCameraTilt.load()?1:0);
     std::fprintf(file,"CutsceneMode=%d\n",g_cutsceneMode.load());
+    std::fprintf(file,"GameCutsceneMode=%d\n",g_gameCutsceneMode.load());
+    for (const auto& [scene, camera] : g_cutsceneCameras)
+        std::fprintf(file,"CutsceneCamera.%s=%d\n",scene.c_str(),camera);
     std::fprintf(file,"WelcomeShown=%d\n",g_welcomeSeen.load()?1:0);
     std::fprintf(file,"BindA=%d\n",g_binding[0].load());
     std::fprintf(file,"BindB=%d\n",g_binding[1].load());
     std::fprintf(file,"BindX=%d\n",g_binding[2].load());
     std::fprintf(file,"BindY=%d\n",g_binding[3].load());
+    std::fprintf(file,"BindL3=%d\n",g_binding[4].load());
+    std::fprintf(file,"BindR3=%d\n",g_binding[5].load());
+    std::fprintf(file,"SwapSticks=%d\n",g_stickOption[STICK_OPT_SWAP].load()?1:0);
+    std::fprintf(file,"InvertMoveX=%d\n",g_stickOption[STICK_OPT_MOVE_X_INVERT].load()?1:0);
+    std::fprintf(file,"InvertMoveY=%d\n",g_stickOption[STICK_OPT_MOVE_Y_INVERT].load()?1:0);
+    std::fprintf(file,"InvertTurnX=%d\n",g_stickOption[STICK_OPT_TURN_X_INVERT].load()?1:0);
+    std::fprintf(file,"InvertTurnY=%d\n",g_stickOption[STICK_OPT_TURN_Y_INVERT].load()?1:0);
     std::fclose(file);
 }
 
@@ -88,9 +111,12 @@ void Load() {
     int chuteFollow=1,autoChute=0,chuteImmersive=0,flightTilt=0;
     int gestureRun=1,gestureSwim=1;
     int cutsceneMode=0;
+    int gameCutsceneMode=2;
     int welcomeSeen=0;
     int bind[BIND_SRC_COUNT]={kBindingDefault[0],kBindingDefault[1],
-                              kBindingDefault[2],kBindingDefault[3]};
+                              kBindingDefault[2],kBindingDefault[3],
+                              kBindingDefault[4],kBindingDefault[5]};
+    int stick[STICK_OPT_COUNT]{};
     if (FILE* file=std::fopen(kPath,"r")) {
         char line[128];
         while (std::fgets(line,sizeof(line),file)) {
@@ -114,12 +140,29 @@ void Load() {
                 cutsceneMode=value?2:0;   // legacy boolean key
             else if (std::sscanf(line,"CutsceneMode=%d",&value)==1)
                 cutsceneMode=value;
-            else if (std::sscanf(line,"WelcomeShown=%d",&value)==1)
-                welcomeSeen=value;
-            else if (std::sscanf(line,"BindA=%d",&value)==1) bind[0]=value;
-            else if (std::sscanf(line,"BindB=%d",&value)==1) bind[1]=value;
-            else if (std::sscanf(line,"BindX=%d",&value)==1) bind[2]=value;
-            else if (std::sscanf(line,"BindY=%d",&value)==1) bind[3]=value;
+            else if (std::sscanf(line,"GameCutsceneMode=%d",&value)==1)
+                gameCutsceneMode=value;
+            else {
+                char scene[64]{};
+                if (std::sscanf(line,"CutsceneCamera.%63[A-Za-z0-9_.-]=%d",
+                                scene,&value)==2) {
+                    g_cutsceneCameras[scene]=std::max(0,value);
+                    continue;
+                }
+                if (std::sscanf(line,"WelcomeShown=%d",&value)==1)
+                    welcomeSeen=value;
+                else if (std::sscanf(line,"BindA=%d",&value)==1) bind[0]=value;
+                else if (std::sscanf(line,"BindB=%d",&value)==1) bind[1]=value;
+                else if (std::sscanf(line,"BindX=%d",&value)==1) bind[2]=value;
+                else if (std::sscanf(line,"BindY=%d",&value)==1) bind[3]=value;
+                else if (std::sscanf(line,"BindL3=%d",&value)==1) bind[4]=value;
+                else if (std::sscanf(line,"BindR3=%d",&value)==1) bind[5]=value;
+                else if (std::sscanf(line,"SwapSticks=%d",&value)==1) stick[0]=value;
+                else if (std::sscanf(line,"InvertMoveX=%d",&value)==1) stick[1]=value;
+                else if (std::sscanf(line,"InvertMoveY=%d",&value)==1) stick[2]=value;
+                else if (std::sscanf(line,"InvertTurnX=%d",&value)==1) stick[3]=value;
+                else if (std::sscanf(line,"InvertTurnY=%d",&value)==1) stick[4]=value;
+            }
         }
         std::fclose(file);
     }
@@ -135,11 +178,14 @@ void Load() {
     g_parachuteImmersiveControl.store(chuteImmersive!=0);
     g_flightCameraTilt.store(flightTilt!=0);
     g_cutsceneMode.store(cutsceneMode<0?0:(cutsceneMode>2?2:cutsceneMode));
+    g_gameCutsceneMode.store(
+        gameCutsceneMode<0?0:(gameCutsceneMode>2?2:gameCutsceneMode));
     g_welcomeSeen.store(welcomeSeen!=0);
     for (int i=0;i<BIND_SRC_COUNT;++i)
         g_binding[i].store(
             bind[i]>=BIND_ACT_NONE&&bind[i]<BIND_ACT_COUNT
                 ?bind[i]:kBindingDefault[i]);
+    for (int i=0;i<STICK_OPT_COUNT;++i) g_stickOption[i].store(stick[i]!=0);
     const char* movementName=g_movement.load()==MOVEMENT_BODY?"BODY":
         (g_movement.load()==MOVEMENT_HEAD?"HEAD":"HEAD TURN EXP");
     const char* turnName=g_turn.load()==TURN_SNAP?"SNAP":"SMOOTH";
@@ -193,6 +239,7 @@ const char* ButtonActionName(int action) {
         case BIND_ACT_JUMP:   return "JUMP";
         case BIND_ACT_ATTACK: return "ATTACK / FIRE";
         case BIND_ACT_ENTER:  return "ENTER / EXIT";
+        case BIND_ACT_CROUCH: return "CROUCH";
         default:              return "UNUSED";
     }
 }
@@ -202,6 +249,8 @@ const char* ButtonSourceName(int source) {
         case BIND_SRC_B: return "B";
         case BIND_SRC_X: return "X";
         case BIND_SRC_Y: return "Y";
+        case BIND_SRC_L3:return "L3";
+        case BIND_SRC_R3:return "R3";
         default:         return "?";
     }
 }
@@ -212,9 +261,46 @@ const char* ControlsLayoutName() {
         default:                            return "CUSTOM";
     }
 }
-bool ActionHeld(int action, bool a, bool b, bool x, bool y, bool onFoot) {
+bool GetStickOption(int option) {
     EnsureInit();
-    const bool held[BIND_SRC_COUNT]={a,b,x,y};
+    return option>=0 && option<STICK_OPT_COUNT && g_stickOption[option].load();
+}
+void ToggleStickOption(int option) {
+    EnsureInit();
+    if (option<0 || option>=STICK_OPT_COUNT) return;
+    g_stickOption[option].store(!g_stickOption[option].load());
+    Save();
+}
+const char* StickOptionName(int option) {
+    return GetStickOption(option) ? "ON" : "OFF";
+}
+void ResetControls() {
+    EnsureInit();
+    for (int i=0;i<BIND_SRC_COUNT;++i) g_binding[i].store(kBindingDefault[i]);
+    for (int i=0;i<STICK_OPT_COUNT;++i) g_stickOption[i].store(false);
+    Save();
+}
+void MapGameplaySticks(float leftX, float leftY, float rightX, float rightY,
+                       float* moveX, float* moveY,
+                       float* turnX, float* turnY) {
+    EnsureInit();
+    float mx=leftX,my=leftY,tx=rightX,ty=rightY;
+    if (g_stickOption[STICK_OPT_SWAP].load()) {
+        mx=rightX; my=rightY; tx=leftX; ty=leftY;
+    }
+    if (g_stickOption[STICK_OPT_MOVE_X_INVERT].load()) mx=-mx;
+    if (g_stickOption[STICK_OPT_MOVE_Y_INVERT].load()) my=-my;
+    if (g_stickOption[STICK_OPT_TURN_X_INVERT].load()) tx=-tx;
+    if (g_stickOption[STICK_OPT_TURN_Y_INVERT].load()) ty=-ty;
+    if (moveX) *moveX=mx;
+    if (moveY) *moveY=my;
+    if (turnX) *turnX=tx;
+    if (turnY) *turnY=ty;
+}
+bool ActionHeld(int action, bool a, bool b, bool x, bool y,
+                bool l3, bool r3, bool onFoot) {
+    EnsureInit();
+    const bool held[BIND_SRC_COUNT]={a,b,x,y,l3,r3};
     for (int i=0;i<BIND_SRC_COUNT;++i) {
         const int bound=onFoot?g_binding[i].load():kBindingDefault[i];
         if (bound==action&&held[i]) return true;
@@ -304,6 +390,31 @@ const char* CutsceneModeName() {
         case 2:  return "FIRST PERSON";
         default: return "CINEMA";
     }
+}
+int GameCutsceneMode() { EnsureInit(); return g_gameCutsceneMode.load(); }
+void CycleGameCutsceneMode(int direction) {
+    EnsureInit();
+    g_gameCutsceneMode.store((g_gameCutsceneMode.load()+direction+3)%3);
+    Save();
+}
+const char* GameCutsceneModeName() {
+    switch (GameCutsceneMode()) {
+        case 1:  return "CINEMATIC";
+        case 2:  return "FIRST PERSON";
+        default: return "CINEMA";
+    }
+}
+int RememberedCutsceneCamera(const char* scene) {
+    EnsureInit();
+    if (!scene || !*scene) return -1;
+    const auto it=g_cutsceneCameras.find(scene);
+    return it==g_cutsceneCameras.end()?-1:it->second;
+}
+void RememberCutsceneCamera(const char* scene,int camera) {
+    EnsureInit();
+    if (!scene||!*scene) return;
+    g_cutsceneCameras[scene]=std::max(0,camera);
+    Save();
 }
 void ToggleFlightCameraTilt() {
     EnsureInit();

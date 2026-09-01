@@ -13,6 +13,7 @@ ADB=""
 ADB_BASE=()
 SETTINGS_FILES=(
   vr_appearance.ini
+  vr_basketball.ini
   vr_calib.ini
   vr_calib.ini.tmp
   vr_driving.ini

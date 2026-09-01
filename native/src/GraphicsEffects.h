@@ -13,17 +13,19 @@ void RenderEye(void* rwCamera, int eye);
 void RenderSkyEye(void* rwCamera, int eye);
 
 // Replay SA's own C3dMarkers::Render into the active stereo eye. This is kept
-// independent from the experimental effects profile so mission arrows and
-// checkpoint geometry work in the normal profile-0 build.
+// independent from the aggregate world-effects switch so mission arrows and
+// checkpoint geometry remain visible when optional effects are disabled.
 bool RenderStockMarkersEye(int eye);
 
-// Process-start setting read from debug.savr.effects:
-//   0 = stock stereo baseline (late effects absent from the eye textures)
-//   1 = minimum VR-safe effects: fire/blood, skidmarks/glass, ropes and
-//       situational water cannons
+// Internal process-start tier read from debug.savr.effects:
+//   1 = default VR-safe effects: fire/blood, skidmarks/glass, ropes,
+//       situational water cannons and searchlights
 //   2 = balanced VR-safe effects
 //   3 = extended geometry effects
+// Tier 0 is retired: players control the entire stable tier through the
+// persisted WORLD EFFECTS row in the graphics menu instead of an adb property.
 int Profile();
+bool Enabled();
 
 // The eye pass is fail-safe: profiles 2/3 stay inert until the guarded retail
 // GOT hook confirms that the now-invisible flat RenderEffects pass is

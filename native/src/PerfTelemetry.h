@@ -4,6 +4,45 @@
 
 namespace savr::perf {
 
+// Mutually-exclusive result of the gameplay stereo projection attempt.  These
+// values are persisted verbatim in the aggregate XR telemetry, so keep their
+// numeric order stable when extending the list.
+enum class StereoProjectionOutcome : int {
+    NotAttempted = 0,
+    Submitted,
+    NoSwapchains,
+    NoSafePair,
+    GenerationPre,
+    NoTimestamp,
+    StaleRejected,
+    BadDimensions,
+    MissingPose,
+    AcquireLeft,
+    WaitLeft,
+    ReleaseLeft,
+    AcquireRight,
+    WaitRight,
+    ReleaseRight,
+    GenerationPost,
+    RecoveryHold,
+    ReadLeaseConflict,
+    Count,
+};
+
+enum class StereoFallbackSource : int {
+    None = 0,
+    GameSurface,
+    Black,
+    Failed,
+};
+
+enum class StereoLivenessState : int {
+    Live = 0,
+    Grace,
+    Stale,
+    Recovering,
+};
+
 // Monotonic wall time and CPU time consumed by the calling thread. Keeping both
 // is essential here: a long wall time with little thread CPU is a driver/wait or
 // descheduling stall, while similar wall/CPU values mean real CPU work.
@@ -227,12 +266,20 @@ struct DebugStatsSnapshot {
     double runtimeGpuMs{};
     int    endFailures{};
     int    ringRaces{};
+    double freshHz{};
     int    fresh{};
     int    repeated{};
+    int    writeClaimBusyDrops{};
+    int    writeClaimRescues{};
     int    stereoSyncWaits{};
     int    stereoSyncRescued{};
     int    stereoSyncTimeouts{};
     double stereoSyncWaitMs{};
+    int    stereoStaleRejects{};
+    int    stereoBlackFallbacks{};
+    int    stereoRepeatStreakMax{};
+    int    stereoLivenessState{};
+    int    stereoRecoveryProgress{};
     bool   fxaaRequested{};
     bool   fxaaActive{};
     int    fxaaDraws{};
@@ -593,6 +640,10 @@ struct GameFrameSample {
     int    skipProcess{};
     int    skipFrame{};
     int    renderSceneCalls{};
+    int    fadeStatus{-1};
+    int    cutsceneRunning{-1};
+    int    mobileMenuOpen{-1};
+    int    cpuCoreStart{-1};
     int    cpuCore{-1};
     bool   stereoActive{};
 };
@@ -614,11 +665,42 @@ struct PresentFrameSample {
     double predictedDeltaMs{};
     int    submittedStereoSequence{-1};
     bool   stereoGenerationRace{};
+    int    stereoWriteClaimBusyDrops{};
+    int    stereoWriteClaimRescues{};
+    int    stereoWriteFencePollAttempts{};
+    int    stereoWriteFencePollSkipped{};
+    int    stereoWriteFencePollLockBusy{};
+    int    stereoWriteFencePollMatched{};
+    int    stereoWriteFencePollRetired{};
+    int    stereoWriteFencePollTimeouts{};
+    int    stereoWriteFencePollWaitFailed{};
+    double stereoWriteFencePollWallMs{};
+    double stereoWriteFencePollCpuMs{};
+    int    stereoWriteFenceWaitAttempts{};
+    int    stereoWriteFenceWaitCalls{};
+    int    stereoWriteFenceWaitSatisfied{};
+    int    stereoWriteFenceWaitTimeouts{};
+    int    stereoWriteFenceWaitFailed{};
+    double stereoWriteFenceWaitWallMs{};
+    double stereoWriteFenceWaitCpuMs{};
+    double stereoWriteFenceWaitAgeMs{};
+    int    stereoWriteFenceWaitAgeSamples{};
     bool   stereoSyncWaitAttempted{};
     bool   stereoSyncWaitRescued{};
     bool   stereoSyncWaitTimedOut{};
     double stereoSyncWaitMs{};
     double submittedStereoSequenceAgeMs{};
+    double candidateStereoSequenceAgeMs{};
+    StereoProjectionOutcome stereoProjectionOutcome{
+        StereoProjectionOutcome::NotAttempted};
+    StereoFallbackSource stereoFallbackSource{StereoFallbackSource::None};
+    StereoLivenessState stereoLivenessState{StereoLivenessState::Live};
+    bool   staleStereoRejected{};
+    int    consecutiveStereoRepeats{};
+    int    stereoRecoveryProgress{};
+    bool   stereoZeroCopyRepeat{};
+    bool   stereoRepeatCopyFallback{};
+    unsigned int eyeReleaseFailureMask{};
     bool   theaterMode{};
     bool   shouldRender{};
     unsigned int layerCount{};

@@ -1,7 +1,9 @@
 #include "Xr.h"
 
 #include "Appearance.h"
+#include "Basketball.h"
 #include "Calib.h"
+#include "BuildStamp.h"
 #include "Cheats.h"
 #include "Driving.h"
 #include "FrameTarget.h"
@@ -19,9 +21,12 @@
 #define XR_USE_GRAPHICS_API_OPENGL_ES
 
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 #include <dirent.h>
 #include <sys/system_properties.h>
+#include <unistd.h>
 
 // sRGB write control is an extension in GLES; the enum is not in gl3.h core.
 #ifndef GL_FRAMEBUFFER_SRGB_EXT
@@ -29,6 +34,13 @@
 #endif
 #ifndef GL_SRGB8_ALPHA8
 #define GL_SRGB8_ALPHA8 0x8C43
+#endif
+#ifndef GL_TEXTURE_FOVEATED_FEATURE_BITS_QCOM
+#define GL_TEXTURE_FOVEATED_FEATURE_BITS_QCOM 0x8BFB
+#define GL_TEXTURE_FOVEATED_MIN_PIXEL_DENSITY_QCOM 0x8BFC
+#define GL_TEXTURE_FOVEATED_FEATURE_QUERY_QCOM 0x8BFD
+#define GL_FOVEATION_ENABLE_BIT_QCOM 0x1
+#define GL_FOVEATION_SCALED_BIN_METHOD_BIT_QCOM 0x2
 #endif
 
 #include <openxr/openxr.h>
@@ -43,6 +55,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -50,12 +63,11 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.1.1.0";  // internal build id (4th digit)
+constexpr char kModVersion[] = "0.1.2.0";  // internal build id (4th digit)
 #ifdef SAVR_DEV
-constexpr const char* kModVersionShown = "0.1.1 WEAPONS FIX";
+constexpr const char* kModVersionShown = "0.1.2";
 #else
-// Temporary tester marker (revert to plain "0.1.1" for the real release).
-constexpr const char* kModVersionShown = "0.1.1 WEAPONS FIX";
+constexpr const char* kModVersionShown = "0.1.2";
 #endif
 
 JavaVM*   g_hudTextVm{};
@@ -67,6 +79,7 @@ struct HudTextState {
     std::u16string help;
     std::u16string big;
     std::u16string timers;
+    std::u16string radio;
     int bigStyle{};
     std::uint64_t revision{};
 };
@@ -116,21 +129,119 @@ bool       g_eyeReady = false;
 std::mutex g_eyePublishMutex;
 int        g_eyePublished = -1; // newest complete pair, -1 = none
 int        g_eyeConsuming = -1; // buffer the consumer currently holds, -1 = none
-bool       g_stereoShared = true;   // false if the XR context is NOT shared with the engine
+std::atomic<bool> g_stereoShared{true}; // false if XR context is not shared with engine
 std::atomic<float> g_stereoRenderFovXDeg{75.0f};   // FOV the game rendered eyes at
 
 // Stereo: the game renders the world twice (once per eye) into a ring of
 // kStereoSets texture pairs on the GameThread, and publishes a monotonically
 // increasing sequence number after finishing each pair. The compositor samples a
-// pair kStereoReadLag frames behind the writer, so (a) the writer is never
-// overwriting the pair being sampled and (b) the async RenderQueue thread has
-// always finished drawing it. Left and right always come from the SAME sequence,
+// pair kStereoReadLag frames behind the writer so the async RenderQueue thread
+// has normally finished drawing it. A per-slot reader/writer lease is the hard
+// exclusion that prevents wraparound overwrite during a slow XR copy. Left and
+// right always come from the SAME sequence,
 // which is what removes the flicker and the head-motion double-vision — those
 // were the two symptoms of sampling a torn / half-drawn pair.
-constexpr int kStereoSets    = 3;
+// Four slots keep the same one-frame presentation lag while giving a completed
+// source-read fence one additional producer period before its slot is reused.
+constexpr int kStereoSets    = 4;
 constexpr int kStereoReadLag = 1;   // frames the consumer trails the writer
+
+enum class StereoProducerSyncState : std::uint8_t {
+    None,
+    Pending,
+    FenceReady,
+    RetailReady,
+};
+
+struct StereoProducerSync {
+    int generation{-1};
+    GLsync fence{};
+    StereoProducerSyncState state{StereoProducerSyncState::None};
+};
+
+std::mutex g_stereoProducerSyncMutex;
+StereoProducerSync g_stereoProducerSync[kStereoSets];
+std::atomic<bool> g_stereoProducerSyncPoisoned{false};
+std::atomic<bool> g_directStereoProjectionHealthy{false};
+#if defined(SAVR_EXPERIMENTAL_BACKPRESSURE)
+// Opt-in experiment state must not share a cache line with the always-hot
+// producer-fence counters below. In particular, an OFF experiment must not
+// make the XR thread invalidate a line observed by the GameThread.
+struct alignas(64) StereoBackpressureState {
+    std::atomic<int> lastSubmittedSequence{-1};
+    std::atomic<std::uint64_t> lastSubmittedNs{};
+    std::atomic<std::uint64_t> throttleCount{};
+};
+StereoBackpressureState g_stereoBackpressure;
+#endif
+std::atomic<std::uint64_t> g_stereoProducerFenceAttempts{};
+std::atomic<std::uint64_t> g_stereoProducerFencePublished{};
+std::atomic<std::uint64_t> g_stereoProducerFenceRetailFallbacks{};
+std::atomic<std::uint64_t> g_stereoProducerFencePendingRejects{};
+std::atomic<std::uint64_t> g_stereoProducerFenceWaits{};
+std::atomic<std::uint64_t> g_stereoProducerFenceErrors{};
+
+constexpr char kStereoProducerFenceProperty[] =
+    "debug.savr.rq_swap46_fence";
+#if defined(SAVR_EXPERIMENTAL_BACKPRESSURE)
+constexpr char kStereoBackpressureProperty[] =
+    "debug.savr.stereo_backpressure";
+
+bool StereoBackpressureRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = false;
+        if (__system_property_get(kStereoBackpressureProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") != 0) {
+                LOGW("[stereo.backpressure] invalid %s=%s; using 0",
+                     kStereoBackpressureProperty, text);
+            }
+        }
+        return value;
+    }();
+    return requested;
+}
+#endif
+
+bool StereoProducerFenceRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = true;
+        if (__system_property_get(kStereoProducerFenceProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[stereo.producer.sync] ignoring invalid %s=%s "
+                      "(valid 0 or 1)", kStereoProducerFenceProperty, text);
+        }
+        LOGI("[stereo.producer.sync] requested=%d property=%s",
+             value ? 1 : 0, kStereoProducerFenceProperty);
+        return value;
+    }();
+    return requested;
+}
+
+bool StereoProducerGenerationReady(int set, int generation) {
+    if (!StereoProducerFenceRequested() ||
+        g_stereoProducerSyncPoisoned.load(std::memory_order_acquire)) {
+        return true;
+    }
+    if (set < 0 || set >= kStereoSets || generation < 0) return false;
+    std::lock_guard<std::mutex> lock(g_stereoProducerSyncMutex);
+    const StereoProducerSync& sync = g_stereoProducerSync[set];
+    return sync.generation == generation &&
+        (sync.state == StereoProducerSyncState::FenceReady ||
+         sync.state == StereoProducerSyncState::RetailReady);
+}
+constexpr int kStereoRepeatGracePresents = 3;
+constexpr double kStereoHardMaxAgeMs = 90.0;
 std::atomic<unsigned int> g_stereoEyeTex[kStereoSets][2] = {};
 std::atomic<unsigned int> g_stereoEyeDepth[kStereoSets][2] = {};
+// GL_QCOM_texture_foveated is texture-object state. Track each ring row so the
+// XR context configures a newly published RenderWare eye texture exactly once;
+// ResetStereoEyeTextures clears the marker before a resized generation can
+// reuse the same numeric GL name.
+std::atomic<unsigned int> g_eyeFoveationAttemptedTex[kStereoSets][2] = {};
 std::atomic<unsigned int> g_stereoHudTex[kStereoSets] = {};
 std::atomic<float>        g_stereoEyeNear[kStereoSets][2] = {};
 std::atomic<float>        g_stereoEyeFar[kStereoSets][2] = {};
@@ -138,10 +249,144 @@ std::atomic<float>        g_stereoUnderWaterness[kStereoSets] = {};
 std::atomic<float>        g_stereoWaterDepth[kStereoSets] = {};
 std::atomic<float>        g_pendingUnderWaterness{0.0f};
 std::atomic<float>        g_pendingWaterDepth{0.0f};
-std::atomic<int>          g_stereoEyeW{0}, g_stereoEyeH{0};
+std::atomic<int>          g_stereoEyeW[kStereoSets] = {};
+std::atomic<int>          g_stereoEyeH[kStereoSets] = {};
 std::atomic<int>          g_stereoSeq{-1};   // newest published pair index (-1 = none)
 std::atomic<int>          g_stereoGeneration[kStereoSets] = {};
 std::atomic<std::uint64_t> g_stereoPublishedNs[kStereoSets] = {};
+// One atomic state is the complete producer/consumer exclusion protocol for a
+// ring slot: -1 = the GameThread owns it for recording, 0 = idle, >0 = XR
+// readers. Keeping writer and reader ownership in one modification order avoids
+// the check-then-increment race that separate flags/refcounts would permit.
+std::atomic<int>          g_stereoSlotUsers[kStereoSets] = {};
+std::atomic<int>          g_stereoWriteClaimBusyDrops{0};
+std::atomic<int>          g_stereoWriteClaimRescues{0};
+std::atomic<int>          g_stereoWriteFencePollAttempts{0};
+std::atomic<int>          g_stereoWriteFencePollSkipped{0};
+std::atomic<int>          g_stereoWriteFencePollLockBusy{0};
+std::atomic<int>          g_stereoWriteFencePollMatched{0};
+std::atomic<int>          g_stereoWriteFencePollRetired{0};
+std::atomic<int>          g_stereoWriteFencePollTimeouts{0};
+std::atomic<int>          g_stereoWriteFencePollWaitFailed{0};
+std::atomic<std::uint64_t> g_stereoWriteFencePollWallNs{0};
+std::atomic<std::uint64_t> g_stereoWriteFencePollCpuNs{0};
+std::atomic<int>          g_stereoWriteFenceWaitAttempts{0};
+std::atomic<int>          g_stereoWriteFenceWaitCalls{0};
+std::atomic<int>          g_stereoWriteFenceWaitSatisfied{0};
+std::atomic<int>          g_stereoWriteFenceWaitTimeouts{0};
+std::atomic<int>          g_stereoWriteFenceWaitFailed{0};
+std::atomic<std::uint64_t> g_stereoWriteFenceWaitWallNs{0};
+std::atomic<std::uint64_t> g_stereoWriteFenceWaitCpuNs{0};
+std::atomic<std::uint64_t> g_stereoWriteFenceWaitAgeNs{0};
+std::atomic<int>          g_stereoWriteFenceWaitAgeSamples{0};
+std::atomic<unsigned int> g_stereoEpochPublishedMask{0};
+// ResetStereoEyeTextures may run on the GameThread while the XR thread still
+// owns a previously released swapchain image.  The image is safe to finish
+// presenting, but it must never seed a repeat cache for the next raster epoch.
+std::atomic<std::uint64_t> g_stereoResetEpoch{1};
+// Producer/compositor phase feedback. A timeout probe is armed only when the
+// consumer found the exact previously submitted safe sequence at its bounded
+// wait boundary. The producer resolves it against the first later publication. Only
+// an exact sequence in the same phase epoch may influence pacing; sequence gaps
+// and genuinely slow frames remain observations, never control input.
+constexpr int kStereoPhaseProbeArming = -2;
+constexpr int kStereoPhaseProbeResolving = -3;
+constexpr std::uint64_t kStereoPhaseProbeExpiryNs = 30000000ULL;
+constexpr std::uint64_t kStereoPhaseMaxSampleNs = 1250000ULL;
+constexpr std::uint64_t kStereoPhaseMaxSpreadNs = 300000ULL;
+constexpr std::uint64_t kStereoPhaseCalibrationWindowNs = 500000000ULL;
+constexpr std::uint64_t kStereoPhaseKickMarginNs = 100000ULL;
+constexpr std::uint64_t kStereoPhaseMaxKickNs = 750000ULL;
+constexpr std::uint64_t kStereoPhaseKickCooldownNs = 750000000ULL;
+// A healthy producer can occasionally publish just beyond the normal 1.25 ms
+// compositor-side boundary.  A second, deliberately small window is allowed
+// only when both the recent producer cadence and the runtime GPU metric prove
+// that this is phase jitter rather than a genuinely slow scene.
+constexpr std::uint64_t kStereoSyncBaseWaitNs = 1250000ULL;
+// The ground producer is consistently ~71.8 Hz, so xrWaitFrame occasionally
+// returns 1-3 ms before the next otherwise-on-time publication. Keep the
+// universal 1.25 ms boundary, but allow a wider second stage only after the
+// cadence and GPU-headroom proof below. The XR thread sleeps during this window;
+// it does not add render work or revive the rejected producer phase-pacer.
+constexpr std::uint64_t kStereoSyncExtendedWaitNs = 4000000ULL;
+// When the last two producer intervals prove a stable 72 Hz cadence, predict
+// the next publication instead of blindly stopping at the normal 4 ms edge.
+// This is consumer-only: it never delays or phase-shifts the GameThread.
+constexpr std::uint64_t kStereoSyncPredictedMaxWaitNs = 6500000ULL;
+constexpr std::uint64_t kStereoSyncPredictionSlackNs = 2000000ULL;
+// A confirmed publication just beyond the 4 ms boundary is stronger evidence
+// than cadence alone. For a short window after such a sample, let the consumer
+// use the existing 6.5 ms hard cap. The producer and its phase stay untouched.
+constexpr std::uint64_t kStereoSyncFeedbackWindowNs = 2000000000ULL;
+constexpr std::uint64_t kStereoSyncFeedbackMaxLateNs =
+    kStereoSyncPredictedMaxWaitNs - kStereoSyncExtendedWaitNs;
+constexpr std::uint64_t kStereoSyncFeedbackPublishingEpoch =
+    std::numeric_limits<std::uint64_t>::max();
+constexpr std::uint64_t kStereoSyncMetricsMaxAgeNs = 1500000000ULL;
+constexpr std::uint64_t kStereoSyncCadenceMinNs = 8000000ULL;
+// Admit ordinary one-frame scheduler jitter while still rejecting a genuinely
+// slow 60 Hz producer (16.67 ms). Two consecutive intervals must pass.
+constexpr std::uint64_t kStereoSyncCadenceMaxNs = 15250000ULL;
+constexpr float kStereoSyncExtendedGpuReserveMs = 1.0f;
+constexpr float kStereoSyncPredictedGpuReserveMs = 2.0f;
+constexpr std::uint64_t kStereoPacerAdvanceClaimingNs =
+    std::numeric_limits<std::uint64_t>::max();
+constexpr std::uint64_t kStereoPacerAdvancePublishingNs =
+    std::numeric_limits<std::uint64_t>::max() - 1ULL;
+std::atomic<std::uint64_t> g_stereoPhaseEpoch{1};
+std::atomic<std::uint64_t> g_stereoPhaseCalibrationGeneration{1};
+std::atomic<int> g_stereoPhasePendingSequence{-1};
+std::atomic<std::uint64_t> g_stereoPhasePendingEpoch{0};
+std::atomic<std::uint64_t> g_stereoPhasePendingCalibrationGeneration{0};
+std::atomic<std::uint64_t> g_stereoPhasePendingTimeoutEndNs{0};
+std::atomic<std::uint64_t> g_stereoPacerAdvancePendingNs{0};
+std::atomic<std::uint64_t> g_stereoPacerAdvanceEpoch{0};
+std::atomic<std::uint64_t> g_stereoPacerAdvanceCalibrationGeneration{0};
+std::atomic<std::uint64_t> g_stereoPacerAdvanceExpiryNs{0};
+std::atomic_flag g_stereoPhaseCalibrationLock = ATOMIC_FLAG_INIT;
+struct StereoPhaseCalibration {
+    std::uint64_t epoch{};
+    std::uint64_t generation{};
+    std::uint64_t firstSampleNs{};
+    std::uint64_t samples[3]{};
+    int count{};
+    std::uint64_t cooldownUntilNs{};
+};
+StereoPhaseCalibration g_stereoPhaseCalibration{};
+
+std::atomic<std::uint64_t> g_stereoPhaseProbeArmed{};
+std::atomic<std::uint64_t> g_stereoPhaseProbeOverlap{};
+std::atomic<std::uint64_t> g_stereoSyncExtendedAttempts{};
+std::atomic<std::uint64_t> g_stereoSyncExtendedRescued{};
+std::atomic<std::uint64_t> g_stereoSyncExtendedTimeouts{};
+std::atomic<std::uint64_t> g_stereoSyncPredictedAttempts{};
+std::atomic<std::uint64_t> g_stereoSyncPredictedRescued{};
+std::atomic<std::uint64_t> g_stereoSyncPredictedTimeouts{};
+std::atomic<std::uint64_t> g_stereoSyncCadenceOutlierAttempts{};
+std::atomic<std::uint64_t> g_stereoSyncCadenceOutlierRescued{};
+std::atomic<std::uint64_t> g_stereoSyncCadenceOutlierTimeouts{};
+std::atomic<std::uint64_t> g_stereoSyncFeedbackUntilNs{};
+std::atomic<std::uint64_t> g_stereoSyncFeedbackEpoch{};
+std::atomic<std::uint64_t> g_stereoSyncFeedbackLateNs{};
+std::atomic<std::uint64_t> g_stereoSyncFeedbackArmed{};
+std::atomic<std::uint64_t> g_stereoSyncFeedbackRefreshed{};
+std::atomic<std::uint64_t> g_stereoSyncFeedbackAttempts{};
+std::atomic<std::uint64_t> g_stereoSyncFeedbackRescued{};
+std::atomic<std::uint64_t> g_stereoSyncFeedbackTimeouts{};
+std::atomic<std::uint64_t> g_stereoPhaseProbeExpired{};
+std::atomic<std::uint64_t> g_stereoPhaseResolvedExact{};
+std::atomic<std::uint64_t> g_stereoPhaseResolvedGap{};
+std::atomic<std::uint64_t> g_stereoPhaseResolvedRace{};
+std::atomic<std::uint64_t> g_stereoPhaseResolvedFault{};
+std::atomic<std::uint64_t> g_stereoPhaseLateNs{};
+std::atomic<std::uint64_t> g_stereoPhaseLateMaxNs{};
+std::atomic<std::uint64_t> g_stereoPhaseLateBuckets[5]{};
+std::atomic<std::uint64_t> g_stereoPhaseCalibrationRejects{};
+std::atomic<std::uint64_t> g_stereoPhaseKickRequestedCount{};
+std::atomic<std::uint64_t> g_stereoPhaseKickRequestedNs{};
+std::atomic<std::uint64_t> g_stereoPhaseKickAppliedCount{};
+std::atomic<std::uint64_t> g_stereoPhaseKickAppliedNs{};
+std::atomic<std::uint64_t> g_stereoPhaseResets{};
 std::atomic<float>        g_stereoTanX{1.303f}, g_stereoTanY{1.365f};  // render frustum half-tangents
 constexpr float           kStereoHalfIpd = 0.032f;   // must match VrCamera kVrHalfIpd
 bool                      g_hasPerfExt = false;      // XR_EXT_performance_settings available
@@ -160,6 +405,7 @@ bool                     g_runtimeCpuValid = false;
 bool                     g_runtimeGpuValid = false;
 float                    g_runtimeCpuMs = 0.0f;
 float                    g_runtimeGpuMs = 0.0f;
+std::uint64_t            g_runtimeMetricsSampleNs = 0;
 bool                     g_displayRefreshValid = false;
 float                    g_displayRefreshHz = 0.0f;
 bool                     g_displayRefreshRequestSupported = false;
@@ -263,6 +509,18 @@ void ApplyThreadSettings(XrInstance instance, XrSession session) {
         LOGW("[perf] renderer-main thread name=RenderQueue not found; retrying");
         g_threadDirty.store(true, std::memory_order_relaxed);
     }
+
+    // RenderFrame runs on the present-only OpenXR consumer thread. Register it
+    // explicitly as a renderer worker as well: otherwise Android is free to
+    // wake it as an ordinary app worker after xrWaitFrame, which can turn an
+    // isolated late wake-up into a visible 72 -> 58 Hz compositor interval even
+    // while GameThread, RenderQueue, and GPU work are all under budget. This is
+    // only a scheduler hint; failure leaves rendering and frame timing intact.
+    const uint32_t presentTid = static_cast<uint32_t>(gettid());
+    const XrResult workerResult = setThread(
+        session, XR_ANDROID_THREAD_TYPE_RENDERER_WORKER_KHR, presentTid);
+    LOGI("[perf] renderer-worker thread tid=%u name=XR-present (rc=%d)",
+         presentTid, static_cast<int>(workerResult));
 }
 
 // Colour: the game renders an already-sRGB-encoded frame. An RGBA8 (linear)
@@ -300,6 +558,12 @@ std::atomic<int>      g_drivingCalibSel{0};
 std::atomic<int>      g_drivingCalibHand{0};
 std::atomic<bool>     g_locomotionActive{false}; // movement/turning submenu
 std::atomic<int>      g_locomotionSel{0};
+std::atomic<bool>     g_basketballActive{false};
+std::atomic<int>      g_basketballSel{0};
+std::atomic<bool>     g_basketballCalibActive{false};
+std::atomic<int>      g_basketballCalibSel{0};
+std::atomic<bool>     g_vehicleCameraActive{false}; // per-vehicle camera motion
+std::atomic<int>      g_vehicleCameraSel{0};
 std::atomic<bool>     g_hudActive{false};        // classic/immersive HUD submenu
 std::atomic<int>      g_hudSel{0};
 std::atomic<int>      g_hudPage{0};              // 0 root, 1 crop/screen, 2 wrist
@@ -317,8 +581,14 @@ std::atomic<bool>     g_gfxDistanceActive{false}; // draw-distance submenu shown
 std::atomic<int>      g_gfxDistanceSel{0};
 float                 g_holsterPos[8][3]{};      // holster anchors (guarded by g_headPoseMutex)
 float                 g_chuteTogglePos[2][3]{};  // parachute brake toggles (g_headPoseMutex)
+float                 g_chuteAnchorPos[2][3]{};  // fixed upper riser anchors (g_headPoseMutex)
 bool                  g_chuteToggleGrabbed[2]{};
 bool                  g_chuteTogglesVisible{false};
+float                 g_chuteRingPos[3]{};
+float                 g_chuteRingAnchor[3]{};
+float                 g_chuteRingForward[3]{0.0f, 0.0f, -1.0f};
+bool                  g_chuteRingGrabbed{false};
+bool                  g_chuteRingVisible{false};
 int                   g_holsterCount = 0;
 // Active weapon object-space geometry (guarded by g_headPoseMutex). Published by
 // the GameThread; the present thread transforms it to the hand pose and draws it.
@@ -355,6 +625,8 @@ scopeaim::VisualState g_stereoScopeState[kStereoSets]{};
 // state beside those pixels so vehicle motion cannot make it swim relative to
 // the baked dashboard. Guarded by g_headPoseMutex.
 driving::WheelVisualState g_stereoDrivingWheelState[kStereoSets]{};
+BallHandLock g_ballHandLock{};                       // guarded by g_headPoseMutex
+BallHandLock g_stereoBallHandLock[kStereoSets]{};
 // Model id of the vehicle currently anchoring the dashboard panels (-1 when
 // not in a vehicle). The HUD menu shows/edits that vehicle's own dash slot.
 std::atomic<int> g_lastDashModelId{-1};
@@ -386,13 +658,14 @@ ThrowableTrajectory g_stereoThrowableTrajectory[kStereoSets][2]{};
 // Keep the streak close to the muzzle: a stock-SA random 2..5 m slice can land
 // tens of metres away and is effectively invisible at headset resolution.
 constexpr int kMaxBulletTracers = 16;
-constexpr std::uint64_t kBulletTracerLifetimeNs = 420000000ULL;
 constexpr float kBulletTracerMaxLength = 45.0f;
 struct BulletTracer {
     bool valid{false};
     XrVector3f start{};
     XrVector3f end{};
     int weaponType{};
+    float maxThickness{0.4f};
+    float visibility{150.0f / 255.0f};
     std::uint64_t bornNs{};
     std::uint64_t expiresNs{};
 };
@@ -427,13 +700,990 @@ std::uint64_t MonotonicNowNs() {
             std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-// The ring set the compositor should sample this frame, or -1 while too few
-// frames have been produced to trail safely. seqOut receives the newest sequence.
-int StereoReadSet(int& seqOut) {
-    const int seq = g_stereoSeq.load(std::memory_order_acquire);
-    seqOut = seq;
-    if (seq < kStereoReadLag) return -1;          // warm-up: nothing safe to show yet
-    return (seq - kStereoReadLag) % kStereoSets;
+void AtomicMaxU64(std::atomic<std::uint64_t>& destination,
+                  std::uint64_t value) {
+    std::uint64_t current = destination.load(std::memory_order_relaxed);
+    while (current < value &&
+           !destination.compare_exchange_weak(
+               current, value, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+}
+
+void ResetStereoPhaseFeedback() {
+    // Publish invalidation first. Clear only fully published values; an arming,
+    // resolving, publishing or claiming owner retains its sentinel until its own
+    // final CAS. That prevents reset-driven ABA and keeps side metadata immutable
+    // for the owner, while the new epoch/generation makes its result fail closed.
+    g_stereoPhaseEpoch.fetch_add(1, std::memory_order_acq_rel);
+    g_stereoPhaseCalibrationGeneration.fetch_add(
+        1, std::memory_order_acq_rel);
+    g_stereoSyncFeedbackEpoch.store(0, std::memory_order_release);
+    g_stereoSyncFeedbackUntilNs.store(0, std::memory_order_release);
+    g_stereoSyncFeedbackLateNs.store(0, std::memory_order_relaxed);
+    int pendingSequence =
+        g_stereoPhasePendingSequence.load(std::memory_order_acquire);
+    while (pendingSequence >= 0 &&
+           !g_stereoPhasePendingSequence.compare_exchange_weak(
+               pendingSequence, -1, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+    std::uint64_t pendingAdvance =
+        g_stereoPacerAdvancePendingNs.load(std::memory_order_acquire);
+    while (pendingAdvance != 0 &&
+           pendingAdvance < kStereoPacerAdvancePublishingNs &&
+           !g_stereoPacerAdvancePendingNs.compare_exchange_weak(
+               pendingAdvance, 0, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+    g_stereoPhaseResets.fetch_add(1, std::memory_order_relaxed);
+}
+
+void BreakStereoPhaseCalibrationWindow() {
+    // A generation cannot be lost if the tiny calibration critical section is
+    // preempted. The owner rechecks it before requesting a kick, and the
+    // GameThread validates the same generation again after claiming the request.
+    g_stereoPhaseCalibrationGeneration.fetch_add(
+        1, std::memory_order_acq_rel);
+}
+
+class StereoPhaseProbeResolutionLease {
+public:
+    StereoPhaseProbeResolutionLease() = default;
+    StereoPhaseProbeResolutionLease(const StereoPhaseProbeResolutionLease&) = delete;
+    StereoPhaseProbeResolutionLease& operator=(
+        const StereoPhaseProbeResolutionLease&) = delete;
+    ~StereoPhaseProbeResolutionLease() {
+        int resolving = kStereoPhaseProbeResolving;
+        g_stereoPhasePendingSequence.compare_exchange_strong(
+            resolving, -1, std::memory_order_release,
+            std::memory_order_relaxed);
+    }
+};
+
+void ResolveStereoLatePublication(int publishedSequence,
+                                  std::uint64_t publishedNs) {
+    int requiredSequence =
+        g_stereoPhasePendingSequence.load(std::memory_order_acquire);
+    if (requiredSequence < 0 || publishedSequence < requiredSequence) return;
+    if (!g_stereoPhasePendingSequence.compare_exchange_strong(
+            requiredSequence, kStereoPhaseProbeResolving,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    StereoPhaseProbeResolutionLease resolutionLease;
+
+    const std::uint64_t phaseEpoch =
+        g_stereoPhasePendingEpoch.load(std::memory_order_relaxed);
+    const std::uint64_t calibrationGeneration =
+        g_stereoPhasePendingCalibrationGeneration.load(
+            std::memory_order_relaxed);
+    const std::uint64_t timeoutEndNs =
+        g_stereoPhasePendingTimeoutEndNs.load(std::memory_order_relaxed);
+    if (phaseEpoch == 0 || calibrationGeneration == 0 ||
+        timeoutEndNs == 0 || publishedNs == 0 ||
+        phaseEpoch != g_stereoPhaseEpoch.load(std::memory_order_acquire) ||
+        calibrationGeneration !=
+            g_stereoPhaseCalibrationGeneration.load(
+                std::memory_order_acquire) ||
+        !g_sessionFocused.load(std::memory_order_acquire)) {
+        BreakStereoPhaseCalibrationWindow();
+        g_stereoPhaseResolvedFault.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (publishedSequence != requiredSequence) {
+        BreakStereoPhaseCalibrationWindow();
+        g_stereoPhaseResolvedGap.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (publishedNs < timeoutEndNs) {
+        // Publication timestamp precedes the consumer boundary. This can happen
+        // only when publication and probe arming crossed; it is useful evidence,
+        // but not a positive phase-error sample.
+        BreakStereoPhaseCalibrationWindow();
+        g_stereoPhaseResolvedRace.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    const std::uint64_t lateNs = publishedNs - timeoutEndNs;
+    g_stereoPhaseResolvedExact.fetch_add(1, std::memory_order_relaxed);
+    g_stereoPhaseLateNs.fetch_add(lateNs, std::memory_order_relaxed);
+    AtomicMaxU64(g_stereoPhaseLateMaxNs, lateNs);
+    const int bucket = lateNs <= 100000ULL ? 0
+        : lateNs <= 250000ULL ? 1
+        : lateNs <= 500000ULL ? 2
+        : lateNs <= 1000000ULL ? 3 : 4;
+    g_stereoPhaseLateBuckets[bucket].fetch_add(1, std::memory_order_relaxed);
+
+    // Only arm consumer feedback when the exact publication would have fit
+    // inside the already-audited 6.5 ms cap. Large stalls are real producer
+    // misses and must never make the compositor wait longer on later frames.
+    if (lateNs <= kStereoSyncFeedbackMaxLateNs &&
+        publishedNs <= std::numeric_limits<std::uint64_t>::max() -
+                           kStereoSyncFeedbackWindowNs) {
+        const std::uint64_t feedbackUntilNs =
+            publishedNs + kStereoSyncFeedbackWindowNs;
+        // Invalidate readers before publishing the deadline. The epoch marker
+        // is committed last, so a reset or stale resolver can only make this
+        // feedback fail closed; it can never expose an old deadline to a new
+        // XR/stereo epoch.
+        g_stereoSyncFeedbackEpoch.store(
+            kStereoSyncFeedbackPublishingEpoch, std::memory_order_release);
+        const bool feedbackEpochValid =
+            phaseEpoch ==
+                g_stereoPhaseEpoch.load(std::memory_order_acquire) &&
+            calibrationGeneration ==
+                g_stereoPhaseCalibrationGeneration.load(
+                    std::memory_order_acquire) &&
+            g_sessionFocused.load(std::memory_order_acquire);
+        if (feedbackEpochValid) {
+            std::uint64_t currentUntilNs =
+                g_stereoSyncFeedbackUntilNs.load(std::memory_order_relaxed);
+            while (currentUntilNs < feedbackUntilNs &&
+                   !g_stereoSyncFeedbackUntilNs.compare_exchange_weak(
+                       currentUntilNs, feedbackUntilNs,
+                       std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {
+            }
+            g_stereoSyncFeedbackLateNs.store(
+                lateNs, std::memory_order_relaxed);
+            g_stereoSyncFeedbackEpoch.store(
+                phaseEpoch, std::memory_order_release);
+            const bool committedEpochValid =
+                phaseEpoch ==
+                    g_stereoPhaseEpoch.load(std::memory_order_acquire) &&
+                calibrationGeneration ==
+                    g_stereoPhaseCalibrationGeneration.load(
+                        std::memory_order_acquire) &&
+                g_sessionFocused.load(std::memory_order_acquire);
+            if (committedEpochValid) {
+                g_stereoSyncFeedbackArmed.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else {
+                std::uint64_t expectedEpoch = phaseEpoch;
+                g_stereoSyncFeedbackEpoch.compare_exchange_strong(
+                    expectedEpoch, 0, std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+            }
+        } else {
+            std::uint64_t expectedEpoch = kStereoSyncFeedbackPublishingEpoch;
+            g_stereoSyncFeedbackEpoch.compare_exchange_strong(
+                expectedEpoch, 0, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+    }
+
+    // Resolution normally runs only on GameThread. The try-lock also makes a
+    // session reset harmless without ever blocking either producer or consumer.
+    if (g_stereoPhaseCalibrationLock.test_and_set(std::memory_order_acquire)) {
+        BreakStereoPhaseCalibrationWindow();
+        g_stereoPhaseResolvedFault.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (phaseEpoch != g_stereoPhaseEpoch.load(std::memory_order_acquire)) {
+        g_stereoPhaseCalibrationLock.clear(std::memory_order_release);
+        g_stereoPhaseResolvedFault.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    StereoPhaseCalibration& calibration = g_stereoPhaseCalibration;
+    if (calibration.epoch != phaseEpoch ||
+        calibration.generation != calibrationGeneration) {
+        calibration = {};
+        calibration.epoch = phaseEpoch;
+        calibration.generation = calibrationGeneration;
+    }
+    if (lateNs > kStereoPhaseMaxSampleNs) {
+        calibration.count = 0;
+        calibration.firstSampleNs = 0;
+        g_stereoPhaseCalibrationRejects.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        g_stereoPhaseCalibrationLock.clear(std::memory_order_release);
+        return;
+    }
+
+    if (calibration.count > 0 &&
+        (publishedNs < calibration.firstSampleNs ||
+         publishedNs - calibration.firstSampleNs >
+             kStereoPhaseCalibrationWindowNs)) {
+        calibration.count = 0;
+        calibration.firstSampleNs = 0;
+        g_stereoPhaseCalibrationRejects.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    if (calibration.count == 0) calibration.firstSampleNs = publishedNs;
+    calibration.samples[calibration.count++] = lateNs;
+    if (calibration.count == 3) {
+        const std::uint64_t a = calibration.samples[0];
+        const std::uint64_t b = calibration.samples[1];
+        const std::uint64_t c = calibration.samples[2];
+        const std::uint64_t minimum = std::min(a, std::min(b, c));
+        const std::uint64_t maximum = std::max(a, std::max(b, c));
+        const std::uint64_t median = a + b + c - minimum - maximum;
+        const std::uint64_t nowNs = MonotonicNowNs();
+        const std::uint64_t currentCalibrationGeneration =
+            g_stereoPhaseCalibrationGeneration.load(std::memory_order_acquire);
+        if (currentCalibrationGeneration != calibrationGeneration) {
+            calibration = {};
+            calibration.epoch = phaseEpoch;
+            calibration.generation = currentCalibrationGeneration;
+            g_stereoPhaseCalibrationRejects.fetch_add(
+                1, std::memory_order_relaxed);
+            g_stereoPhaseCalibrationLock.clear(std::memory_order_release);
+            return;
+        }
+        if (maximum - minimum <= kStereoPhaseMaxSpreadNs &&
+            nowNs >= calibration.cooldownUntilNs &&
+            phaseEpoch == g_stereoPhaseEpoch.load(std::memory_order_acquire)) {
+            const std::uint64_t requestedNs = std::min(
+                median + kStereoPhaseKickMarginNs, kStereoPhaseMaxKickNs);
+
+            // A request should be consumed later in this same GameThread frame.
+            // Retire a stale unconsumed request before publishing a new one; the
+            // expiry prevents a phase correction calibrated under old load from
+            // firing much later when spare sleep happens to return.
+            std::uint64_t pending =
+                g_stereoPacerAdvancePendingNs.load(std::memory_order_acquire);
+            const std::uint64_t pendingExpiry =
+                g_stereoPacerAdvanceExpiryNs.load(std::memory_order_relaxed);
+            const std::uint64_t pendingEpoch =
+                g_stereoPacerAdvanceEpoch.load(std::memory_order_relaxed);
+            if (pending != 0 &&
+                pending != kStereoPacerAdvanceClaimingNs &&
+                pending != kStereoPacerAdvancePublishingNs &&
+                (pendingEpoch != phaseEpoch || nowNs > pendingExpiry)) {
+                g_stereoPacerAdvancePendingNs.compare_exchange_strong(
+                    pending, 0, std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+            }
+
+            std::uint64_t empty = 0;
+            if (g_stereoPacerAdvancePendingNs.compare_exchange_strong(
+                    empty, kStereoPacerAdvancePublishingNs,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                g_stereoPacerAdvanceEpoch.store(
+                    phaseEpoch, std::memory_order_relaxed);
+                g_stereoPacerAdvanceCalibrationGeneration.store(
+                    calibrationGeneration, std::memory_order_relaxed);
+                g_stereoPacerAdvanceExpiryNs.store(
+                    nowNs + kStereoPhaseProbeExpiryNs,
+                    std::memory_order_relaxed);
+                std::uint64_t publishing =
+                    kStereoPacerAdvancePublishingNs;
+                if (g_stereoPacerAdvancePendingNs.compare_exchange_strong(
+                        publishing, requestedNs, std::memory_order_release,
+                        std::memory_order_relaxed)) {
+                    g_stereoPhaseKickRequestedCount.fetch_add(
+                        1, std::memory_order_relaxed);
+                    g_stereoPhaseKickRequestedNs.fetch_add(
+                        requestedNs, std::memory_order_relaxed);
+                    calibration.cooldownUntilNs =
+                        nowNs + kStereoPhaseKickCooldownNs;
+                }
+            }
+            calibration.count = 0;
+            calibration.firstSampleNs = 0;
+        } else {
+            // Keep the newest sample as the start of a new window. This requires
+            // three mutually consistent exact publications, not merely any three
+            // timeouts collected across changing scene load.
+            calibration.samples[0] = c;
+            calibration.count = 1;
+            calibration.firstSampleNs = publishedNs;
+            g_stereoPhaseCalibrationRejects.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+    g_stereoPhaseCalibrationLock.clear(std::memory_order_release);
+}
+
+void ArmStereoLatePublicationProbe(int requiredSequence,
+                                   std::uint64_t timeoutEndNs,
+                                   std::uint64_t expectedPhaseEpoch) {
+    if (requiredSequence < 0 || timeoutEndNs == 0 ||
+        expectedPhaseEpoch == 0 ||
+        expectedPhaseEpoch !=
+            g_stereoPhaseEpoch.load(std::memory_order_acquire) ||
+        !g_sessionFocused.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const std::uint64_t nowNs = MonotonicNowNs();
+    int pending = g_stereoPhasePendingSequence.load(std::memory_order_acquire);
+    if (pending >= 0) {
+        const std::uint64_t previousEnd =
+            g_stereoPhasePendingTimeoutEndNs.load(std::memory_order_relaxed);
+        if (previousEnd != 0 && nowNs > previousEnd + kStereoPhaseProbeExpiryNs &&
+            g_stereoPhasePendingSequence.compare_exchange_strong(
+                pending, -1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            g_stereoPhaseProbeExpired.fetch_add(1, std::memory_order_relaxed);
+            BreakStereoPhaseCalibrationWindow();
+            pending = -1;
+        }
+    }
+    if (pending != -1) {
+        g_stereoPhaseProbeOverlap.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    const std::uint64_t phaseEpoch = expectedPhaseEpoch;
+    int idle = -1;
+    if (!g_stereoPhasePendingSequence.compare_exchange_strong(
+            idle, kStereoPhaseProbeArming, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        g_stereoPhaseProbeOverlap.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_stereoPhasePendingEpoch.store(phaseEpoch, std::memory_order_relaxed);
+    g_stereoPhasePendingCalibrationGeneration.store(
+        g_stereoPhaseCalibrationGeneration.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
+    g_stereoPhasePendingTimeoutEndNs.store(timeoutEndNs,
+                                           std::memory_order_relaxed);
+
+    int arming = kStereoPhaseProbeArming;
+    if (phaseEpoch != g_stereoPhaseEpoch.load(std::memory_order_acquire) ||
+        !g_sessionFocused.load(std::memory_order_acquire) ||
+        !g_stereoPhasePendingSequence.compare_exchange_strong(
+            arming, requiredSequence, std::memory_order_release,
+            std::memory_order_relaxed)) {
+        arming = kStereoPhaseProbeArming;
+        g_stereoPhasePendingSequence.compare_exchange_strong(
+            arming, -1, std::memory_order_release,
+            std::memory_order_relaxed);
+        g_stereoPhaseResolvedFault.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_stereoPhaseProbeArmed.fetch_add(1, std::memory_order_relaxed);
+
+    // Close publish-before-arm: a producer may have advanced between the final
+    // consumer load and the latch publication above. Acquire its generation and
+    // timestamp exactly as a normal resolver callback would.
+    const int newest = g_stereoSeq.load(std::memory_order_acquire);
+    if (newest >= requiredSequence) {
+        const int set = ((newest % kStereoSets) + kStereoSets) % kStereoSets;
+        const int generation =
+            g_stereoGeneration[set].load(std::memory_order_acquire);
+        const std::uint64_t publishedNs = generation == newest
+            ? g_stereoPublishedNs[set].load(std::memory_order_relaxed) : 0;
+        ResolveStereoLatePublication(newest, publishedNs);
+    }
+}
+
+struct StereoCandidate {
+    int sequence{-1};
+    int set{-1};
+    double ageMs{};
+};
+
+class StereoReadLease {
+public:
+    StereoReadLease() = default;
+    StereoReadLease(const StereoReadLease&) = delete;
+    StereoReadLease& operator=(const StereoReadLease&) = delete;
+    ~StereoReadLease() { Release(); }
+
+    void Adopt(int set) { set_ = set; }
+    int Detach() {
+        const int set = set_;
+        set_ = -1;
+        return set;
+    }
+    void Release() {
+        if (set_ < 0) return;
+        g_stereoSlotUsers[set_].fetch_sub(1, std::memory_order_release);
+        set_ = -1;
+    }
+
+private:
+    int set_{-1};
+};
+
+// A CPU lease alone is not enough for shared GL objects: after the draw calls
+// return, the XR context may still be sampling the source texture on the GPU.
+// Keep that slot pinned until a fence queued after all source reads signals.
+struct PendingStereoReadFence {
+    // EGL syncs are display objects rather than GLES3-context objects.  The XR
+    // thread creates the fence after its last shared-texture read, then either
+    // the XR thread can poll it or the engine's GLES2 GameThread can give one
+    // proven-late target a tiny bounded wait. A GLsync could only be queried
+    // from an ES3 context, which made
+    // the producer rescue path silently unavailable on retail GTA SA.
+    EGLSyncKHR sync{EGL_NO_SYNC_KHR};
+    // Compatibility fallback for an EGL implementation without
+    // EGL_KHR_fence_sync.  Only the XR ES3 thread ever queries this object.
+    GLsync glSync{};
+    EGLDisplay display{EGL_NO_DISPLAY};
+    int set{-1};
+    std::uint64_t queuedNs{};
+};
+constexpr int kMaxPendingStereoReadFences = 16;
+// The ground-heavy capture still had about four milliseconds of average frame-
+// limiter sleep, but its worst measured GPU margin was only 0.90 ms. Spend less
+// than that margin, and only after the normal zero-time producer poll proved the
+// target EGL fence was genuinely late. One absolute deadline is shared by every
+// fence for the target slot; this is never a per-fence allowance.
+constexpr std::uint64_t kStereoProducerFenceWaitNs = 750000ULL;
+// Quest's EGL driver returns sub-millisecond timed client waits as an immediate
+// timeout. Enforce the absolute budget in software with cheap zero-time polls;
+// sleep briefly between polls so a failed rescue does not burn a producer core.
+constexpr std::uint64_t kStereoProducerFencePollSleepNs = 50000ULL;
+PendingStereoReadFence g_pendingStereoReadFences[kMaxPendingStereoReadFences]{};
+std::mutex g_pendingStereoReadFenceMutex;
+
+// Android's libEGL link stub does not export the EGL 1.5 sync entry points even
+// when the runtime implements them.  Quest advertises EGL_KHR_fence_sync, whose
+// entry points are intentionally resolved through eglGetProcAddress.
+struct EglFenceApi {
+    PFNEGLCREATESYNCKHRPROC create{};
+    PFNEGLCLIENTWAITSYNCKHRPROC clientWait{};
+    PFNEGLDESTROYSYNCKHRPROC destroy{};
+
+    bool Available() const { return create && clientWait && destroy; }
+};
+
+const EglFenceApi& GetEglFenceApi() {
+    static const EglFenceApi api = [] {
+        EglFenceApi loaded{};
+        loaded.create = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(
+            eglGetProcAddress("eglCreateSyncKHR"));
+        loaded.clientWait = reinterpret_cast<PFNEGLCLIENTWAITSYNCKHRPROC>(
+            eglGetProcAddress("eglClientWaitSyncKHR"));
+        loaded.destroy = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(
+            eglGetProcAddress("eglDestroySyncKHR"));
+        return loaded;
+    }();
+    return api;
+}
+
+bool SupportsEglFenceSync(EGLDisplay display) {
+    // PinStereoReadUntilGpuComplete is XR-thread-only. Cache per display without
+    // adding another lock to the frame path; a recreated display is re-queried.
+    static EGLDisplay cachedDisplay = EGL_NO_DISPLAY;
+    static bool cachedSupport = false;
+    if (display != cachedDisplay) {
+        cachedDisplay = display;
+        const char* extensions = display != EGL_NO_DISPLAY
+            ? eglQueryString(display, EGL_EXTENSIONS)
+            : nullptr;
+        cachedSupport = GetEglFenceApi().Available() && extensions &&
+            std::strstr(extensions, "EGL_KHR_fence_sync") != nullptr;
+    }
+    return cachedSupport;
+}
+
+struct StereoFencePollResult {
+    int matched{};
+    int retired{};
+    int timeouts{};
+    int waitFailed{};
+    std::uint64_t fenceAgeNs{};
+    int fenceAgeSamples{};
+};
+
+void ReleaseStereoSlotReader(int set) {
+    if (set >= 0 && set < kStereoSets)
+        g_stereoSlotUsers[set].fetch_sub(1, std::memory_order_release);
+}
+
+// The caller owns g_pendingStereoReadFenceMutex.  Every safe-drain caller runs
+// on the XR context: glFinish on the producer context could not prove completion
+// of reads queued by the XR context.
+void FinishAndReleasePendingStereoReadsLocked() {
+    glFinish();
+    const EglFenceApi& eglFence = GetEglFenceApi();
+    for (auto& pending : g_pendingStereoReadFences) {
+        if (pending.sync == EGL_NO_SYNC_KHR && !pending.glSync) continue;
+        if (pending.sync != EGL_NO_SYNC_KHR &&
+            pending.display != EGL_NO_DISPLAY &&
+            (!eglFence.destroy ||
+             eglFence.destroy(pending.display, pending.sync) != EGL_TRUE)) {
+            static bool loggedDestroyFailure = false;
+            if (!loggedDestroyFailure) {
+                LOGE("[stereo.ring] eglDestroySync failed during safe drain: 0x%x",
+                     eglGetError());
+                loggedDestroyFailure = true;
+            }
+        }
+        if (pending.glSync) glDeleteSync(pending.glSync);
+        pending.sync = EGL_NO_SYNC_KHR;
+        pending.glSync = nullptr;
+        pending.display = EGL_NO_DISPLAY;
+        ReleaseStereoSlotReader(pending.set);
+        pending.set = -1;
+        pending.queuedNs = 0;
+    }
+}
+
+// Poll either all pending reads (targetSet < 0) or one producer target.  The
+// producer passes drainOnFailure=false: WAIT_FAILED keeps the fence and lease
+// intact so only the XR owner can perform the exceptional safe drain.
+StereoFencePollResult RetireCompletedStereoReadsLocked(int targetSet,
+                                                        bool drainOnFailure) {
+    StereoFencePollResult result{};
+    const EglFenceApi& eglFence = GetEglFenceApi();
+    for (auto& pending : g_pendingStereoReadFences) {
+        if (pending.sync == EGL_NO_SYNC_KHR && !pending.glSync) continue;
+        if (targetSet >= 0 && pending.set != targetSet) continue;
+
+        // GLsync is the compatibility fallback. It is valid only on the XR ES3
+        // context; a retail GLES2 producer leaves it for the next XR poll.
+        if (pending.glSync) {
+            if (!drainOnFailure) continue;
+            ++result.matched;
+            const GLenum status = glClientWaitSync(pending.glSync, 0, 0);
+            if (status == GL_TIMEOUT_EXPIRED) {
+                ++result.timeouts;
+                continue;
+            }
+            if (status == GL_WAIT_FAILED) {
+                ++result.waitFailed;
+                static bool loggedGlWait = false;
+                if (!loggedGlWait) {
+                    LOGE("[stereo.ring] GL fallback read fence wait failed (0x%x); "
+                         "draining safely", glGetError());
+                    loggedGlWait = true;
+                }
+                FinishAndReleasePendingStereoReadsLocked();
+                return result;
+            }
+            glDeleteSync(pending.glSync);
+            pending.glSync = nullptr;
+            pending.display = EGL_NO_DISPLAY;
+            ReleaseStereoSlotReader(pending.set);
+            pending.set = -1;
+            pending.queuedNs = 0;
+            ++result.retired;
+            continue;
+        }
+
+        ++result.matched;
+        const std::uint64_t waitStartNs = MonotonicNowNs();
+        if (pending.queuedNs != 0 && waitStartNs >= pending.queuedNs) {
+            result.fenceAgeNs += waitStartNs - pending.queuedNs;
+            ++result.fenceAgeSamples;
+        }
+        const EGLint status = eglFence.clientWait
+            ? eglFence.clientWait(pending.display, pending.sync, 0, 0)
+            : EGL_FALSE;
+        if (status == EGL_TIMEOUT_EXPIRED_KHR) {
+            ++result.timeouts;
+            continue;
+        }
+        if (status == EGL_FALSE) {
+            ++result.waitFailed;
+            if (!drainOnFailure) continue;
+            static bool logged = false;
+            if (!logged) {
+                LOGE("[stereo.ring] EGL read fence wait failed (0x%x); draining safely",
+                     eglGetError());
+                logged = true;
+            }
+            FinishAndReleasePendingStereoReadsLocked();
+            return result;
+        }
+        if (status != EGL_CONDITION_SATISFIED_KHR) continue;
+        if (!eglFence.destroy ||
+            eglFence.destroy(pending.display, pending.sync) != EGL_TRUE) {
+            ++result.waitFailed;
+            if (!drainOnFailure) continue;
+            static bool logged = false;
+            if (!logged) {
+                LOGE("[stereo.ring] EGL read fence destroy failed (0x%x); draining safely",
+                     eglGetError());
+                logged = true;
+            }
+            FinishAndReleasePendingStereoReadsLocked();
+            return result;
+        }
+        pending.sync = EGL_NO_SYNC_KHR;
+        pending.display = EGL_NO_DISPLAY;
+        ReleaseStereoSlotReader(pending.set);
+        pending.set = -1;
+        pending.queuedNs = 0;
+        ++result.retired;
+    }
+    return result;
+}
+
+void RetireCompletedStereoReads() {
+    std::lock_guard<std::mutex> lock(g_pendingStereoReadFenceMutex);
+    RetireCompletedStereoReadsLocked(-1, true);
+}
+
+// A writer may arrive after the XR fence signalled but before the paced XR
+// thread got another chance to retire it.  Reclaim only that already-complete
+// target-slot lease.  This path is deliberately nonblocking and fail-closed.
+bool TryRetireCompletedStereoReadsForProducer(int targetSet) {
+    g_stereoWriteFencePollAttempts.fetch_add(1, std::memory_order_relaxed);
+
+    if (!g_stereoShared.load(std::memory_order_acquire)) {
+        g_stereoWriteFencePollSkipped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Diagnostic only: EGL fence polling itself does not require a GLES3
+    // current context.  Keep the one-shot version proof so future captures show
+    // exactly which retail producer context exercised this cross-context path.
+    static std::atomic<bool> loggedProducerContext{false};
+    if (!loggedProducerContext.exchange(true, std::memory_order_relaxed)) {
+        const EGLContext context = eglGetCurrentContext();
+        const EGLDisplay display = eglGetCurrentDisplay();
+        EGLint clientVersion = 0;
+        const EGLBoolean queried = context != EGL_NO_CONTEXT &&
+            display != EGL_NO_DISPLAY
+            ? eglQueryContext(display, context, EGL_CONTEXT_CLIENT_VERSION,
+                              &clientVersion)
+            : EGL_FALSE;
+        LOGI("[stereo.ring] producer EGL context=%p display=%p query=%d client=%d; "
+             "using display-level fence polling",
+             context, display, queried == EGL_TRUE ? 1 : 0, clientVersion);
+    }
+
+    std::unique_lock<std::mutex> lock(g_pendingStereoReadFenceMutex,
+                                      std::try_to_lock);
+    if (!lock.owns_lock()) {
+        g_stereoWriteFencePollLockBusy.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    const std::uint64_t wallStartNs = MonotonicNowNs();
+    const double cpuStartMs = perf::ThreadCpuMs();
+    const StereoFencePollResult result =
+        RetireCompletedStereoReadsLocked(targetSet, false);
+    const double cpuElapsedMs = std::max(0.0, perf::ThreadCpuMs() - cpuStartMs);
+    const std::uint64_t wallElapsedNs = MonotonicNowNs() - wallStartNs;
+    g_stereoWriteFencePollWallNs.fetch_add(wallElapsedNs,
+                                            std::memory_order_relaxed);
+    g_stereoWriteFencePollCpuNs.fetch_add(
+        static_cast<std::uint64_t>(cpuElapsedMs * 1.0e6),
+        std::memory_order_relaxed);
+    g_stereoWriteFencePollMatched.fetch_add(result.matched,
+                                             std::memory_order_relaxed);
+    g_stereoWriteFencePollRetired.fetch_add(result.retired,
+                                             std::memory_order_relaxed);
+    g_stereoWriteFencePollTimeouts.fetch_add(result.timeouts,
+                                              std::memory_order_relaxed);
+    g_stereoWriteFencePollWaitFailed.fetch_add(result.waitFailed,
+                                                std::memory_order_relaxed);
+    return result.waitFailed == 0;
+}
+
+// If the zero-time producer rescue found a genuinely unsignalled EGL fence,
+// allow that one target slot a very small, shared deadline before dropping the
+// whole stereo pair. Each zero-time poll owns the fence mutex only for the scan;
+// sleeps happen unlocked so the XR thread can insert or retire fences. The XR
+// owner creates and flushes every visible EGL fence before taking the mutex.
+// GLsync fallback and a CPU-only read lease remain nonblocking and fail closed.
+bool TryWaitCompletedStereoReadsForProducer(int targetSet) {
+    g_stereoWriteFenceWaitAttempts.fetch_add(1, std::memory_order_relaxed);
+    if (targetSet < 0 || targetSet >= kStereoSets ||
+        !g_stereoShared.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    const std::uint64_t wallStartNs = MonotonicNowNs();
+    const std::uint64_t deadlineNs = wallStartNs + kStereoProducerFenceWaitNs;
+    const double cpuStartMs = perf::ThreadCpuMs();
+    int waitCalls = 0;
+    int waitFailed = 0;
+    std::uint64_t fenceAgeNs = 0;
+    int fenceAgeSamples = 0;
+    bool satisfied = false;
+    bool timedOut = false;
+
+    for (;;) {
+        const int users = g_stereoSlotUsers[targetSet].load(
+            std::memory_order_acquire);
+        if (users == 0) {
+            satisfied = true;
+            break;
+        }
+        if (users < 0 || !g_stereoShared.load(std::memory_order_acquire)) break;
+
+        StereoFencePollResult poll{};
+        bool lockBusy = false;
+        {
+            std::unique_lock<std::mutex> lock(g_pendingStereoReadFenceMutex,
+                                              std::try_to_lock);
+            if (lock.owns_lock()) {
+                poll = RetireCompletedStereoReadsLocked(targetSet, false);
+            } else {
+                lockBusy = true;
+            }
+        }
+
+        // matched counts real zero-time EGL client-wait calls. GLsync fallback
+        // and CPU-only leases deliberately report no match and remain fail-closed.
+        waitCalls += poll.matched;
+        waitFailed += poll.waitFailed;
+        if (fenceAgeSamples == 0 && poll.fenceAgeSamples > 0) {
+            fenceAgeNs = poll.fenceAgeNs;
+            fenceAgeSamples = poll.fenceAgeSamples;
+        }
+        if (waitFailed != 0) break;
+
+        const int usersAfterPoll = g_stereoSlotUsers[targetSet].load(
+            std::memory_order_acquire);
+        if (usersAfterPoll == 0) {
+            satisfied = true;
+            break;
+        }
+        if (usersAfterPoll < 0) break;
+
+        // A successful scan with no matching EGL fence proves this is not the
+        // display-level fence case this bounded path is allowed to wait for.
+        if (!lockBusy && poll.matched == 0) break;
+
+        const std::uint64_t nowNs = MonotonicNowNs();
+        if (nowNs >= deadlineNs) {
+            timedOut = true;
+            break;
+        }
+        const std::uint64_t sleepNs = std::min(
+            kStereoProducerFencePollSleepNs, deadlineNs - nowNs);
+        const timespec pause{0, static_cast<long>(sleepNs)};
+        nanosleep(&pause, nullptr);
+        // The next iteration always performs one final zero-time sample even if
+        // scheduler wake-up lands on or just beyond the logical deadline.
+    }
+
+    const double cpuElapsedMs = std::max(0.0, perf::ThreadCpuMs() - cpuStartMs);
+    const std::uint64_t wallElapsedNs = MonotonicNowNs() - wallStartNs;
+    g_stereoWriteFenceWaitCalls.fetch_add(waitCalls,
+                                           std::memory_order_relaxed);
+    g_stereoWriteFenceWaitSatisfied.fetch_add(satisfied ? 1 : 0,
+                                               std::memory_order_relaxed);
+    g_stereoWriteFenceWaitTimeouts.fetch_add(timedOut ? 1 : 0,
+                                              std::memory_order_relaxed);
+    g_stereoWriteFenceWaitFailed.fetch_add(waitFailed,
+                                            std::memory_order_relaxed);
+    g_stereoWriteFenceWaitWallNs.fetch_add(wallElapsedNs,
+                                            std::memory_order_relaxed);
+    g_stereoWriteFenceWaitCpuNs.fetch_add(
+        static_cast<std::uint64_t>(cpuElapsedMs * 1.0e6),
+        std::memory_order_relaxed);
+    g_stereoWriteFenceWaitAgeNs.fetch_add(fenceAgeNs,
+                                           std::memory_order_relaxed);
+    g_stereoWriteFenceWaitAgeSamples.fetch_add(fenceAgeSamples,
+                                                std::memory_order_relaxed);
+    return satisfied && waitFailed == 0;
+}
+
+void PinStereoReadUntilGpuComplete(StereoReadLease& lease) {
+    RetireCompletedStereoReads();
+    const int set = lease.Detach();
+    if (set < 0) return;
+
+    const EGLDisplay display = eglGetCurrentDisplay();
+    const EglFenceApi& eglFence = GetEglFenceApi();
+    const EGLSyncKHR sync = SupportsEglFenceSync(display)
+        ? eglFence.create(display, EGL_SYNC_FENCE_KHR, nullptr)
+        : EGL_NO_SYNC_KHR;
+    if (sync == EGL_NO_SYNC_KHR) {
+        // Preserve the previous, XR-only GLsync behavior on devices without the
+        // display-level extension. It cannot rescue the same producer callback,
+        // but it stays asynchronous and keeps lifetime correctness.
+        const GLsync glSync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!glSync) {
+            static bool loggedFailure = false;
+            if (!loggedFailure) {
+                LOGE("[stereo.ring] EGL/GL read fence creation failed "
+                     "(display=%p eglErr=0x%x glErr=0x%x); finishing safely",
+                     display, eglGetError(), glGetError());
+                loggedFailure = true;
+            }
+            glFinish();
+            ReleaseStereoSlotReader(set);
+            return;
+        }
+        static bool loggedFallback = false;
+        if (!loggedFallback) {
+            LOGW("[stereo.ring] EGL_KHR_fence_sync unavailable; using XR-only "
+                 "GL fence fallback");
+            loggedFallback = true;
+        }
+        glFlush();
+        const std::uint64_t queuedNs = MonotonicNowNs();
+        std::lock_guard<std::mutex> lock(g_pendingStereoReadFenceMutex);
+        for (auto& pending : g_pendingStereoReadFences) {
+            if (pending.sync != EGL_NO_SYNC_KHR || pending.glSync) continue;
+            pending.glSync = glSync;
+            pending.display = display;
+            pending.set = set;
+            pending.queuedNs = queuedNs;
+            return;
+        }
+        static bool loggedGlQueue = false;
+        if (!loggedGlQueue) {
+            LOGE("[stereo.ring] GL fallback fence queue exhausted; draining safely");
+            loggedGlQueue = true;
+        }
+        FinishAndReleasePendingStereoReadsLocked();
+        glDeleteSync(glSync);
+        ReleaseStereoSlotReader(set);
+        return;
+    }
+    static bool loggedActive = false;
+    if (!loggedActive) {
+        const char* version = eglQueryString(display, EGL_VERSION);
+        LOGI("[stereo.ring] display-level EGL fence sync active (%s)",
+             version ? version : "unknown EGL version");
+        loggedActive = true;
+    }
+    glFlush();
+    const std::uint64_t queuedNs = MonotonicNowNs();
+
+    std::lock_guard<std::mutex> lock(g_pendingStereoReadFenceMutex);
+    for (auto& pending : g_pendingStereoReadFences) {
+        if (pending.sync != EGL_NO_SYNC_KHR || pending.glSync) continue;
+        pending.sync = sync;
+        pending.display = display;
+        pending.set = set;
+        pending.queuedNs = queuedNs;
+        return;
+    }
+
+    // Sixteen unsignalled compositor copies means the GPU is already severely
+    // wedged. This exceptional drain preserves correctness without putting a
+    // glFinish on the normal frame path.
+    static bool logged = false;
+    if (!logged) {
+        LOGE("[stereo.ring] GPU read fence queue exhausted; draining safely");
+        logged = true;
+    }
+    FinishAndReleasePendingStereoReadsLocked();
+    if (eglFence.destroy(display, sync) != EGL_TRUE) {
+        LOGE("[stereo.ring] eglDestroySync failed after queue drain: 0x%x",
+             eglGetError());
+    }
+    ReleaseStereoSlotReader(set);
+}
+
+class ScopedStereoGpuRead {
+public:
+    explicit ScopedStereoGpuRead(StereoReadLease& lease) : lease_(lease) {}
+    ~ScopedStereoGpuRead() { PinNow(); }
+    void MarkIssued() { issued_ = true; }
+    bool PinNow() {
+        if (!issued_) return false;
+        issued_ = false;
+        PinStereoReadUntilGpuComplete(lease_);
+        return true;
+    }
+
+private:
+    StereoReadLease& lease_;
+    bool issued_{};
+};
+
+bool LeaseStereoCandidate(int sequence, StereoCandidate& candidate,
+                          StereoReadLease& lease,
+                          perf::StereoProjectionOutcome& failure,
+                          bool& generationRace) {
+    candidate = {};
+    candidate.sequence = sequence;
+    if (sequence < 0) {
+        failure = perf::StereoProjectionOutcome::NoSafePair;
+        return false;
+    }
+
+    const int set = ((sequence % kStereoSets) + kStereoSets) % kStereoSets;
+    int users = g_stereoSlotUsers[set].load(std::memory_order_acquire);
+    for (;;) {
+        if (users < 0) {
+            failure = perf::StereoProjectionOutcome::ReadLeaseConflict;
+            return false;
+        }
+        if (g_stereoSlotUsers[set].compare_exchange_weak(
+                users, users + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            lease.Adopt(set);
+            break;
+        }
+    }
+
+    // Ownership prevents a producer from invalidating this slot after the
+    // check. A mismatch here therefore means the requested generation was
+    // already gone before the lease, not that it changed during the copy.
+    if (g_stereoGeneration[set].load(std::memory_order_acquire) != sequence) {
+        generationRace = true;
+        failure = perf::StereoProjectionOutcome::GenerationPre;
+        lease.Release();
+        return false;
+    }
+    if (!StereoProducerGenerationReady(set, sequence)) {
+        failure = perf::StereoProjectionOutcome::NoSafePair;
+        lease.Release();
+        return false;
+    }
+    const std::uint64_t publishedNs =
+        g_stereoPublishedNs[set].load(std::memory_order_relaxed);
+    if (publishedNs == 0) {
+        failure = perf::StereoProjectionOutcome::NoTimestamp;
+        lease.Release();
+        return false;
+    }
+    const std::uint64_t sampledNs = MonotonicNowNs();
+    if (sampledNs < publishedNs) {
+        failure = perf::StereoProjectionOutcome::NoTimestamp;
+        lease.Release();
+        return false;
+    }
+    candidate.set = set;
+    candidate.ageMs = static_cast<double>(sampledNs - publishedNs) / 1e6;
+    return true;
+}
+
+bool ProbeStereoCandidate(int sequence, StereoCandidate& candidate,
+                          perf::StereoProjectionOutcome& failure,
+                          bool& generationRace) {
+    candidate = {};
+    candidate.sequence = sequence;
+    if (sequence < 0) {
+        failure = perf::StereoProjectionOutcome::NoSafePair;
+        return false;
+    }
+    const int set = ((sequence % kStereoSets) + kStereoSets) % kStereoSets;
+    if (g_stereoGeneration[set].load(std::memory_order_acquire) != sequence) {
+        generationRace = true;
+        failure = perf::StereoProjectionOutcome::GenerationPre;
+        return false;
+    }
+    if (!StereoProducerGenerationReady(set, sequence)) {
+        failure = perf::StereoProjectionOutcome::NoSafePair;
+        return false;
+    }
+    const std::uint64_t publishedNs =
+        g_stereoPublishedNs[set].load(std::memory_order_relaxed);
+    if (publishedNs == 0) {
+        failure = perf::StereoProjectionOutcome::NoTimestamp;
+        return false;
+    }
+    const std::uint64_t sampledNs = MonotonicNowNs();
+    if (sampledNs < publishedNs) {
+        failure = perf::StereoProjectionOutcome::NoTimestamp;
+        return false;
+    }
+    candidate.set = set;
+    candidate.ageMs = static_cast<double>(sampledNs - publishedNs) / 1e6;
+    return true;
+}
+
+bool ProbeLatestStereoCandidate(StereoCandidate& candidate,
+                                perf::StereoProjectionOutcome& failure,
+                                bool& generationRace) {
+    const int newest = g_stereoSeq.load(std::memory_order_acquire);
+    if (newest < kStereoReadLag) {
+        candidate = {};
+        failure = perf::StereoProjectionOutcome::NoSafePair;
+        return false;
+    }
+    return ProbeStereoCandidate(newest - kStereoReadLag, candidate, failure,
+                                generationRace);
 }
 
 struct StereoSyncWaitResult {
@@ -443,10 +1693,158 @@ struct StereoSyncWaitResult {
     double waitMs{};
 };
 
+bool StereoExtendedWaitRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool enabled = true;
+        if (__system_property_get("debug.savr.stereo_wait_extend", text) > 0) {
+            if (std::strcmp(text, "0") == 0) enabled = false;
+            else if (std::strcmp(text, "1") != 0)
+                LOGW("[stereo.wait] ignoring invalid "
+                     "debug.savr.stereo_wait_extend=%s (valid 0 or 1)", text);
+        }
+        LOGI("[stereo.wait] adaptive_extension=%d base=%.2fms "
+             "normal=%.2fms predicted=%.2fms",
+             enabled ? 1 : 0,
+             static_cast<double>(kStereoSyncBaseWaitNs) / 1.0e6,
+             static_cast<double>(kStereoSyncExtendedWaitNs) / 1.0e6,
+             static_cast<double>(kStereoSyncPredictedMaxWaitNs) / 1.0e6);
+        return enabled;
+    }();
+    return requested;
+}
+
+bool ReadStereoPublicationTime(int sequence, std::uint64_t& publishedNs) {
+    if (sequence < 0) return false;
+    const int set = ((sequence % kStereoSets) + kStereoSets) % kStereoSets;
+    if (g_stereoGeneration[set].load(std::memory_order_acquire) != sequence)
+        return false;
+    publishedNs = g_stereoPublishedNs[set].load(std::memory_order_relaxed);
+    return publishedNs != 0;
+}
+
+struct StereoSyncWaitPlan {
+    bool eligible{};
+    bool predicted{};
+    bool cadenceOutlierTolerated{};
+    bool feedback{};
+    std::uint64_t feedbackEpoch{};
+    std::uint64_t deadlineNs{};
+};
+
+StereoSyncWaitPlan PlanStereoSyncWait(int newest, std::uint64_t startNs,
+                                      std::uint64_t nowNs) {
+    StereoSyncWaitPlan plan{};
+    plan.deadlineNs = startNs + kStereoSyncExtendedWaitNs;
+    const float gpuBudgetMs = g_displayRefreshValid &&
+            std::isfinite(g_displayRefreshHz) && g_displayRefreshHz > 1.0f
+        ? 1000.0f / g_displayRefreshHz : 0.0f;
+    if (!StereoExtendedWaitRequested() ||
+        !g_displayRefreshValid ||
+        std::fabs(g_displayRefreshHz - 72.0f) >= 0.5f ||
+        !g_runtimeGpuValid ||
+        !std::isfinite(g_runtimeGpuMs) ||
+        gpuBudgetMs <= kStereoSyncExtendedGpuReserveMs ||
+        g_runtimeGpuMs > gpuBudgetMs - kStereoSyncExtendedGpuReserveMs ||
+        g_runtimeMetricsSampleNs == 0 ||
+        nowNs < g_runtimeMetricsSampleNs ||
+        nowNs - g_runtimeMetricsSampleNs > kStereoSyncMetricsMaxAgeNs) {
+        return plan;
+    }
+
+    // The four-slot ring retains three complete producer intervals. A single
+    // scheduler wobble must not disable prediction for the next otherwise
+    // healthy frame, so accept two cadence-valid intervals out of three. Until
+    // the fourth publication exists, preserve the old two-out-of-two proof.
+    // A genuinely slow 60 Hz producer still has fewer than two valid samples.
+    std::uint64_t t0 = 0;
+    std::uint64_t t1 = 0;
+    std::uint64_t t2 = 0;
+    if (!ReadStereoPublicationTime(newest, t0) ||
+        !ReadStereoPublicationTime(newest - 1, t1) ||
+        !ReadStereoPublicationTime(newest - 2, t2) ||
+        t0 <= t1 || t1 <= t2) {
+        return plan;
+    }
+    std::uint64_t periods[3]{t0 - t1, t1 - t2, 0};
+    int intervalCount = 2;
+    std::uint64_t t3 = 0;
+    if (ReadStereoPublicationTime(newest - 3, t3) && t2 > t3) {
+        periods[2] = t2 - t3;
+        intervalCount = 3;
+    }
+    std::uint64_t validSumNs = 0;
+    int validCount = 0;
+    for (int i = 0; i < intervalCount; ++i) {
+        const std::uint64_t period = periods[i];
+        if (period >= kStereoSyncCadenceMinNs &&
+            period <= kStereoSyncCadenceMaxNs) {
+            validSumNs += period;
+            ++validCount;
+        }
+    }
+    if (validCount < 2) {
+        return plan;
+    }
+    plan.eligible = true;
+    plan.cadenceOutlierTolerated = intervalCount == 3 && validCount == 2;
+
+    // A longer wait is permitted only with an additional millisecond of
+    // measured GPU reserve. The mean of cadence-valid intervals ignores the
+    // one admitted scheduler wobble; the fixed 2 ms tail covers the measured
+    // post-4 ms publication lateness.
+    if (gpuBudgetMs <= kStereoSyncPredictedGpuReserveMs ||
+        g_runtimeGpuMs > gpuBudgetMs - kStereoSyncPredictedGpuReserveMs) {
+        return plan;
+    }
+    const std::uint64_t hardDeadlineNs =
+        startNs + kStereoSyncPredictedMaxWaitNs;
+    const std::uint64_t phaseEpoch =
+        g_stereoPhaseEpoch.load(std::memory_order_acquire);
+    const std::uint64_t feedbackEpoch =
+        g_stereoSyncFeedbackEpoch.load(std::memory_order_acquire);
+    const std::uint64_t feedbackUntilNs =
+        g_stereoSyncFeedbackUntilNs.load(std::memory_order_acquire);
+    if (phaseEpoch != 0 && feedbackEpoch == phaseEpoch &&
+        feedbackUntilNs != 0 && nowNs <= feedbackUntilNs &&
+        g_stereoSyncFeedbackEpoch.load(std::memory_order_acquire) ==
+            feedbackEpoch &&
+        g_stereoPhaseEpoch.load(std::memory_order_acquire) == phaseEpoch) {
+        plan.predicted = true;
+        plan.feedback = true;
+        plan.feedbackEpoch = feedbackEpoch;
+        plan.deadlineNs = hardDeadlineNs;
+        return plan;
+    }
+    const std::uint64_t predictedPeriodNs =
+        (validSumNs + static_cast<std::uint64_t>(validCount / 2)) /
+        static_cast<std::uint64_t>(validCount);
+    if (t0 > std::numeric_limits<std::uint64_t>::max() - predictedPeriodNs) {
+        return plan;
+    }
+    const std::uint64_t predictedPublishNs = t0 + predictedPeriodNs;
+    if (predictedPublishNs >
+        std::numeric_limits<std::uint64_t>::max() -
+            kStereoSyncPredictionSlackNs) {
+        return plan;
+    }
+    const std::uint64_t predictedDeadlineNs =
+        predictedPublishNs + kStereoSyncPredictionSlackNs;
+    if (predictedDeadlineNs > plan.deadlineNs &&
+        predictedDeadlineNs <= hardDeadlineNs &&
+        predictedDeadlineNs > nowNs) {
+        plan.predicted = true;
+        plan.deadlineNs = predictedDeadlineNs;
+    }
+    return plan;
+}
+
 StereoSyncWaitResult WaitForFreshStereoPair(int lastSubmittedSequence) {
     StereoSyncWaitResult result{};
     if (lastSubmittedSequence < 0) return result;
 
+    const std::uint64_t initialPhaseEpoch =
+        g_stereoPhaseEpoch.load(std::memory_order_acquire);
     const int initialNewest = g_stereoSeq.load(std::memory_order_acquire);
     if (initialNewest < kStereoReadLag ||
         initialNewest - kStereoReadLag != lastSubmittedSequence) {
@@ -456,13 +1854,13 @@ StereoSyncWaitResult WaitForFreshStereoPair(int lastSubmittedSequence) {
     // xrWaitFrame return times jitter around the independently paced game
     // producer. If we land just before its publication fence, immediately
     // sampling the ring repeats the old pair and skips the new one next frame.
-    // Give only that boundary case a small bounded chance to complete. The cap
-    // is deliberately below the measured 72 Hz GPU headroom and cannot turn a
-    // genuinely late producer into an unbounded compositor stall.
-    constexpr std::uint64_t kMaxWaitNs = 1250000ULL;
+    // Give only that boundary case a small bounded chance to complete. The base
+    // cap applies to every scene. A healthy 72 Hz producer with measured GPU
+    // margin may use the normal 4 ms window. A stricter GPU-reserve gate may
+    // extend only to the predicted publication, never beyond 6.5 ms.
     constexpr long kSleepStepNs = 100000L;
     const std::uint64_t startNs = MonotonicNowNs();
-    const std::uint64_t deadlineNs = startNs + kMaxWaitNs;
+    const std::uint64_t baseDeadlineNs = startNs + kStereoSyncBaseWaitNs;
     result.attempted = true;
 
     do {
@@ -474,11 +1872,127 @@ StereoSyncWaitResult WaitForFreshStereoPair(int lastSubmittedSequence) {
             result.rescued = true;
             break;
         }
-    } while (MonotonicNowNs() < deadlineNs);
+    } while (MonotonicNowNs() < baseDeadlineNs);
+
+    bool extended = false;
+    bool predicted = false;
+    const int postBaseNewest = g_stereoSeq.load(std::memory_order_acquire);
+    if (!result.rescued && postBaseNewest >= kStereoReadLag &&
+        postBaseNewest - kStereoReadLag > lastSubmittedSequence) {
+        result.rescued = true;
+    }
+    std::uint64_t nowNs = MonotonicNowNs();
+    const StereoSyncWaitPlan waitPlan = PlanStereoSyncWait(
+        initialNewest, startNs, nowNs);
+    if (!result.rescued &&
+        g_stereoSeq.load(std::memory_order_acquire) == initialNewest &&
+        g_stereoPhaseEpoch.load(std::memory_order_acquire) == initialPhaseEpoch &&
+        waitPlan.eligible && nowNs < waitPlan.deadlineNs) {
+        extended = true;
+        predicted = waitPlan.predicted;
+        g_stereoSyncExtendedAttempts.fetch_add(1, std::memory_order_relaxed);
+        if (predicted) {
+            g_stereoSyncPredictedAttempts.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (waitPlan.cadenceOutlierTolerated) {
+            g_stereoSyncCadenceOutlierAttempts.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (waitPlan.feedback) {
+            g_stereoSyncFeedbackAttempts.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        do {
+            timespec pause{0, kSleepStepNs};
+            nanosleep(&pause, nullptr);
+            const int newest = g_stereoSeq.load(std::memory_order_acquire);
+            if (newest >= kStereoReadLag &&
+                newest - kStereoReadLag > lastSubmittedSequence) {
+                result.rescued = true;
+                g_stereoSyncExtendedRescued.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (predicted) {
+                    g_stereoSyncPredictedRescued.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                if (waitPlan.cadenceOutlierTolerated) {
+                    g_stereoSyncCadenceOutlierRescued.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                if (waitPlan.feedback) {
+                    g_stereoSyncFeedbackRescued.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                break;
+            }
+        } while (MonotonicNowNs() < waitPlan.deadlineNs);
+    }
 
     const std::uint64_t endNs = MonotonicNowNs();
+    if (extended && waitPlan.feedback && result.rescued &&
+        endNs > startNs + kStereoSyncExtendedWaitNs &&
+        endNs <= std::numeric_limits<std::uint64_t>::max() -
+                     kStereoSyncFeedbackWindowNs) {
+        // A successful rescue beyond the ordinary 4 ms edge proves that the
+        // producer/consumer phase is still close enough for the bounded tail to
+        // be useful. Rescues that would already fit in the ordinary window must
+        // not keep feedback alive indefinitely.
+        // Keep that evidence warm instead of forcing the next isolated miss to
+        // pay one visible timeout merely to re-arm the two-second window.
+        //
+        // Compare-exchange only a live deadline. ResetStereoPhaseFeedback()
+        // clears it to zero after advancing the epoch, so this cannot resurrect
+        // feedback across focus, session or stereo-generation resets.
+        const std::uint64_t refreshedUntilNs =
+            endNs + kStereoSyncFeedbackWindowNs;
+        std::uint64_t currentUntilNs =
+            g_stereoSyncFeedbackUntilNs.load(std::memory_order_acquire);
+        while (currentUntilNs >= endNs &&
+               currentUntilNs < refreshedUntilNs &&
+               g_stereoSyncFeedbackEpoch.load(std::memory_order_acquire) ==
+                   waitPlan.feedbackEpoch &&
+               g_stereoPhaseEpoch.load(std::memory_order_acquire) ==
+                   initialPhaseEpoch &&
+               g_sessionFocused.load(std::memory_order_acquire)) {
+            if (g_stereoSyncFeedbackUntilNs.compare_exchange_weak(
+                    currentUntilNs, refreshedUntilNs,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                if (g_stereoSyncFeedbackEpoch.load(
+                        std::memory_order_acquire) ==
+                        waitPlan.feedbackEpoch &&
+                    g_stereoPhaseEpoch.load(std::memory_order_acquire) ==
+                        initialPhaseEpoch) {
+                    g_stereoSyncFeedbackRefreshed.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                break;
+            }
+        }
+    }
     result.waitMs = static_cast<double>(endNs - startNs) / 1e6;
     result.timedOut = !result.rescued;
+    if (extended && result.timedOut) {
+        g_stereoSyncExtendedTimeouts.fetch_add(1, std::memory_order_relaxed);
+        if (predicted) {
+            g_stereoSyncPredictedTimeouts.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (waitPlan.cadenceOutlierTolerated) {
+            g_stereoSyncCadenceOutlierTimeouts.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (waitPlan.feedback) {
+            g_stereoSyncFeedbackTimeouts.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+    if (result.timedOut && !predicted &&
+        initialNewest < std::numeric_limits<int>::max()) {
+        ArmStereoLatePublicationProbe(
+            initialNewest + 1, endNs, initialPhaseEpoch);
+    }
     return result;
 }
 
@@ -502,7 +2016,22 @@ struct Swapchain {
     int32_t     width{};
     int32_t     height{};
     std::vector<XrSwapchainImageOpenGLESKHR> images;
+    // A failed wait leaves the acquired image outstanding; releasing it before
+    // a successful wait would violate OpenXR call order. A failed release also
+    // leaves ownership ambiguous. Quarantine either case for this session.
+    bool poisoned{};
 };
+
+struct HiddenAreaMaskStorage {
+    std::vector<float> verticesXY;
+    std::vector<unsigned short> indices;
+};
+
+std::array<HiddenAreaMaskStorage, 2> g_hiddenAreaMasks;
+std::atomic<bool> g_hiddenAreaMasksReady{false};
+bool g_hasVisibilityMaskExt = false;
+PFN_xrGetVisibilityMaskKHR g_xrGetVisibilityMaskKHR = nullptr;
+void LoadHiddenAreaMasks();
 
 struct State {
     XrInstance     instance{XR_NULL_HANDLE};
@@ -527,7 +2056,13 @@ struct State {
     // Head-locked FPS/debug panel (toggled by both grips + A), in the spirit of
     // the Vice City VR port's overlay.
     Swapchain debug;
+#ifdef SAVR_DEV
+    // Keep diagnostics available without covering normal gameplay on launch.
+    // The same grips+A chord enables the panel when a capture needs it.
     bool      debugVisible{false};
+#else
+    bool      debugVisible{false};
+#endif
 
     // Original mobile HUD rendered into a transparent shared texture and
     // submitted as a head-locked quad, independently of the world projection.
@@ -594,6 +2129,7 @@ struct State {
     XrAction    stickAction{XR_NULL_HANDLE};
     XrAction    triggerAction{XR_NULL_HANDLE};
     XrAction    gripAction{XR_NULL_HANDLE};
+    XrAction    thumbrestAction{XR_NULL_HANDLE};
     XrAction    aAction{XR_NULL_HANDLE};
     XrAction    bAction{XR_NULL_HANDLE};
     XrAction    xAction{XR_NULL_HANDLE};
@@ -602,6 +2138,7 @@ struct State {
     XrAction    stickClickAction{XR_NULL_HANDLE}; // L3/R3, per-hand subactions
     XrAction    aimAction{XR_NULL_HANDLE};
     XrAction    gripPoseAction{XR_NULL_HANDLE};
+    XrAction    hapticAction{XR_NULL_HANDLE};
     XrSpace     aimSpace{XR_NULL_HANDLE};        // right-hand aim, for the laser pointer
     XrSpace     handGripSpace[2]{};              // per-hand grip pose (VR hands)
     XrSpace     handAimSpace[2]{};               // per-hand aim pose
@@ -610,6 +2147,520 @@ struct State {
 };
 
 State s;
+
+// Asynchronous GPU-stage profiler for the XR presentation context. The
+// RenderQueue timer measures the game's renderer context, but it cannot see a
+// late stall while the XR context copies shared eye textures into OpenXR
+// swapchains. Sample one non-overlapping stage per frame and consume results
+// only after the driver reports them available, so profiling never waits.
+enum class XrGpuStage : std::uint8_t {
+    CopyLeft,
+    OverlayLeft,
+    CopyRight,
+    OverlayRight,
+    Count,
+};
+
+enum class XrCpuStage : std::uint8_t {
+    Acquire,
+    Wait,
+    CopySubmit,
+    OverlaySubmit,
+    Release,
+    Count,
+};
+
+struct XrStageAggregate {
+    std::uint64_t samples{};
+    double totalMs{};
+    double maxMs{};
+};
+
+struct XrGpuTimerApi {
+    PFNGLGENQUERIESEXTPROC genQueries{};
+    PFNGLBEGINQUERYEXTPROC beginQuery{};
+    PFNGLENDQUERYEXTPROC endQuery{};
+    PFNGLGETQUERYOBJECTUIVEXTPROC getQueryObjectUiv{};
+    PFNGLGETQUERYOBJECTUI64VEXTPROC getQueryObjectUi64v{};
+
+    bool Available() const {
+        return genQueries && beginQuery && endQuery && getQueryObjectUiv &&
+            getQueryObjectUi64v;
+    }
+};
+
+struct XrGpuQuery {
+    GLuint id{};
+    bool pending{};
+    XrGpuStage stage{XrGpuStage::CopyLeft};
+};
+
+struct XrStageProfiler {
+    static constexpr std::size_t kQueryCount = 32;
+
+    EGLContext context{EGL_NO_CONTEXT};
+    bool initialized{};
+    bool supported{};
+    std::array<XrGpuQuery, kQueryCount> queries{};
+    std::size_t nextQuery{};
+    std::size_t nextPoll{};
+    int activeQuery{-1};
+    XrGpuStage sampleStage{XrGpuStage::CopyLeft};
+    std::uint8_t nextSampleStage{};
+    std::uint64_t drops{};
+    std::uint64_t disjoint{};
+    double windowStartMs{};
+    std::array<XrStageAggregate,
+               static_cast<std::size_t>(XrGpuStage::Count)> gpu{};
+    std::array<std::array<XrStageAggregate,
+                          static_cast<std::size_t>(XrCpuStage::Count)>, 2> cpu{};
+};
+
+XrStageProfiler g_xrStageProfiler;
+
+double XrStageNowMs() {
+    timespec t{};
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return static_cast<double>(t.tv_sec) * 1000.0 +
+        static_cast<double>(t.tv_nsec) / 1000000.0;
+}
+
+bool XrStageGpuTimerRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = false;
+        if (__system_property_get("debug.savr.xr_gpu_timer", text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[xr.gpu.stage] ignoring invalid property value=%s", text);
+        }
+        LOGI("[xr.gpu.stage] requested=%d", value ? 1 : 0);
+        return value;
+    }();
+    return requested;
+}
+
+const XrGpuTimerApi& GetXrGpuTimerApi() {
+    static const XrGpuTimerApi api{
+        .genQueries = reinterpret_cast<PFNGLGENQUERIESEXTPROC>(
+            eglGetProcAddress("glGenQueriesEXT")),
+        .beginQuery = reinterpret_cast<PFNGLBEGINQUERYEXTPROC>(
+            eglGetProcAddress("glBeginQueryEXT")),
+        .endQuery = reinterpret_cast<PFNGLENDQUERYEXTPROC>(
+            eglGetProcAddress("glEndQueryEXT")),
+        .getQueryObjectUiv = reinterpret_cast<PFNGLGETQUERYOBJECTUIVEXTPROC>(
+            eglGetProcAddress("glGetQueryObjectuivEXT")),
+        .getQueryObjectUi64v =
+            reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(
+                eglGetProcAddress("glGetQueryObjectui64vEXT")),
+    };
+    return api;
+}
+
+bool XrGlExtensionPresent(const char* extensions, const char* name) {
+    if (!extensions || !name || *name == '\0') return false;
+    const std::size_t length = std::strlen(name);
+    const char* cursor = extensions;
+    while ((cursor = std::strstr(cursor, name)) != nullptr) {
+        const bool left = cursor == extensions || cursor[-1] == ' ';
+        const char right = cursor[length];
+        if (left && (right == '\0' || right == ' ')) return true;
+        cursor += length;
+    }
+    return false;
+}
+
+void InitializeXrStageProfiler() {
+    XrStageProfiler& profiler = g_xrStageProfiler;
+    const EGLContext context = eglGetCurrentContext();
+    if (profiler.initialized && profiler.context == context) return;
+
+    // Query names are context-owned. Abandon a tiny old ring on context
+    // replacement instead of deleting it from the wrong context.
+    profiler = {};
+    profiler.context = context;
+    profiler.initialized = true;
+    profiler.windowStartMs = XrStageNowMs();
+    if (!XrStageGpuTimerRequested() || context == EGL_NO_CONTEXT) return;
+
+    const char* extensions = reinterpret_cast<const char*>(
+        glGetString(GL_EXTENSIONS));
+    const XrGpuTimerApi& api = GetXrGpuTimerApi();
+    if (!api.Available() ||
+        !XrGlExtensionPresent(extensions, "GL_EXT_disjoint_timer_query")) {
+        LOGW("[xr.gpu.stage] GL_EXT_disjoint_timer_query unavailable");
+        return;
+    }
+
+    std::array<GLuint, XrStageProfiler::kQueryCount> ids{};
+    api.genQueries(static_cast<GLsizei>(ids.size()), ids.data());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        profiler.queries[i].id = ids[i];
+    }
+    profiler.supported = std::all_of(
+        ids.begin(), ids.end(), [](GLuint id) { return id != 0u; });
+    LOGI("[xr.gpu.stage] supported=%d queries=%zu",
+         profiler.supported ? 1 : 0, ids.size());
+}
+
+void PollXrStageGpuQueries() {
+    XrStageProfiler& profiler = g_xrStageProfiler;
+    InitializeXrStageProfiler();
+    if (!profiler.supported) return;
+    const XrGpuTimerApi& api = GetXrGpuTimerApi();
+
+    // Poll a few ready results, but never wait for the GPU.
+    for (int poll = 0; poll < 4; ++poll) {
+        bool found = false;
+        for (std::size_t offset = 0; offset < profiler.queries.size(); ++offset) {
+            const std::size_t index =
+                (profiler.nextPoll + offset) % profiler.queries.size();
+            XrGpuQuery& query = profiler.queries[index];
+            if (!query.pending) continue;
+            found = true;
+            GLuint available = GL_FALSE;
+            api.getQueryObjectUiv(query.id, GL_QUERY_RESULT_AVAILABLE_EXT,
+                                  &available);
+            if (available != GL_TRUE) return;
+            GLint disjoint = GL_FALSE;
+            glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+            GLuint64EXT elapsedNs = 0;
+            api.getQueryObjectUi64v(query.id, GL_QUERY_RESULT_EXT, &elapsedNs);
+            query.pending = false;
+            profiler.nextPoll = (index + 1u) % profiler.queries.size();
+            if (disjoint != GL_FALSE) {
+                ++profiler.disjoint;
+            } else {
+                XrStageAggregate& aggregate =
+                    profiler.gpu[static_cast<std::size_t>(query.stage)];
+                const double elapsedMs = static_cast<double>(elapsedNs) / 1.0e6;
+                ++aggregate.samples;
+                aggregate.totalMs += elapsedMs;
+                aggregate.maxMs = std::max(aggregate.maxMs, elapsedMs);
+            }
+            break;
+        }
+        if (!found) return;
+    }
+}
+
+void RecordXrCpuStage(int eye, XrCpuStage stage, double wallStartMs,
+                      double cpuStartMs) {
+    if (!XrStageGpuTimerRequested() || eye < 0 || eye > 1) return;
+    XrStageAggregate& aggregate = g_xrStageProfiler.cpu[eye][
+        static_cast<std::size_t>(stage)];
+    const double wallMs = std::max(0.0, XrStageNowMs() - wallStartMs);
+    const double cpuMs = std::max(0.0, perf::ThreadCpuMs() - cpuStartMs);
+    ++aggregate.samples;
+    aggregate.totalMs += wallMs;
+    aggregate.maxMs = std::max(aggregate.maxMs,
+                               std::max(0.0, wallMs - cpuMs));
+}
+
+bool BeginXrGpuStage(XrGpuStage stage) {
+    XrStageProfiler& profiler = g_xrStageProfiler;
+    if (!profiler.supported || profiler.activeQuery >= 0 ||
+        profiler.sampleStage != stage) {
+        return false;
+    }
+    for (std::size_t offset = 0; offset < profiler.queries.size(); ++offset) {
+        const std::size_t index =
+            (profiler.nextQuery + offset) % profiler.queries.size();
+        XrGpuQuery& query = profiler.queries[index];
+        if (query.pending || query.id == 0u) continue;
+        query.stage = stage;
+        GetXrGpuTimerApi().beginQuery(GL_TIME_ELAPSED_EXT, query.id);
+        profiler.activeQuery = static_cast<int>(index);
+        profiler.nextQuery = (index + 1u) % profiler.queries.size();
+        return true;
+    }
+    ++profiler.drops;
+    return false;
+}
+
+void EndXrGpuStage(bool began) {
+    XrStageProfiler& profiler = g_xrStageProfiler;
+    if (!began || profiler.activeQuery < 0) return;
+    GetXrGpuTimerApi().endQuery(GL_TIME_ELAPSED_EXT);
+    profiler.queries[static_cast<std::size_t>(profiler.activeQuery)].pending = true;
+    profiler.activeQuery = -1;
+}
+
+double XrStageAverage(const XrStageAggregate& aggregate) {
+    return aggregate.samples != 0u
+        ? aggregate.totalMs / static_cast<double>(aggregate.samples) : 0.0;
+}
+
+void BeginXrStageProfilerFrame() {
+    if (!XrStageGpuTimerRequested()) return;
+    PollXrStageGpuQueries();
+    XrStageProfiler& profiler = g_xrStageProfiler;
+    profiler.sampleStage = static_cast<XrGpuStage>(
+        profiler.nextSampleStage++ %
+        static_cast<std::uint8_t>(XrGpuStage::Count));
+
+    const double nowMs = XrStageNowMs();
+    if (nowMs - profiler.windowStartMs < 1000.0) return;
+    const auto& gl = profiler.gpu;
+    const auto& l = profiler.cpu[0];
+    const auto& r = profiler.cpu[1];
+    LOGI("[xr.gpu.stage] gpu copyL/overL/copyR/overR avg="
+         "%.3f/%.3f/%.3f/%.3f max=%.3f/%.3f/%.3f/%.3f "
+         "n=%llu/%llu/%llu/%llu disjoint/drop=%llu/%llu",
+         XrStageAverage(gl[0]), XrStageAverage(gl[1]),
+         XrStageAverage(gl[2]), XrStageAverage(gl[3]),
+         gl[0].maxMs, gl[1].maxMs, gl[2].maxMs, gl[3].maxMs,
+         static_cast<unsigned long long>(gl[0].samples),
+         static_cast<unsigned long long>(gl[1].samples),
+         static_cast<unsigned long long>(gl[2].samples),
+         static_cast<unsigned long long>(gl[3].samples),
+         static_cast<unsigned long long>(profiler.disjoint),
+         static_cast<unsigned long long>(profiler.drops));
+    LOGI("[xr.cpu.stage] left acq/wait/copy/over/rel="
+         "%.3f/%.3f/%.3f/%.3f/%.3f blocked_max="
+         "%.3f/%.3f/%.3f/%.3f/%.3f right="
+         "%.3f/%.3f/%.3f/%.3f/%.3f blocked_max="
+         "%.3f/%.3f/%.3f/%.3f/%.3f",
+         XrStageAverage(l[0]), XrStageAverage(l[1]),
+         XrStageAverage(l[2]), XrStageAverage(l[3]), XrStageAverage(l[4]),
+         l[0].maxMs, l[1].maxMs, l[2].maxMs, l[3].maxMs, l[4].maxMs,
+         XrStageAverage(r[0]), XrStageAverage(r[1]),
+         XrStageAverage(r[2]), XrStageAverage(r[3]), XrStageAverage(r[4]),
+         r[0].maxMs, r[1].maxMs, r[2].maxMs, r[3].maxMs, r[4].maxMs);
+    profiler.gpu = {};
+    profiler.cpu = {};
+    profiler.disjoint = 0;
+    profiler.drops = 0;
+    profiler.windowStartMs = nowMs;
+}
+
+bool StoreHiddenTriangleMask(uint32_t eye, HiddenAreaMaskStorage& out) {
+    XrVisibilityMaskKHR query{XR_TYPE_VISIBILITY_MASK_KHR};
+    XrResult result = g_xrGetVisibilityMaskKHR(
+        s.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &query);
+    if (XR_FAILED(result) || query.vertexCountOutput == 0 ||
+        query.indexCountOutput == 0 || query.vertexCountOutput > 65535u) {
+        LOGW("[stereo.mask] eye=%u hidden count result=%d vertices=%u indices=%u",
+             eye, static_cast<int>(result), query.vertexCountOutput,
+             query.indexCountOutput);
+        return false;
+    }
+
+    std::vector<XrVector2f> vertices(query.vertexCountOutput);
+    std::vector<uint32_t> indices(query.indexCountOutput);
+    query.vertexCapacityInput = static_cast<uint32_t>(vertices.size());
+    query.vertices = vertices.data();
+    query.indexCapacityInput = static_cast<uint32_t>(indices.size());
+    query.indices = indices.data();
+    result = g_xrGetVisibilityMaskKHR(
+        s.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &query);
+    if (XR_FAILED(result) || query.vertexCountOutput > vertices.size() ||
+        query.indexCountOutput > indices.size() ||
+        (query.indexCountOutput % 3u) != 0u) {
+        LOGW("[stereo.mask] eye=%u hidden data result=%d vertices=%u indices=%u",
+             eye, static_cast<int>(result), query.vertexCountOutput,
+             query.indexCountOutput);
+        return false;
+    }
+
+    out.verticesXY.reserve(static_cast<std::size_t>(query.vertexCountOutput) * 2u);
+    for (uint32_t i = 0; i < query.vertexCountOutput; ++i) {
+        if (!std::isfinite(vertices[i].x) || !std::isfinite(vertices[i].y)) {
+            LOGW("[stereo.mask] eye=%u hidden invalid vertex=%u", eye, i);
+            return false;
+        }
+        out.verticesXY.push_back(vertices[i].x);
+        out.verticesXY.push_back(vertices[i].y);
+    }
+    out.indices.reserve(query.indexCountOutput);
+    for (uint32_t i = 0; i < query.indexCountOutput; ++i) {
+        if (indices[i] >= query.vertexCountOutput) {
+            LOGW("[stereo.mask] eye=%u hidden invalid index=%u value=%u vertices=%u",
+                 eye, i, indices[i], query.vertexCountOutput);
+            return false;
+        }
+        out.indices.push_back(static_cast<unsigned short>(indices[i]));
+    }
+    LOGI("[stereo.mask] eye=%u source=hidden vertices=%u indices=%u triangles=%u",
+         eye, query.vertexCountOutput, query.indexCountOutput,
+         query.indexCountOutput / 3u);
+    return true;
+}
+
+bool StoreHiddenRingFromLineLoop(uint32_t eye, HiddenAreaMaskStorage& out) {
+    XrVisibilityMaskKHR query{XR_TYPE_VISIBILITY_MASK_KHR};
+    XrResult result = g_xrGetVisibilityMaskKHR(
+        s.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+        XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR, &query);
+    if (XR_FAILED(result) || query.vertexCountOutput < 3u ||
+        query.indexCountOutput < 3u || query.vertexCountOutput > 32767u ||
+        query.indexCountOutput > 32767u) {
+        LOGW("[stereo.mask] eye=%u line count result=%d vertices=%u indices=%u",
+             eye, static_cast<int>(result), query.vertexCountOutput,
+             query.indexCountOutput);
+        return false;
+    }
+
+    std::vector<XrVector2f> vertices(query.vertexCountOutput);
+    std::vector<uint32_t> indices(query.indexCountOutput);
+    query.vertexCapacityInput = static_cast<uint32_t>(vertices.size());
+    query.vertices = vertices.data();
+    query.indexCapacityInput = static_cast<uint32_t>(indices.size());
+    query.indices = indices.data();
+    result = g_xrGetVisibilityMaskKHR(
+        s.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+        XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR, &query);
+    if (XR_FAILED(result) || query.vertexCountOutput > vertices.size() ||
+        query.indexCountOutput > indices.size() || query.indexCountOutput < 3u) {
+        LOGW("[stereo.mask] eye=%u line data result=%d vertices=%u indices=%u",
+             eye, static_cast<int>(result), query.vertexCountOutput,
+             query.indexCountOutput);
+        return false;
+    }
+
+    std::vector<XrVector2f> loop;
+    loop.reserve(query.indexCountOutput);
+    for (uint32_t i = 0; i < query.indexCountOutput; ++i) {
+        const uint32_t index = indices[i];
+        if (index >= query.vertexCountOutput ||
+            !std::isfinite(vertices[index].x) ||
+            !std::isfinite(vertices[index].y)) {
+            LOGW("[stereo.mask] eye=%u line invalid index=%u value=%u vertices=%u",
+                 eye, i, index, query.vertexCountOutput);
+            return false;
+        }
+        if (!loop.empty() && vertices[index].x == loop.back().x &&
+            vertices[index].y == loop.back().y) {
+            continue;
+        }
+        loop.push_back(vertices[index]);
+    }
+    if (loop.size() > 3u && loop.front().x == loop.back().x &&
+        loop.front().y == loop.back().y) {
+        loop.pop_back();
+    }
+    if (loop.size() < 3u || loop.size() > 32767u) {
+        LOGW("[stereo.mask] eye=%u line unusable loop=%zu", eye, loop.size());
+        return false;
+    }
+
+    double twiceArea = 0.0;
+    for (std::size_t i = 0; i < loop.size(); ++i) {
+        const XrVector2f& a = loop[i];
+        const XrVector2f& b = loop[(i + 1u) % loop.size()];
+        twiceArea += static_cast<double>(a.x) * static_cast<double>(b.y) -
+                     static_cast<double>(a.y) * static_cast<double>(b.x);
+    }
+    if (!std::isfinite(twiceArea) || std::abs(twiceArea) < 1.0e-5) {
+        LOGW("[stereo.mask] eye=%u line degenerate area=%.7f", eye, twiceArea);
+        return false;
+    }
+
+    const double winding = twiceArea > 0.0 ? 1.0 : -1.0;
+    double minEdgeDistance = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < loop.size(); ++i) {
+        const XrVector2f& previous = loop[(i + loop.size() - 1u) % loop.size()];
+        const XrVector2f& a = loop[i];
+        const XrVector2f& b = loop[(i + 1u) % loop.size()];
+        const double previousEdgeX = static_cast<double>(a.x) - previous.x;
+        const double previousEdgeY = static_cast<double>(a.y) - previous.y;
+        const double edgeX = static_cast<double>(b.x) - a.x;
+        const double edgeY = static_cast<double>(b.y) - a.y;
+        const double edgeLength = std::hypot(edgeX, edgeY);
+        const double turn = winding *
+            (previousEdgeX * edgeY - previousEdgeY * edgeX);
+        const double originSide = winding *
+            (edgeX * -static_cast<double>(a.y) - edgeY * -static_cast<double>(a.x));
+        if (!std::isfinite(edgeLength) || edgeLength < 1.0e-5 ||
+            !std::isfinite(turn) || turn < -1.0e-5 ||
+            !std::isfinite(originSide) || originSide <= 1.0e-5) {
+            LOGW("[stereo.mask] eye=%u line unsafe edge=%zu turn=%.7f side=%.7f",
+                 eye, i, turn, originSide);
+            return false;
+        }
+        minEdgeDistance = std::min(minEdgeDistance, originSide / edgeLength);
+    }
+    if (!std::isfinite(minEdgeDistance) || minEdgeDistance < 0.05) {
+        LOGW("[stereo.mask] eye=%u line unsafe edge_distance=%.6f",
+             eye, minEdgeDistance);
+        return false;
+    }
+
+    // The runtime line loop is the exact visible-area boundary. A homothetic
+    // copy large enough to contain the complete NDC square lets us triangulate
+    // only the outside ring. Convex/origin-containing validation above makes
+    // this fail closed: malformed loops never write depth over visible pixels.
+    const double outerScale = std::max(1.05,
+        (std::sqrt(2.0) * 1.05) / minEdgeDistance);
+    if (!std::isfinite(outerScale) || outerScale > 64.0) {
+        LOGW("[stereo.mask] eye=%u line unsafe scale=%.4f", eye, outerScale);
+        return false;
+    }
+
+    out.verticesXY.reserve(loop.size() * 4u);
+    for (const XrVector2f& vertex : loop) {
+        out.verticesXY.push_back(vertex.x);
+        out.verticesXY.push_back(vertex.y);
+    }
+    for (const XrVector2f& vertex : loop) {
+        out.verticesXY.push_back(static_cast<float>(vertex.x * outerScale));
+        out.verticesXY.push_back(static_cast<float>(vertex.y * outerScale));
+    }
+    out.indices.reserve(loop.size() * 6u);
+    const auto count = static_cast<unsigned short>(loop.size());
+    for (unsigned short i = 0; i < count; ++i) {
+        const unsigned short next = static_cast<unsigned short>((i + 1u) % count);
+        const unsigned short outerI = static_cast<unsigned short>(count + i);
+        const unsigned short outerNext = static_cast<unsigned short>(count + next);
+        out.indices.push_back(i);
+        out.indices.push_back(outerI);
+        out.indices.push_back(outerNext);
+        out.indices.push_back(i);
+        out.indices.push_back(outerNext);
+        out.indices.push_back(next);
+    }
+    LOGI("[stereo.mask] eye=%u source=line-ring boundary=%zu vertices=%zu triangles=%zu scale=%.3f",
+         eye, loop.size(), out.verticesXY.size() / 2u,
+         out.indices.size() / 3u, outerScale);
+    return true;
+}
+
+void LoadHiddenAreaMasks() {
+    // Once published the vectors are immutable: the GameThread consumes their
+    // pointers without a mutex in the hot eye path. Session READY/FOCUSED may
+    // both request a load, but only the first successful one is allowed to
+    // mutate storage.
+    if (g_hiddenAreaMasksReady.load(std::memory_order_acquire)) return;
+    g_hiddenAreaMasksReady.store(false, std::memory_order_release);
+    for (auto& mask : g_hiddenAreaMasks) {
+        mask.verticesXY.clear();
+        mask.indices.clear();
+    }
+    if (!g_hasVisibilityMaskExt || !g_xrGetVisibilityMaskKHR ||
+        s.session == XR_NULL_HANDLE) {
+        LOGI("[stereo.mask] unavailable extension=%d entrypoint=%d session=%d",
+             g_hasVisibilityMaskExt ? 1 : 0,
+             g_xrGetVisibilityMaskKHR ? 1 : 0,
+             s.session != XR_NULL_HANDLE ? 1 : 0);
+        return;
+    }
+
+    for (uint32_t eye = 0; eye < g_hiddenAreaMasks.size(); ++eye) {
+        HiddenAreaMaskStorage& out = g_hiddenAreaMasks[eye];
+        if (!StoreHiddenTriangleMask(eye, out)) {
+            out.verticesXY.clear();
+            out.indices.clear();
+            if (!StoreHiddenRingFromLineLoop(eye, out)) {
+                out.verticesXY.clear();
+                out.indices.clear();
+                return;
+            }
+        }
+    }
+    g_hiddenAreaMasksReady.store(true, std::memory_order_release);
+}
 
 const char* XrName(XrResult r) {
     static char buffer[XR_MAX_RESULT_STRING_SIZE];
@@ -637,6 +2688,30 @@ bool Check(XrResult result, const char* what) {
         LOGE("%s failed: %s (failure %llu)", what, XrName(result), failures);
     }
     return false;
+}
+
+void PoisonSwapchain(Swapchain& chain, const char* name, const char* stage) {
+    if (!chain.poisoned) {
+        LOGE("[xr.swapchain] poisoned name=%s stage=%s; suppressing further use",
+             name, stage);
+    }
+    chain.poisoned = true;
+}
+
+bool WaitSwapchainImageReady(Swapchain& chain, const char* name,
+                             const char* what) {
+    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    for (;;) {
+        const XrResult result = xrWaitSwapchainImage(chain.handle, &wait);
+        if (XR_SUCCEEDED(result) && result != XR_TIMEOUT_EXPIRED) return true;
+        // XR_TIMEOUT_EXPIRED is a positive result, but the acquired image is not
+        // ready and must be waited again. Generic XR_SUCCEEDED checks are unsafe.
+        if (result == XR_TIMEOUT_EXPIRED) continue;
+        Check(result, what);
+        PoisonSwapchain(chain, name, "wait");
+        return false;
+    }
 }
 
 template <typename Fn>
@@ -849,6 +2924,7 @@ void QueryRuntimeDiagnostics() {
     };
     queryFrameTime(g_appCpuFrameTimePath, g_runtimeCpuMs, g_runtimeCpuValid);
     queryFrameTime(g_appGpuFrameTimePath, g_runtimeGpuMs, g_runtimeGpuValid);
+    g_runtimeMetricsSampleNs = MonotonicNowNs();
 }
 
 // The runtime binds to one specific EGL context, and the config has to be the
@@ -880,6 +2956,8 @@ void PollEvents() {
             s.sessionState = changed.state;
             g_sessionFocused.store(s.sessionState == XR_SESSION_STATE_FOCUSED,
                                    std::memory_order_release);
+            if (s.sessionState != XR_SESSION_STATE_FOCUSED)
+                ResetStereoPhaseFeedback();
             LOGI("session state -> %d", static_cast<int>(s.sessionState));
 
             if (s.sessionState == XR_SESSION_STATE_READY) {
@@ -888,6 +2966,10 @@ void PollEvents() {
                 if (Check(xrBeginSession(s.session, &begin), "xrBeginSession")) {
                     s.running = true;
                     LOGI("session running");
+                    // Meta advertises XR_KHR_visibility_mask at instance
+                    // creation, but returns an empty successful mesh before
+                    // xrBeginSession. Query only after the session is running.
+                    LoadHiddenAreaMasks();
                     g_displayRefreshRetryCount = 0;
                     RequestTargetDisplayRefresh("begin");
                     g_displayRefreshRetryCount = 1;
@@ -898,12 +2980,19 @@ void PollEvents() {
                     g_threadDirty.store(true, std::memory_order_relaxed);  // hints next frame
                 }
             } else if (s.sessionState == XR_SESSION_STATE_FOCUSED) {
+                // One bounded retry covers runtimes that populate the physical
+                // view mask only when the session becomes focused.
+                LoadHiddenAreaMasks();
                 // Some runtimes restore the headset's global refresh rate while
                 // transitioning into the running/focused state. Reassert once
                 // at focus so the session target cannot silently fall back.
                 RequestTargetDisplayRefresh("focused");
                 if (g_displayRefreshRetryCount < 2)
                     g_displayRefreshRetryCount = 2;
+                // Quest may restore global clock policy during the READY ->
+                // FOCUSED transition. Reassert the public BOOST defaults here,
+                // not only immediately after xrBeginSession.
+                g_perfDirty.store(true, std::memory_order_relaxed);
             } else if (s.sessionState == XR_SESSION_STATE_STOPPING) {
                 s.running = false;
                 g_runtimeCpuValid = false;
@@ -1038,6 +3127,7 @@ bool CreateSwapchains() {
         Swapchain& chain = s.swapchains[i];
         chain.width  = info.width;
         chain.height = info.height;
+        chain.poisoned = false;
         if (!Check(xrCreateSwapchain(s.session, &info, &chain.handle), "xrCreateSwapchain")) {
             return false;
         }
@@ -1074,6 +3164,7 @@ bool CreateSwapchains() {
 
         s.theater.width  = info.width;
         s.theater.height = info.height;
+        s.theater.poisoned = false;
         if (!Check(xrCreateSwapchain(s.session, &info, &s.theater.handle), "xrCreateSwapchain(theater)")) {
             return false;
         }
@@ -1102,6 +3193,7 @@ bool CreateSwapchains() {
         info.mipCount    = 1;
         s.debug.width  = info.width;
         s.debug.height = info.height;
+        s.debug.poisoned = false;
         if (!Check(xrCreateSwapchain(s.session, &info, &s.debug.handle), "xrCreateSwapchain(debug)")) {
             return false;
         }
@@ -1130,6 +3222,7 @@ bool CreateSwapchains() {
         info.arraySize   = 1;
         info.mipCount    = 1;
         s.hud.width=info.width; s.hud.height=info.height;
+        s.hud.poisoned=false;
         if (!Check(xrCreateSwapchain(s.session,&info,&s.hud.handle),
                    "xrCreateSwapchain(hud)")) return false;
         uint32_t imageCount=0;
@@ -1180,6 +3273,136 @@ void main() {
 )";
 
 constexpr char kFxaaProperty[] = "debug.savr.fxaa";
+constexpr char kEyeFoveationProperty[] = "debug.savr.eye_foveation";
+
+using TextureFoveationParametersQcomFn = void(GL_APIENTRYP)(
+    GLuint texture, GLuint layer, GLuint focalPoint, GLfloat focalX,
+    GLfloat focalY, GLfloat gainX, GLfloat gainY, GLfloat foveaArea);
+
+bool EyeFoveationRequested() {
+    // Process-start A/B: QCOM texture foveation cannot be disabled after it has
+    // been enabled on a texture object. Changing the property therefore takes
+    // effect on the next process launch / eye-raster generation, never halfway
+    // through a frame.
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        // Runtime A/B on Quest showed no useful GPU reduction and materially
+        // higher RenderQueue blocking. Keep the driver path available for an
+        // explicit experiment, but never enable it implicitly for players.
+        bool enabled = false;
+        if (__system_property_get(kEyeFoveationProperty, text) > 0) {
+            if (std::strcmp(text, "1") == 0) enabled = true;
+            else if (std::strcmp(text, "0") != 0)
+                LOGW("[gpu.foveation] ignoring invalid %s=%s (valid 0 or 1)",
+                     kEyeFoveationProperty, text);
+        }
+        LOGI("[gpu.foveation] requested=%d property=%s restart_required=1",
+             enabled ? 1 : 0, kEyeFoveationProperty);
+        return enabled;
+    }();
+    return requested;
+}
+
+struct EyeFoveationApi {
+    TextureFoveationParametersQcomFn parameters{};
+    bool extensionAvailable{};
+
+    bool Available() const { return extensionAvailable && parameters; }
+};
+
+const EyeFoveationApi& GetEyeFoveationApi() {
+    // XR-thread-only initialization. The GLES objects are shared with the
+    // RenderQueue context, but extension entry points belong to this process.
+    static const EyeFoveationApi api = [] {
+        EyeFoveationApi loaded{};
+        const char* extensions = reinterpret_cast<const char*>(
+            glGetString(GL_EXTENSIONS));
+        loaded.extensionAvailable = extensions &&
+            std::strstr(extensions, "GL_QCOM_texture_foveated") != nullptr;
+        loaded.parameters = reinterpret_cast<TextureFoveationParametersQcomFn>(
+            eglGetProcAddress("glTextureFoveationParametersQCOM"));
+        return loaded;
+    }();
+    return api;
+}
+
+void ConfigureRenderWareEyeFoveation(int set, int eye, GLuint texture) {
+    if (!EyeFoveationRequested() || texture == 0 || set < 0 ||
+        set >= kStereoSets || eye < 0 || eye > 1) {
+        return;
+    }
+
+    // The read lease held by RenderStereoEyeProjection excludes the producer
+    // from this ring row. Once the persistent texture state is installed, every
+    // later RenderWare pass into this eye gets hardware lens-matched foveation;
+    // the final OpenXR blit is not the optimization target.
+    unsigned int attempted =
+        g_eyeFoveationAttemptedTex[set][eye].load(std::memory_order_acquire);
+    if (attempted == texture) return;
+    g_eyeFoveationAttemptedTex[set][eye].store(texture,
+                                               std::memory_order_release);
+
+    const EyeFoveationApi& api = GetEyeFoveationApi();
+    if (!api.Available()) {
+        static bool loggedUnavailable = false;
+        if (!loggedUnavailable) {
+            loggedUnavailable = true;
+            LOGW("[gpu.foveation] unavailable extension=%d entrypoint=%d",
+                 api.extensionAvailable ? 1 : 0, api.parameters ? 1 : 0);
+        }
+        return;
+    }
+
+    GLint previousActiveTexture = GL_TEXTURE0;
+    GLint previousTexture0 = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+
+    GLint supportedBits = 0;
+    glGetTexParameteriv(GL_TEXTURE_2D,
+                        GL_TEXTURE_FOVEATED_FEATURE_QUERY_QCOM,
+                        &supportedBits);
+    constexpr GLint kRequiredBits = GL_FOVEATION_ENABLE_BIT_QCOM |
+                                    GL_FOVEATION_SCALED_BIN_METHOD_BIT_QCOM;
+    if ((supportedBits & kRequiredBits) == kRequiredBits) {
+        // Conservative first A/B: a large full-quality centre and no region
+        // below 70% linear pixel density. Qualcomm's own weak example uses the
+        // same gain/fovea shape; our higher density floor protects lens edges.
+        constexpr GLfloat kMinimumPixelDensity = 0.70f;
+        constexpr GLfloat kGain = 4.0f;
+        constexpr GLfloat kFoveaArea = 2.0f;
+        glTexParameteri(GL_TEXTURE_2D,
+                        GL_TEXTURE_FOVEATED_FEATURE_BITS_QCOM,
+                        kRequiredBits);
+        glTexParameterf(GL_TEXTURE_2D,
+                        GL_TEXTURE_FOVEATED_MIN_PIXEL_DENSITY_QCOM,
+                        kMinimumPixelDensity);
+        api.parameters(texture, 0, 0, 0.0f, 0.0f,
+                       kGain, kGain, kFoveaArea);
+
+        GLint activeBits = 0;
+        glGetTexParameteriv(GL_TEXTURE_2D,
+                            GL_TEXTURE_FOVEATED_FEATURE_BITS_QCOM,
+                            &activeBits);
+        glFlush();
+        LOGI("[gpu.foveation] set=%d eye=%d tex=%u supported=0x%x "
+             "active=0x%x density=%.2f gain=%.1f area=%.1f",
+             set, eye, texture, supportedBits, activeBits,
+             kMinimumPixelDensity, kGain, kFoveaArea);
+    } else {
+        static bool loggedUnsupportedMethod = false;
+        if (!loggedUnsupportedMethod) {
+            loggedUnsupportedMethod = true;
+            LOGW("[gpu.foveation] scaled-bin unsupported bits=0x%x",
+                 supportedBits);
+        }
+    }
+
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture0));
+    glActiveTexture(static_cast<GLenum>(previousActiveTexture));
+}
 
 // The Quest Vice City port's stable single-frame FXAA, translated to GLES.
 // Low-contrast pixels stop after five samples; edge pixels use nine. Sampling
@@ -1865,6 +4088,10 @@ bool DrawHudComposite(GLuint sourceTexture,int targetWidth,int targetHeight,
     }
     std::u16string bigText=textState.big;
     std::u16string timerText=textState.timers;
+    if (!textState.radio.empty()) {
+        if (!timerText.empty()) timerText.append(u"\n");
+        timerText.append(textState.radio);
+    }
     // While the HUD menu is open, live mission text is usually absent, which
     // made the text layers impossible to place. Substitute sample strings
     // so their boxes are always visible during calibration; the revision
@@ -2354,11 +4581,28 @@ void BlitGameFrame() {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-// Draw the game frame into the theater swapchain and describe it as a quad. All
-// GL state the blit touches is saved and restored, because this runs on the same
-// context the compositor and (indirectly) the engine share.
-bool RenderTheaterQuad(XrSpace space, XrCompositionLayerQuad& quad, bool fillView = false) {
-    if (!BuildBlitProgram()) {
+enum class TheaterFrameSource {
+    GameSurface,
+    Black,
+};
+
+// Logical source dimensions (see SetTheaterCrop). The flat game SurfaceTexture
+// is landscape while the theater swapchain may be eye-shaped; these values set
+// only the quad aspect. No source pixels are cropped.
+std::atomic<int> g_theaterCropW{0};
+std::atomic<int> g_theaterCropH{0};
+
+// Draw a trusted flat game frame (menus/cutscenes) or an explicit neutral black
+// fallback into the theater swapchain.  Gameplay must never source this quad
+// from one stereo eye: that old path bypassed the ring generation/age checks and
+// made a left-eye image flash head-locked whenever projection setup failed.
+bool RenderTheaterQuad(XrSpace space, XrCompositionLayerQuad& quad,
+                       bool fillView = false,
+                       TheaterFrameSource source = TheaterFrameSource::GameSurface) {
+    if (s.theater.handle == XR_NULL_HANDLE || s.theater.poisoned) {
+        return false;
+    }
+    if (source == TheaterFrameSource::GameSurface && !BuildBlitProgram()) {
         return false;
     }
 
@@ -2368,12 +4612,8 @@ bool RenderTheaterQuad(XrSpace space, XrCompositionLayerQuad& quad, bool fillVie
                "xrAcquireSwapchainImage(theater)")) {
         return false;
     }
-    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wait.timeout = XR_INFINITE_DURATION;
-    if (!Check(xrWaitSwapchainImage(s.theater.handle, &wait), "xrWaitSwapchainImage(theater)")) {
-        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        Check(xrReleaseSwapchainImage(s.theater.handle, &release),
-              "xrReleaseSwapchainImage(theater wait-fail)");
+    if (!WaitSwapchainImageReady(s.theater, "theater",
+                                 "xrWaitSwapchainImage(theater)")) {
         return false;
     }
 
@@ -2397,31 +4637,7 @@ bool RenderTheaterQuad(XrSpace space, XrCompositionLayerQuad& quad, bool fillVie
                            s.theater.images[imageIndex].image, 0);
     glViewport(0, 0, s.theater.width, s.theater.height);
 
-    int fvSeq = -1;
-    const int fvSet = fillView ? StereoReadSet(fvSeq) : -1;
-    const GLuint eyeTex = fvSet >= 0 ? g_stereoEyeTex[fvSet][0].load(std::memory_order_relaxed) : 0;
-    if (eyeTex != 0) {
-        // Stereo Step 1: the game rendered the world into this offscreen texture
-        // (on the shared context). Copy it onto the screen. Flip Y — the engine's
-        // FBO is GL bottom-up while the swapchain wants top-down.
-        const int ew = g_stereoEyeW.load(std::memory_order_relaxed);
-        const int eh = g_stereoEyeH.load(std::memory_order_relaxed);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, s.eyeReadFramebuffer);
-        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, eyeTex, 0);
-        static bool eyeDiag = false;
-        if (!eyeDiag) {
-            const GLenum st = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
-            const GLboolean isTex = glIsTexture(eyeTex);
-            LOGI("[stereo] consumer eye blit: tex=%u isTexture=%d readFBstatus=0x%x glErr=0x%x %dx%d",
-                 eyeTex, isTex, st, glGetError(), ew, eh);
-            eyeDiag = true;
-        }
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s.framebuffer);
-        glBlitFramebuffer(0, 0, ew, eh, 0, 0, s.theater.width, s.theater.height,
-                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
-        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-        glBindFramebuffer(GL_FRAMEBUFFER, s.framebuffer);
-    } else if (s.gameTexture != 0) {
+    if (source == TheaterFrameSource::GameSurface && s.gameTexture != 0) {
         BlitGameFrame();
     } else {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -2437,11 +4653,19 @@ bool RenderTheaterQuad(XrSpace space, XrCompositionLayerQuad& quad, bool fillVie
     // pre-rasterised desktop-arrow sprite, tip exactly on the laser hit point.
     // pointerV is measured from the top, the framebuffer from the bottom,
     // hence the Y flip.
-    if (s.input.pointerValid && BuildCursorResources()) {
+    const int cropWi = g_theaterCropW.load(std::memory_order_relaxed);
+    const int cropHi = g_theaterCropH.load(std::memory_order_relaxed);
+    const bool cropped = cropWi > 0 && cropHi > 0;
+    const int cropOffY = 0;
+    if (source == TheaterFrameSource::GameSurface &&
+        s.input.pointerValid && BuildCursorResources()) {
         const float cw = static_cast<float>(s.theater.width);
         const float ch = static_cast<float>(s.theater.height);
         const float px = s.input.pointerU * cw;
-        const float py = (1.0f - s.input.pointerV) * ch;
+        const float py = static_cast<float>(cropOffY) +
+                         (1.0f - s.input.pointerV) * ch;
+        const float fw = static_cast<float>(s.theater.width);
+        const float fh = static_cast<float>(s.theater.height);
         const float hpx = std::max(64.0f, cw / 20.0f);  // arrow height, px
         const float wpx = hpx * (static_cast<float>(kCursorTexW) / kCursorTexH);
         glUseProgram(g_cursorProgram);
@@ -2451,10 +4675,10 @@ bool RenderTheaterQuad(XrSpace space, XrCompositionLayerQuad& quad, bool fillVie
         glUniform1i(g_cursorTexUniform, 0);
         // Quad rect in NDC: tip at the top-left corner, body down-right.
         glUniform4f(g_cursorRectUniform,
-                    px / cw * 2.0f - 1.0f,
-                    (py - hpx) / ch * 2.0f - 1.0f,
-                    wpx / cw * 2.0f,
-                    hpx / ch * 2.0f);
+                    px / fw * 2.0f - 1.0f,
+                    (py - hpx) / fh * 2.0f - 1.0f,
+                    wpx / fw * 2.0f,
+                    hpx / fh * 2.0f);
         GLint prevSrcRgb = 0, prevDstRgb = 0, prevSrcA = 0, prevDstA = 0;
         glGetIntegerv(GL_BLEND_SRC_RGB, &prevSrcRgb);
         glGetIntegerv(GL_BLEND_DST_RGB, &prevDstRgb);
@@ -2488,14 +4712,20 @@ bool RenderTheaterQuad(XrSpace space, XrCompositionLayerQuad& quad, bool fillVie
     }
 
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    Check(xrReleaseSwapchainImage(s.theater.handle, &release), "xrReleaseSwapchainImage(theater)");
+    if (!Check(xrReleaseSwapchainImage(s.theater.handle, &release),
+               "xrReleaseSwapchainImage(theater)")) {
+        PoisonSwapchain(s.theater, "theater", "release");
+        return false;
+    }
 
     // Menu: a world-locked cinema screen (comfortable, distant). In-world: a
     // head-locked screen brought close and wide so it fills the view like a proper
     // VR image while staying rigid to the head (no rotation tremble).
     const float kDistanceMeters = fillView ? 1.4f : 2.2f;
     const float kWidthMeters    = fillView ? 3.2f : 3.2f;
-    const float aspect = static_cast<float>(s.theater.width) / static_cast<float>(s.theater.height);
+    const float aspect = cropped
+        ? static_cast<float>(cropWi)/static_cast<float>(cropHi)
+        : static_cast<float>(s.theater.width)/static_cast<float>(s.theater.height);
 
     quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     quad.layerFlags   = 0;
@@ -2553,8 +4783,10 @@ bool CreateInput() {
         !CreateAction(s.yAction,       XR_ACTION_TYPE_BOOLEAN_INPUT,  "y",       false) ||
         !CreateAction(s.menuAction,    XR_ACTION_TYPE_BOOLEAN_INPUT,  "menu",    false) ||
         !CreateAction(s.stickClickAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "stickclick", true) ||
+        !CreateAction(s.thumbrestAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "thumbrest", true) ||
         !CreateAction(s.aimAction,     XR_ACTION_TYPE_POSE_INPUT,     "aim",     true)  ||
-        !CreateAction(s.gripPoseAction,XR_ACTION_TYPE_POSE_INPUT,     "grippose", true)) {
+        !CreateAction(s.gripPoseAction,XR_ACTION_TYPE_POSE_INPUT,     "grippose", true) ||
+        !CreateAction(s.hapticAction,  XR_ACTION_TYPE_VIBRATION_OUTPUT, "haptic", true)) {
         return false;
     }
 
@@ -2573,10 +4805,14 @@ bool CreateInput() {
         {s.menuAction,    "/user/hand/left/input/menu/click"},
         {s.stickClickAction, "/user/hand/left/input/thumbstick/click"},
         {s.stickClickAction, "/user/hand/right/input/thumbstick/click"},
+        {s.thumbrestAction,  "/user/hand/left/input/thumbrest/touch"},
+        {s.thumbrestAction,  "/user/hand/right/input/thumbrest/touch"},
         {s.aimAction,     "/user/hand/right/input/aim/pose"},
         {s.aimAction,     "/user/hand/left/input/aim/pose"},
         {s.gripPoseAction,"/user/hand/left/input/grip/pose"},
         {s.gripPoseAction,"/user/hand/right/input/grip/pose"},
+        {s.hapticAction,  "/user/hand/left/output/haptic"},
+        {s.hapticAction,  "/user/hand/right/output/haptic"},
     };
     std::vector<XrActionSuggestedBinding> suggested;
     for (const Bind& b : binds) {
@@ -2727,6 +4963,8 @@ void SyncInput(XrTime displayTime) {
     in.menu = ReadBool(s.menuAction);
     in.l3   = ReadBool(s.stickClickAction, s.handPaths[0]);
     in.r3   = ReadBool(s.stickClickAction, s.handPaths[1]);
+    in.thumbrest[0] = ReadBool(s.thumbrestAction, s.handPaths[0]);
+    in.thumbrest[1] = ReadBool(s.thumbrestAction, s.handPaths[1]);
     UpdatePointer(in, displayTime);
     s.input = in;
 }
@@ -2735,6 +4973,23 @@ void SyncInput(XrTime displayTime) {
 
 void GetInput(InputState& out) {
     out = s.input;
+}
+
+void TriggerHaptic(int hand, float amplitude, float frequencyHz,
+                   float durationMs) {
+    if (s.session == XR_NULL_HANDLE || s.hapticAction == XR_NULL_HANDLE ||
+        hand < 0 || hand > 1)
+        return;
+    XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+    vibration.amplitude = std::clamp(amplitude, 0.0f, 1.0f);
+    vibration.frequency = frequencyHz;
+    vibration.duration = static_cast<XrDuration>(durationMs * 1.0e6f);
+    XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
+    info.action = s.hapticAction;
+    info.subactionPath = s.handPaths[hand];
+    xrApplyHapticFeedback(
+        s.session, &info,
+        reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
 }
 
 void PublishHudText(const std::int16_t* brief, int briefCapacity,
@@ -2797,6 +5052,19 @@ void PublishMissionTimersText(const char* text) {
          g_hudTextState.timers.size());
 }
 
+void PublishRadioText(const char* text) {
+    std::u16string next;
+    if (text) {
+        for (const char* c = text; *c != '\0' && next.size() < 64; ++c)
+            next.push_back(static_cast<char16_t>(
+                static_cast<unsigned char>(*c)));
+    }
+    std::lock_guard<std::mutex> lock(g_hudTextMutex);
+    if (g_hudTextState.radio == next) return;
+    g_hudTextState.radio = std::move(next);
+    ++g_hudTextState.revision;
+}
+
 void GetHandPoses(HandPose out[2]) {
     std::lock_guard<std::mutex> lock(g_headPoseMutex);
     out[0] = g_handPose[0];
@@ -2840,9 +5108,30 @@ bool GetEyePoses(float positionOut[2][3], float orientationOut[2][4]) {
     return true;
 }
 
+bool GetHiddenAreaMask(int eye, HiddenAreaMaskView& out) {
+    out = {};
+    if (eye < 0 || eye >= static_cast<int>(g_hiddenAreaMasks.size()) ||
+        !g_hiddenAreaMasksReady.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const HiddenAreaMaskStorage& mask =
+        g_hiddenAreaMasks[static_cast<std::size_t>(eye)];
+    if (mask.verticesXY.empty() || mask.indices.empty() ||
+        (mask.verticesXY.size() % 2u) != 0u) {
+        return false;
+    }
+    out.verticesXY = mask.verticesXY.data();
+    out.indices = mask.indices.data();
+    out.vertexCount = static_cast<int>(mask.verticesXY.size() / 2u);
+    out.indexCount = static_cast<int>(mask.indices.size());
+    return true;
+}
+
 // --- stereo eye-texture bridge: producer half (GameThread) -------------------
 
-void SetStereoContextShared(bool shared) { g_stereoShared = shared; }
+void SetStereoContextShared(bool shared) {
+    g_stereoShared.store(shared, std::memory_order_release);
+}
 
 void SetStereoRenderFov(float tanX, float tanY) {
     g_stereoTanX.store(tanX, std::memory_order_relaxed);
@@ -2883,6 +5172,64 @@ void SetGameThreadTid(unsigned int tid) {
     g_threadDirty.store(true, std::memory_order_relaxed);
 }
 
+std::uint64_t ConsumeStereoPacerAdvanceNs(std::uint64_t maxNs) {
+    if (maxNs == 0 ||
+        !g_sessionFocused.load(std::memory_order_acquire)) return 0;
+
+    std::uint64_t pending =
+        g_stereoPacerAdvancePendingNs.load(std::memory_order_acquire);
+    while (pending != 0) {
+        if (pending == kStereoPacerAdvanceClaimingNs ||
+            pending == kStereoPacerAdvancePublishingNs) return 0;
+        const std::uint64_t consumed = std::min(pending, maxNs);
+        if (g_stereoPacerAdvancePendingNs.compare_exchange_weak(
+                pending, kStereoPacerAdvanceClaimingNs,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            // Metadata is immutable while the claiming sentinel owns the latch.
+            // Recheck after the CAS so a concurrent reset, focus loss, phase
+            // break or expiry can retract the request before it affects pacing.
+            const std::uint64_t requestEpoch =
+                g_stereoPacerAdvanceEpoch.load(std::memory_order_relaxed);
+            const std::uint64_t requestCalibrationGeneration =
+                g_stereoPacerAdvanceCalibrationGeneration.load(
+                    std::memory_order_relaxed);
+            const std::uint64_t expiryNs =
+                g_stereoPacerAdvanceExpiryNs.load(std::memory_order_relaxed);
+            const bool stillValid =
+                g_sessionFocused.load(std::memory_order_acquire) &&
+                requestEpoch ==
+                    g_stereoPhaseEpoch.load(std::memory_order_acquire) &&
+                requestCalibrationGeneration ==
+                    g_stereoPhaseCalibrationGeneration.load(
+                        std::memory_order_acquire) &&
+                MonotonicNowNs() <= expiryNs;
+            std::uint64_t claiming = kStereoPacerAdvanceClaimingNs;
+            if (!g_stereoPacerAdvancePendingNs.compare_exchange_strong(
+                    claiming, 0, std::memory_order_release,
+                    std::memory_order_relaxed)) {
+                return 0;
+            }
+            const bool validAtRelease =
+                g_sessionFocused.load(std::memory_order_acquire) &&
+                requestEpoch ==
+                    g_stereoPhaseEpoch.load(std::memory_order_acquire) &&
+                requestCalibrationGeneration ==
+                    g_stereoPhaseCalibrationGeneration.load(
+                        std::memory_order_acquire) &&
+                MonotonicNowNs() <= expiryNs;
+            return stillValid && validAtRelease ? consumed : 0;
+        }
+    }
+    return 0;
+}
+
+void ReportStereoPacerAdvanceApplied(std::uint64_t appliedNs) {
+    if (appliedNs == 0) return;
+    g_stereoPhaseKickAppliedCount.fetch_add(1, std::memory_order_relaxed);
+    g_stereoPhaseKickAppliedNs.fetch_add(appliedNs, std::memory_order_relaxed);
+}
+
 void SetCalibPage(bool active, int selection, int hand, int weaponType) {
     g_calibActive.store(active, std::memory_order_relaxed);
     g_calibSel.store(selection, std::memory_order_relaxed);
@@ -2920,6 +5267,16 @@ void SetDrivingCalibrationMenu(bool active, int selection, int hand) {
 void SetLocomotionMenu(bool active, int selection) {
     g_locomotionActive.store(active,std::memory_order_relaxed);
     g_locomotionSel.store(selection,std::memory_order_relaxed);
+}
+
+void SetVehicleCameraMenu(bool active, int selection) {
+    g_vehicleCameraActive.store(active, std::memory_order_relaxed);
+    g_vehicleCameraSel.store(selection, std::memory_order_relaxed);
+}
+
+void SetBasketballMenu(bool active, int selection) {
+    g_basketballActive.store(active, std::memory_order_relaxed);
+    g_basketballSel.store(selection, std::memory_order_relaxed);
 }
 
 void SetHudMenu(bool active, int selection, int page) {
@@ -2986,29 +5343,75 @@ void SetGraphicsDistanceMenu(bool active, int selection) {
 }
 
 void ResetStereoEyeTextures() {
-    // Sequence is the publication fence. Clear dimensions as well so a consumer
-    // already entering RenderStereoEyeProjection takes its normal theater
-    // fallback while the new RenderWare ring receives its first complete pair.
-    g_stereoEyeW.store(0, std::memory_order_relaxed);
-    g_stereoEyeH.store(0, std::memory_order_relaxed);
-    for (auto& generation : g_stereoGeneration)
-        generation.store(-1, std::memory_order_relaxed);
-    for (auto& publishedNs : g_stereoPublishedNs)
-        publishedNs.store(0, std::memory_order_relaxed);
-    for (auto& texture : g_stereoHudTex)
-        texture.store(0, std::memory_order_relaxed);
-    for (auto& value : g_stereoUnderWaterness)
-        value.store(0.0f, std::memory_order_relaxed);
-    for (auto& value : g_stereoWaterDepth)
-        value.store(0.0f, std::memory_order_relaxed);
+    // Close the publication epoch first.  A consumer which already acquired a
+    // slot may finish using its immutable snapshot; no new consumer can enter.
+    // Clear only slots we can claim exclusively, otherwise leave their metadata
+    // intact until the reader releases and the next writer replaces that row.
+    g_stereoSeq.store(-1, std::memory_order_release);
+#if defined(SAVR_EXPERIMENTAL_BACKPRESSURE)
+    if (StereoBackpressureRequested()) {
+        g_stereoBackpressure.lastSubmittedSequence.store(
+            -1, std::memory_order_relaxed);
+        g_stereoBackpressure.lastSubmittedNs.store(
+            0, std::memory_order_release);
+    }
+#endif
+    g_stereoResetEpoch.fetch_add(1, std::memory_order_acq_rel);
+    ResetStereoPhaseFeedback();
+    g_stereoEpochPublishedMask.store(0, std::memory_order_release);
+    bool clearMobileColor[kStereoSets]{};
+    for (int set = 0; set < kStereoSets; ++set) {
+        int idle = 0;
+        if (!g_stereoSlotUsers[set].compare_exchange_strong(
+                idle, -1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            continue;
+        }
+        g_stereoEyeW[set].store(0, std::memory_order_relaxed);
+        g_stereoEyeH[set].store(0, std::memory_order_relaxed);
+        g_stereoGeneration[set].store(-1, std::memory_order_relaxed);
+        g_stereoPublishedNs[set].store(0, std::memory_order_relaxed);
+        g_eyeFoveationAttemptedTex[set][0].store(
+            0, std::memory_order_relaxed);
+        g_eyeFoveationAttemptedTex[set][1].store(
+            0, std::memory_order_relaxed);
+        g_stereoHudTex[set].store(0, std::memory_order_relaxed);
+        g_stereoUnderWaterness[set].store(0.0f, std::memory_order_relaxed);
+        g_stereoWaterDepth[set].store(0.0f, std::memory_order_relaxed);
+        clearMobileColor[set] = true;
+        g_stereoSlotUsers[set].store(0, std::memory_order_release);
+    }
     g_pendingUnderWaterness.store(0.0f, std::memory_order_relaxed);
     g_pendingWaterDepth.store(0.0f, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(g_headPoseMutex);
         g_pendingMobileColor = {};
-        for (auto& colour : g_stereoMobileColor) colour = {};
+        for (int set = 0; set < kStereoSets; ++set)
+            if (clearMobileColor[set]) g_stereoMobileColor[set] = {};
     }
-    g_stereoSeq.store(-1, std::memory_order_release);
+}
+
+void DrainStereoEyeReads() {
+    std::lock_guard<std::mutex> lock(g_pendingStereoReadFenceMutex);
+    bool pending = false;
+    for (const auto& read : g_pendingStereoReadFences) {
+        if (read.sync != EGL_NO_SYNC_KHR || read.glSync) {
+            pending = true;
+            break;
+        }
+    }
+    if (pending) FinishAndReleasePendingStereoReadsLocked();
+}
+
+bool StereoEyeRetiredRingCanBeDestroyed() {
+    constexpr unsigned int kCompleteMask = (1u << kStereoSets) - 1u;
+    // A row cannot be republished until its 0 -> -1 writer claim succeeds, and
+    // that cannot happen while an old CPU lease or deferred GPU-fence lease owns
+    // the slot. Once all three bits are set, every old-ring read has therefore
+    // completed and old GL names are unreachable. New-ring readers need not go
+    // idle before the unrelated retired objects are destroyed.
+    return g_stereoEpochPublishedMask.load(std::memory_order_acquire) ==
+        kCompleteMask;
 }
 
 void SetUnderwaterState(float underWaterness, float waterDepth) {
@@ -3087,7 +5490,8 @@ void SetHolsterMarkers(const float positions[][3], int count) {
     }
 }
 
-void SetParachuteToggles(const float positions[2][3], const bool grabbed[2],
+void SetParachuteToggles(const float positions[2][3],
+                         const float anchors[2][3], const bool grabbed[2],
                          bool visible) {
     std::lock_guard<std::mutex> lock(g_headPoseMutex);
     g_chuteTogglesVisible = visible;
@@ -3098,7 +5502,25 @@ void SetParachuteToggles(const float positions[2][3], const bool grabbed[2],
             g_chuteTogglePos[i][1] = positions[i][1];
             g_chuteTogglePos[i][2] = positions[i][2];
         }
+        if (anchors != nullptr) {
+            g_chuteAnchorPos[i][0] = anchors[i][0];
+            g_chuteAnchorPos[i][1] = anchors[i][1];
+            g_chuteAnchorPos[i][2] = anchors[i][2];
+        }
     }
+}
+
+void SetParachuteDeployRing(const float position[3], const float anchor[3],
+                            const float forward[3], bool grabbed, bool visible) {
+    std::lock_guard<std::mutex> lock(g_headPoseMutex);
+    g_chuteRingVisible = visible;
+    g_chuteRingGrabbed = grabbed;
+    if (position != nullptr) std::memcpy(g_chuteRingPos, position,
+                                         sizeof(g_chuteRingPos));
+    if (anchor != nullptr) std::memcpy(g_chuteRingAnchor, anchor,
+                                       sizeof(g_chuteRingAnchor));
+    if (forward != nullptr) std::memcpy(g_chuteRingForward, forward,
+                                        sizeof(g_chuteRingForward));
 }
 
 void SetRenderedHandPoses(const HandPose poses[2]) {
@@ -3110,6 +5532,11 @@ void SetRenderedHandPoses(const HandPose poses[2]) {
     g_renderedHandPose[0] = poses[0];
     g_renderedHandPose[1] = poses[1];
     g_renderedHandPoseValid = true;
+}
+
+void SetBallHandLock(const BallHandLock& lock) {
+    std::lock_guard<std::mutex> guard(g_headPoseMutex);
+    g_ballHandLock = lock;
 }
 
 void SetTwoHandVisualState(const TwoHandVisualState& state) {
@@ -3195,7 +5622,20 @@ void AddBulletTracer(const float start[3], const float end[3], int weaponType) {
     tracer.end = streakEnd;
     tracer.weaponType = weaponType;
     tracer.bornNs = now;
-    tracer.expiresNs = now + kBulletTracerLifetimeNs;
+    // Vice City class tuning, mapped onto SA weapon ids: shotguns get the
+    // short fat puff, rifles/minigun the long streak, everything else the
+    // default pistol trace.
+    float thickness = 0.4f, visibility = 150.0f, lifetimeMs = 750.0f;
+    if (weaponType == 25 || weaponType == 26 || weaponType == 27) {
+        thickness = 0.7f; visibility = 200.0f; lifetimeMs = 1000.0f;
+    } else if (weaponType == 30 || weaponType == 31 || weaponType == 33 ||
+               weaponType == 34 || weaponType == 38) {
+        thickness = 1.0f; visibility = 220.0f; lifetimeMs = 2000.0f;
+    }
+    tracer.maxThickness = thickness;
+    tracer.visibility = visibility / 255.0f;
+    tracer.expiresNs = now +
+        static_cast<std::uint64_t>(lifetimeMs * 1.0e6);
 }
 
 void UpdateObjectiveMarker(std::uint64_t id, const float center[3],
@@ -3264,6 +5704,232 @@ void SetThrowableTrajectory(int hand, const float points[][3], int count,
     g_throwableTrajectory[hand] = next;
 }
 
+bool TryBeginStereoEyeWrite(int seq) {
+    if (seq < 0) return false;
+    const int ws = ((seq % kStereoSets) + kStereoSets) % kStereoSets;
+    int idle = 0;
+    if (!g_stereoSlotUsers[ws].compare_exchange_strong(
+            idle, -1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        // A negative owner is another writer/reset path, never an XR read that
+        // a fence poll could retire. Positive users may be completed XR GPU
+        // leases whose paced owner has not yet performed its next poll.
+        if (idle < 0 || !TryRetireCompletedStereoReadsForProducer(ws)) {
+            g_stereoWriteClaimBusyDrops.fetch_add(1,
+                                                  std::memory_order_relaxed);
+            return false;
+        }
+        idle = 0;
+        if (!g_stereoSlotUsers[ws].compare_exchange_strong(
+                idle, -1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            // The normal poll deliberately never waits. Only a still-positive
+            // GPU lease gets one sub-millisecond bounded retry; a writer, CPU
+            // reader or GLsync fallback remains fail-closed.
+            if (idle < 0 || !TryWaitCompletedStereoReadsForProducer(ws)) {
+                g_stereoWriteClaimBusyDrops.fetch_add(
+                    1, std::memory_order_relaxed);
+                return false;
+            }
+            idle = 0;
+            if (!g_stereoSlotUsers[ws].compare_exchange_strong(
+                    idle, -1, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                g_stereoWriteClaimBusyDrops.fetch_add(
+                    1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        g_stereoWriteClaimRescues.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Invalidate before the first RenderWare command can target this slot. The
+    // old implementation did this only after both eyes had already been
+    // recorded, which let XR begin copying the old generation during overwrite.
+    g_stereoGeneration[ws].store(-1, std::memory_order_release);
+    g_stereoPublishedNs[ws].store(0, std::memory_order_relaxed);
+    return true;
+}
+
+void SetBasketballCalibMenu(bool active, int selection) {
+    g_basketballCalibActive.store(active, std::memory_order_relaxed);
+    g_basketballCalibSel.store(selection, std::memory_order_relaxed);
+}
+
+#if defined(SAVR_EXPERIMENTAL_BACKPRESSURE)
+bool ShouldThrottleStereoProducer(int nextSequence) {
+    if (nextSequence < 0 || !StereoBackpressureRequested() ||
+        !g_sessionFocused.load(std::memory_order_acquire) ||
+        !g_directStereoProjectionHealthy.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    const int submitted =
+        g_stereoBackpressure.lastSubmittedSequence.load(
+            std::memory_order_relaxed);
+    const std::uint64_t submittedNs =
+        g_stereoBackpressure.lastSubmittedNs.load(
+            std::memory_order_acquire);
+    const std::uint64_t nowNs = MonotonicNowNs();
+    if (submitted < 0 || submittedNs == 0 || nowNs < submittedNs ||
+        nowNs - submittedNs > 100000000ULL ||
+        nextSequence - submitted <= kStereoReadLag + 1) {
+        return false;
+    }
+
+    const std::uint64_t count =
+        g_stereoBackpressure.throttleCount.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    if (count <= 4 || (count & (count - 1)) == 0) {
+        LOGI("[stereo.backpressure] throttle=%llu next/submitted/lead=%d/%d/%d age_ms=%.3f",
+             static_cast<unsigned long long>(count), nextSequence, submitted,
+             nextSequence - submitted,
+             static_cast<double>(nowNs - submittedNs) / 1000000.0);
+    }
+    return true;
+}
+#endif
+
+void CancelStereoEyeWrite(int seq) {
+    if (seq < 0) return;
+    const int ws = ((seq % kStereoSets) + kStereoSets) % kStereoSets;
+    // TryBeginStereoEyeWrite already invalidated the slot before any draw was
+    // recorded.  Do not touch its generation here: a stale/double cancel after
+    // publication must never invalidate a reader or somebody else's frame.
+    int writing = -1;
+    g_stereoSlotUsers[ws].compare_exchange_strong(
+        writing, 0, std::memory_order_release, std::memory_order_relaxed);
+}
+
+bool TryPublishStereoProducerFenceFromRenderQueue() {
+    g_stereoProducerFenceAttempts.fetch_add(1, std::memory_order_relaxed);
+    if (!StereoProducerFenceRequested() ||
+        g_stereoProducerSyncPoisoned.load(std::memory_order_acquire) ||
+        !g_directStereoProjectionHealthy.load(std::memory_order_acquire) ||
+        !g_stereoShared.load(std::memory_order_acquire) ||
+        eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        return false;
+    }
+
+    const int generation = g_stereoSeq.load(std::memory_order_acquire);
+    if (generation < 0) return false;
+    const int set = ((generation % kStereoSets) + kStereoSets) % kStereoSets;
+
+    std::lock_guard<std::mutex> lock(g_stereoProducerSyncMutex);
+    StereoProducerSync& sync = g_stereoProducerSync[set];
+    if (sync.generation != generation ||
+        sync.state != StereoProducerSyncState::Pending) {
+        return false;
+    }
+
+    const GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!fence) {
+        g_stereoProducerSyncPoisoned.store(true, std::memory_order_release);
+        g_stereoProducerFenceErrors.fetch_add(1, std::memory_order_relaxed);
+        LOGE("[stereo.producer.sync] glFenceSync failed gen/set=%d/%d; "
+             "retail swap restored", generation, set);
+        return false;
+    }
+    // Submit every eye command preceding retail command 46 without presenting
+    // the hidden Android surface. The XR context inserts glWaitSync before it
+    // samples this exact ring generation, so this is a GPU dependency rather
+    // than a RenderQueue-thread fence stall.
+    glFlush();
+    if (sync.fence) glDeleteSync(sync.fence);
+    sync.fence = fence;
+    sync.state = StereoProducerSyncState::FenceReady;
+    const std::uint64_t published =
+        g_stereoProducerFencePublished.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    if (published == 1u || (published & 255u) == 0u) {
+        LOGI("[stereo.producer.sync] fence=%llu gen/set=%d/%d "
+             "attempt/retail/pending/error=%llu/%llu/%llu/%llu",
+             static_cast<unsigned long long>(published), generation, set,
+             static_cast<unsigned long long>(
+                 g_stereoProducerFenceAttempts.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoProducerFenceRetailFallbacks.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoProducerFencePendingRejects.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoProducerFenceErrors.load(std::memory_order_relaxed)));
+    }
+    return true;
+}
+
+void NotifyStereoRetailSwapCompletedFromRenderQueue() {
+    if (!StereoProducerFenceRequested() ||
+        g_stereoProducerSyncPoisoned.load(std::memory_order_acquire)) {
+        return;
+    }
+    const int generation = g_stereoSeq.load(std::memory_order_acquire);
+    if (generation < 0) return;
+    const int set = ((generation % kStereoSets) + kStereoSets) % kStereoSets;
+    std::lock_guard<std::mutex> lock(g_stereoProducerSyncMutex);
+    StereoProducerSync& sync = g_stereoProducerSync[set];
+    if (sync.generation != generation ||
+        sync.state != StereoProducerSyncState::Pending) {
+        return;
+    }
+    if (sync.fence) {
+        glDeleteSync(sync.fence);
+        sync.fence = nullptr;
+    }
+    sync.state = StereoProducerSyncState::RetailReady;
+    g_stereoProducerFenceRetailFallbacks.fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+bool WaitStereoProducerFenceForCandidate(int set, int generation) {
+    if (!StereoProducerFenceRequested() ||
+        g_stereoProducerSyncPoisoned.load(std::memory_order_acquire)) {
+        return true;
+    }
+    if (set < 0 || set >= kStereoSets || generation < 0) return false;
+
+    std::lock_guard<std::mutex> lock(g_stereoProducerSyncMutex);
+    StereoProducerSync& sync = g_stereoProducerSync[set];
+    if (sync.generation != generation ||
+        sync.state == StereoProducerSyncState::Pending ||
+        sync.state == StereoProducerSyncState::None) {
+        const std::uint64_t rejected =
+            g_stereoProducerFencePendingRejects.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+        if (rejected == 1u || (rejected & 127u) == 0u) {
+            LOGI("[stereo.producer.sync] pending=%llu wanted=%d/%d "
+                 "found=%d/%d",
+                 static_cast<unsigned long long>(rejected), generation, set,
+                 sync.generation, static_cast<int>(sync.state));
+        }
+        return false;
+    }
+    if (sync.state == StereoProducerSyncState::RetailReady) return true;
+    if (sync.state != StereoProducerSyncState::FenceReady || !sync.fence) {
+        return false;
+    }
+
+    if (glIsSync(sync.fence) != GL_TRUE) {
+        g_stereoProducerSyncPoisoned.store(true, std::memory_order_release);
+        g_stereoProducerFenceErrors.fetch_add(1, std::memory_order_relaxed);
+        LOGE("[stereo.producer.sync] unshared/invalid fence gen/set=%d/%d; "
+             "feature disabled until restart", generation, set);
+        return false;
+    }
+    glWaitSync(sync.fence, 0, GL_TIMEOUT_IGNORED);
+    const std::uint64_t waits = g_stereoProducerFenceWaits.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    if (waits == 1u || (waits & 255u) == 0u) {
+        LOGI("[stereo.producer.sync] waits=%llu gen/set=%d/%d fences=%llu",
+             static_cast<unsigned long long>(waits), generation, set,
+             static_cast<unsigned long long>(
+                 g_stereoProducerFencePublished.load(
+                     std::memory_order_relaxed)));
+    }
+    return true;
+}
+
 void SetStereoEyeTextures(const unsigned int* tex, const unsigned int* depth,
                           const unsigned int* hudTex,
                           const float* nearZ, const float* farZ,
@@ -3274,20 +5940,30 @@ void SetStereoEyeTextures(const unsigned int* tex, const unsigned int* depth,
     // sequence LAST with release ordering so a consumer that has acquired it sees
     // the matching texture ids.
     const int ws = ((seq % kStereoSets) + kStereoSets) % kStereoSets;
-    // Mark this slot incomplete before changing any of its CPU-side metadata.
-    // This detects ring wrap while the consumer is copying; it does not claim
-    // asynchronous RenderQueue/GPU completion (the lag still serves that role).
-    g_stereoGeneration[ws].store(-1, std::memory_order_release);
-    g_stereoEyeW.store(width, std::memory_order_relaxed);
-    g_stereoEyeH.store(height, std::memory_order_relaxed);
-    for (int set = 0; set < kStereoSets; ++set) {
-        g_stereoEyeTex[set][0].store(tex[set * 2 + 0], std::memory_order_relaxed);
-        g_stereoEyeTex[set][1].store(tex[set * 2 + 1], std::memory_order_relaxed);
-        g_stereoEyeDepth[set][0].store(depth ? depth[set * 2 + 0] : 0, std::memory_order_relaxed);
-        g_stereoEyeDepth[set][1].store(depth ? depth[set * 2 + 1] : 0, std::memory_order_relaxed);
-        g_stereoHudTex[set].store(hudTex ? hudTex[set] : 0,
-                                  std::memory_order_relaxed);
+    // TryBeginStereoEyeWrite must have claimed and invalidated this slot before
+    // either eye was recorded. Fail closed if a caller violates that contract;
+    // publishing an unowned slot would reintroduce the torn-pair race.
+    if (g_stereoSlotUsers[ws].load(std::memory_order_acquire) != -1) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            LOGE("[stereo.ring] publish without writer ownership seq=%d set=%d",
+                 seq, ws);
+        return;
     }
+    g_stereoEyeW[ws].store(width, std::memory_order_relaxed);
+    g_stereoEyeH[ws].store(height, std::memory_order_relaxed);
+    // Publish only the row protected by this writer claim.  Render-scale
+    // changes replace all three raster ids at once on the producer side; copying
+    // the entire table here could otherwise rewrite a different slot while XR
+    // still holds a read lease on it.  The next two sequences warm those rows.
+    g_stereoEyeTex[ws][0].store(tex[ws * 2 + 0], std::memory_order_relaxed);
+    g_stereoEyeTex[ws][1].store(tex[ws * 2 + 1], std::memory_order_relaxed);
+    g_stereoEyeDepth[ws][0].store(
+        depth ? depth[ws * 2 + 0] : 0, std::memory_order_relaxed);
+    g_stereoEyeDepth[ws][1].store(
+        depth ? depth[ws * 2 + 1] : 0, std::memory_order_relaxed);
+    g_stereoHudTex[ws].store(hudTex ? hudTex[ws] : 0,
+                              std::memory_order_relaxed);
     g_stereoEyeNear[ws][0].store(nearZ ? nearZ[0] : 0.05f, std::memory_order_relaxed);
     g_stereoEyeNear[ws][1].store(nearZ ? nearZ[1] : 0.05f, std::memory_order_relaxed);
     g_stereoEyeFar[ws][0].store(farZ ? farZ[0] : 1000.0f, std::memory_order_relaxed);
@@ -3298,6 +5974,17 @@ void SetStereoEyeTextures(const unsigned int* tex, const unsigned int* depth,
     g_stereoWaterDepth[ws].store(
         g_pendingWaterDepth.load(std::memory_order_relaxed),
         std::memory_order_relaxed);
+
+    if (StereoProducerFenceRequested() &&
+        !g_stereoProducerSyncPoisoned.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_stereoProducerSyncMutex);
+        StereoProducerSync& sync = g_stereoProducerSync[ws];
+        // The old sync object remains alive until command 46 reaches the
+        // RenderQueue GL context, where it can be deleted safely and replaced.
+        // TryBeginStereoEyeWrite already proved that no XR reader owns this row.
+        sync.generation = seq;
+        sync.state = StereoProducerSyncState::Pending;
+    }
 
     // Snapshot the pose these pixels were rendered at into the SAME ring slot the
     // textures went to. OnCopyCameraMatrixToRWCam has already published
@@ -3329,6 +6016,7 @@ void SetStereoEyeTextures(const unsigned int* tex, const unsigned int* depth,
         g_stereoTwoHandVisualState[ws] = g_twoHandVisualState;
         g_stereoScopeState[ws] = scopeaim::Snapshot();
         g_stereoDrivingWheelState[ws] = drivingWheel;
+        g_stereoBallHandLock[ws] = g_ballHandLock;
         g_stereoMobileColor[ws] = g_pendingMobileColor;
         g_stereoThrowableTrajectory[ws][0] = g_throwableTrajectory[0];
         g_stereoThrowableTrajectory[ws][1] = g_throwableTrajectory[1];
@@ -3350,16 +6038,23 @@ void SetStereoEyeTextures(const unsigned int* tex, const unsigned int* depth,
         g_stereoLaserRay[ws] = laserRay;
     }
     // Publish only after texture, depth and pose for this ring slot are complete.
-    g_stereoPublishedNs[ws].store(MonotonicNowNs(), std::memory_order_relaxed);
+    const std::uint64_t publishedNs = MonotonicNowNs();
+    g_stereoPublishedNs[ws].store(publishedNs, std::memory_order_relaxed);
     g_stereoGeneration[ws].store(seq, std::memory_order_release);
+    // Release ownership before advertising this generation as newest. A reader
+    // that acquires g_stereoSeq can therefore always pin the matching slot.
+    g_stereoSlotUsers[ws].store(0, std::memory_order_release);
     g_stereoSeq.store(seq, std::memory_order_release);
+    g_stereoEpochPublishedMask.fetch_or(1u << ws,
+                                        std::memory_order_release);
+    ResolveStereoLatePublication(seq, publishedNs);
 }
 
 bool StereoEnsure(int width, int height) {
     // Without a shared XR context the consumer cannot sample these textures, so
     // producing them is worse than useless (it would black the eyes). Bail so the
     // game thread renders a single mono frame that the consumer can still show.
-    if (!g_stereoShared) return false;
+    if (!g_stereoShared.load(std::memory_order_acquire)) return false;
     if (g_eyeReady && width == g_eyeW && height == g_eyeH) {
         return true;
     }
@@ -3488,6 +6183,8 @@ bool Initialize(JavaVM* vm, jobject activity) {
     }
 
     LOGI("SAVR version %s", kModVersion);
+    LOGI("[savr.build] version=%s origin=%s shared-sync=%s",
+         kModVersion, SAVR_BUILD_ORIGIN, SAVR_SHARED_SYNC);
     SetupHudTextRenderer(vm,activity);
 
     // On Android the loader has to be handed the VM and Activity before any
@@ -3544,10 +6241,14 @@ bool Initialize(JavaVM* vm, jobject activity) {
     g_hasPerformanceMetricsExt = hasExt(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
     if (g_hasPerformanceMetricsExt)
         extensions.push_back(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
-    LOGI("[perf.init] xr_ext perf_settings=%d thread_settings=%d refresh=%d meta_metrics=%d",
+    g_hasVisibilityMaskExt = hasExt(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+    if (g_hasVisibilityMaskExt)
+        extensions.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+    LOGI("[perf.init] xr_ext perf_settings=%d thread_settings=%d refresh=%d meta_metrics=%d visibility_mask=%d",
          g_hasPerfExt ? 1 : 0, g_hasThreadExt ? 1 : 0,
          g_hasDisplayRefreshExt ? 1 : 0,
-         g_hasPerformanceMetricsExt ? 1 : 0);
+         g_hasPerformanceMetricsExt ? 1 : 0,
+         g_hasVisibilityMaskExt ? 1 : 0);
     // Capability evidence only. Do not enable foveation here: GTA renders the
     // expensive world into intermediate RenderWare eye textures, so XR-swapchain
     // foveation would currently optimize only the final blit.
@@ -3571,6 +6272,16 @@ bool Initialize(JavaVM* vm, jobject activity) {
 
     if (!Check(xrCreateInstance(&create, &s.instance), "xrCreateInstance")) {
         return false;
+    }
+    if (g_hasVisibilityMaskExt) {
+        const XrResult maskProcResult = xrGetInstanceProcAddr(
+            s.instance, "xrGetVisibilityMaskKHR",
+            reinterpret_cast<PFN_xrVoidFunction*>(&g_xrGetVisibilityMaskKHR));
+        if (XR_FAILED(maskProcResult) || !g_xrGetVisibilityMaskKHR) {
+            LOGW("[stereo.mask] entrypoint unavailable result=%d",
+                 static_cast<int>(maskProcResult));
+            g_xrGetVisibilityMaskKHR = nullptr;
+        }
     }
     ResolveDiagnosticExtensions();
 
@@ -3641,7 +6352,6 @@ bool CreateSession() {
     if (!Check(xrCreateSession(s.instance, &create, &s.session), "xrCreateSession")) {
         return false;
     }
-
     XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     spaceInfo.referenceSpaceType   = XR_REFERENCE_SPACE_TYPE_LOCAL;
     spaceInfo.poseInReferenceSpace = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
@@ -3826,10 +6536,17 @@ void BuildPanel(const perf::DebugStatsSnapshot& stats) {
         censusRateBaseline = false;
     }
 
-    std::snprintf(line, sizeof(line), "GAME %.1F/%d  XR %.1F",
-                  stats.renderedHz, targetFps,
-                  stats.displayValid ? stats.displayHz : 0.0);
-    PanelText(line, cx, 40, 2, 255, 230, 64);
+    // A rendered callback can still fall back to the flat game surface when the
+    // stereo writer misses its ring claim. Show distinct stereo sequences that
+    // actually reached the compositor, not the misleading callback/cap cadence.
+    std::snprintf(line, sizeof(line), "FRESH %.1F P %.1F REP%d WB%d",
+                  stats.freshHz, stats.presentHz, stats.repeated,
+                  stats.writeClaimBusyDrops);
+    const bool freshGood = stats.presentValid &&
+        stats.freshHz >= static_cast<double>(targetFps) - 1.0 &&
+        stats.repeated <= 1 && stats.writeClaimBusyDrops == 0;
+    PanelText(line, cx, 40, 2, freshGood ? 130 : 255,
+              freshGood ? 255 : 170, freshGood ? 170 : 80);
     std::snprintf(line, sizeof(line), "LOAD CPU %.0F GPU %.0F",
                   cpuLoad, gpuLoad);
     PanelText(line, cx, 70, 2, loadR, loadG, loadB);
@@ -4119,13 +6836,20 @@ void BuildPanel(const perf::DebugStatsSnapshot& stats) {
     PanelText(line, cx, 434, 2, guardsGood ? 130 : 255,
               guardsGood ? 255 : 100, guardsGood ? 170 : 100);
     std::snprintf(line, sizeof(line),
-                  "SYNC W/R/T %d/%d/%d %.2FMS REP%d",
+                  "SYNC W/R/T %d/%d/%d %.2F WR%d WB%d ST%d BK%d G%d R%d",
                   hudCount(stats.stereoSyncWaits),
                   hudCount(stats.stereoSyncRescued),
                   hudCount(stats.stereoSyncTimeouts),
-                  stats.stereoSyncWaitMs, hudCount(stats.repeated));
+                  stats.stereoSyncWaitMs, hudCount(stats.writeClaimRescues),
+                  hudCount(stats.writeClaimBusyDrops),
+                  hudCount(stats.stereoStaleRejects),
+                  hudCount(stats.stereoBlackFallbacks),
+                  stats.stereoLivenessState,
+                  stats.stereoRecoveryProgress);
     const bool syncGood = stats.stereoSyncTimeouts == 0 &&
-                          stats.repeated <= 1;
+                           stats.repeated <= 1 &&
+                           stats.stereoStaleRejects == 0 &&
+                           stats.writeClaimBusyDrops == 0;
     PanelText(line, cx, 453, 2, syncGood ? 130 : 255,
               syncGood ? 255 : 180, syncGood ? 170 : 100);
     if (stats.lodWitnessValid) {
@@ -4190,10 +6914,10 @@ void BuildAboutMenu() {
         "PROMPTS: TAP R2 YES  L2 NO  HOLD R2",
         "RECRUIT: LOOK AT GROVE PED + HOLD R2",
         "RECRUITING NEEDS RESPECT (OR CHEAT)",
-        "L3+R3 RECENTERS THE VIEW",
+        "CUTSCENE: R3 CAMERA / L3 REMEMBER",
         "ACTIVE DEVELOPMENT - EXPECT ROUGH EDGES",
         "DISCUSSION: FLAT2VR DISCORD",
-        "discord.com/channels/747967102895390741/1540234546182750228",
+        "discord.com/channels/747967102895390741/1543691482861408276",
         "PRESS ANY BUTTON TO CLOSE",
     };
     const int count = static_cast<int>(sizeof(kLines) / sizeof(kLines[0]));
@@ -4216,6 +6940,8 @@ void BuildControlsTipsMenu() {
         "GRIPS+MENU (OR Y)  OPEN VR MENU",
         "Y ENTER/EXIT   X JUMP   A SPRINT",
         "B  FIRE HELD WEAPON IN VEHICLES / TANK",
+        "WEAPON PICKUP: WALK OVER IT ON GROUND;",
+        "  SAME SLOT SWAPS - DRAW FROM HOLSTER",
         "R2 TAP  ANSWER PROMPTS YES   L2  NO",
         "R2 HOLD  TAP-AND-HOLD PROMPTS",
         "PLANES: PULL/PUSH YOKE = PITCH",
@@ -4231,10 +6957,11 @@ void BuildControlsTipsMenu() {
         "  THE MAX RESPECT CHEAT)",
         "HORN: PRESS PALM ON THE WHEEL HUB",
         "ANSWER PHONE: BOTH GRIPS + R2",
+        "CUTSCENE: R3 CAMERA / L3 REMEMBER",
         "L3+R3 RECENTER   GRIPS+R3 CAMERA VIEW",
     };
     const int count = static_cast<int>(sizeof(kTips) / sizeof(kTips[0]));
-    const int top = 48, rowH = 23;
+    const int top = 44, rowH = 21;
     for (int i = 0; i < count; ++i)
         PanelText(kTips[i], cx, top + i * rowH, 2, 210, 225, 235);
     PanelText("A / B BACK", cx, kPanelH - 18, 2, 150, 185, 150);
@@ -4244,28 +6971,44 @@ void BuildControlsMenu() {
     PanelClear();
     const int cx = kPanelW / 2;
     PanelText("CONTROLS", cx, 20, 5, 100, 225, 255);
-    PanelTextFit("ON FOOT ONLY - VEHICLES KEEP DEFAULTS",
+    PanelTextFit("GAMEPLAY ONLY - MENU CURSOR STAYS RAW",
                  cx, 56, 2, 150, 185, 150);
-    char rows[7][64];
+    constexpr int firstStick = 1;
+    constexpr int firstButton = firstStick + locomotion::STICK_OPT_COUNT;
+    constexpr int tipsRow = firstButton + locomotion::BIND_SRC_COUNT;
+    constexpr int resetRow = tipsRow + 1;
+    constexpr int backRow = resetRow + 1;
+    constexpr int rowCount = backRow + 1;
+    char rows[rowCount][64]{};
     std::snprintf(rows[0], sizeof(rows[0]), "LAYOUT  < %s >",
                   locomotion::ControlsLayoutName());
+    const char* stickLabels[locomotion::STICK_OPT_COUNT]={
+        "SWAP MOVE / TURN STICKS", "INVERT MOVE X", "INVERT MOVE Y",
+        "INVERT TURN X", "INVERT TURN Y"};
+    for (int i=0;i<locomotion::STICK_OPT_COUNT;++i)
+        std::snprintf(rows[firstStick+i],sizeof(rows[0]),"%s  < %s >",
+                      stickLabels[i],locomotion::StickOptionName(i));
     for (int srcRow = 0; srcRow < locomotion::BIND_SRC_COUNT; ++srcRow) {
-        std::snprintf(rows[1 + srcRow], sizeof(rows[0]), "%s  < %s >",
+        std::snprintf(rows[firstButton + srcRow], sizeof(rows[0]), "%s  < %s >",
                       locomotion::ButtonSourceName(srcRow),
                       locomotion::ButtonActionName(
                           locomotion::GetButtonBinding(srcRow)));
     }
-    std::snprintf(rows[5], sizeof(rows[0]), "CONTROL TIPS");
-    std::snprintf(rows[6], sizeof(rows[0]), "BACK");
+    std::snprintf(rows[tipsRow], sizeof(rows[0]), "CONTROL TIPS");
+    std::snprintf(rows[resetRow], sizeof(rows[0]), "RESET DEFAULTS");
+    std::snprintf(rows[backRow], sizeof(rows[0]), "BACK");
     const int sel = g_controlsSel.load(std::memory_order_relaxed);
-    const int top = 96, rowH = 50;
-    for (int i = 0; i < 7; ++i) {
-        const int y = top + i * rowH;
+    constexpr int visibleRows=10;
+    const int first=std::clamp(sel-visibleRows/2,0,rowCount-visibleRows);
+    const int last=std::min(rowCount,first+visibleRows);
+    const int top = 86, rowH = 39;
+    for (int i = first; i < last; ++i) {
+        const int y = top + (i-first) * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
         const int c = (i == sel) ? 255 : 200;
         PanelText(rows[i], cx, y, 2, c, c, (i == sel) ? 120 : c);
     }
-    PanelText("STICK SEL   L2/R2 CHANGE   B BACK", cx, kPanelH - 22, 2, 150, 185, 150);
+    PanelText("STICK SEL   L2/R2 CHANGE   A TOGGLE", cx, kPanelH - 22, 2, 150, 185, 150);
 }
 
 void BuildMainMenu() {
@@ -4289,17 +7032,18 @@ void BuildMainMenu() {
         "CHEATS",
         "GRAPHICS",
         "CONTROLS",
+        "BASKETBALL",
         "ABOUT",
         "CLOSE"
     };
-    const int N   = 12;
+    const int N   = 13;
     const int sel = g_mainSel.load(std::memory_order_relaxed);
     const int top = 82, rowH = 34;
     for (int i = 0; i < N; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
         const bool submenu=i==0||i==1||i==2||i==3||i==4||i==5||
-                           i==7||i==8||i==9||i==10;
+                           i==7||i==8||i==9||i==10||i==11;
         if (submenu)
             PanelText(kItems[i],cx,y,2,i==sel?255:100,
                       i==sel?235:225,i==sel?120:255);
@@ -4381,13 +7125,14 @@ void BuildHolsterMenu() {
             std::snprintf(row, sizeof(row), "BACK");
         } else {
             const int slot = holster::PointSlot(i);
-            std::snprintf(row, sizeof(row), "%s   < %s >%s",
+            std::snprintf(row, sizeof(row), "%s   < %s >  [%s]%s",
                           holster::PointName(i), holster::SlotName(slot),
+                          holster::PointVisible(i) ? "SHOW" : "HIDE",
                           holster::IsPointFixed(i) ? "  [FIXED]" : "");
         }
         PanelText(row, cx, y, 2, c, c, (i == sel) ? 120 : c);
     }
-    const char* hint = "L2/R2 CHOOSE (EMPTY CLEARS)   B BACK";
+    const char* hint = "L2/R2 CHOOSE   A SHOW/HIDE   B BACK";
     if (sel >= holster::PointCount() && sel <= holster::PointCount() + 2)
         hint = "A/B BACK";
     else if (holster::IsPointFixed(sel))
@@ -4405,35 +7150,90 @@ void BuildGraphicsMenu() {
     const int sel = g_gfxSel.load(std::memory_order_relaxed);
     const int cpu = g_cpuPerfIdx.load(std::memory_order_relaxed);
     const int gpu = g_gpuPerfIdx.load(std::memory_order_relaxed);
-    char rows[9][64];
-    std::snprintf(rows[0], sizeof(rows[0]), "RENDER SCALE  < %d%% >",
-                  vrcam::GetRenderScalePercent());
+    const int renderScalePercent = vrcam::GetRenderScalePercent();
+    const int activeRenderScalePercent = vrcam::GetActiveRenderScalePercent();
+    const bool renderScalePending = vrcam::RenderScaleChangePending();
+    int activeWidth = 0;
+    int activeHeight = 0;
+    const int latestSequence = g_stereoSeq.load(std::memory_order_acquire);
+    if (latestSequence >= 0) {
+        const int set = latestSequence % kStereoSets;
+        activeWidth = g_stereoEyeW[set].load(std::memory_order_acquire);
+        activeHeight = g_stereoEyeH[set].load(std::memory_order_acquire);
+    }
+    const int baseWidth = !s.swapchains.empty() ? s.swapchains[0].width : 0;
+    const int baseHeight = !s.swapchains.empty() ? s.swapchains[0].height : 0;
+    // Before the first stereo pair is published, still show the exact size the
+    // current scale will allocate from the runtime's OpenXR recommendation.
+    if ((activeWidth <= 0 || activeHeight <= 0) &&
+        baseWidth > 0 && baseHeight > 0) {
+        activeWidth =
+            (static_cast<int>(baseWidth * renderScalePercent / 100.0f + 0.5f)) & ~1;
+        activeHeight =
+            (static_cast<int>(baseHeight * renderScalePercent / 100.0f + 0.5f)) & ~1;
+    }
+    char rows[11][64];
+    if (renderScalePending) {
+        std::snprintf(rows[0], sizeof(rows[0]),
+                      "RESOLUTION  < %d%% >  [APPLYING]",
+                      renderScalePercent);
+    } else if (activeWidth > 0 && activeHeight > 0) {
+        std::snprintf(rows[0], sizeof(rows[0]),
+                      "RESOLUTION  < %d X %d >  %d%%",
+                      activeWidth, activeHeight, renderScalePercent);
+    } else {
+        std::snprintf(rows[0], sizeof(rows[0]), "RESOLUTION  < %d%% >",
+                      renderScalePercent);
+    }
     std::snprintf(rows[1], sizeof(rows[1]), "CPU  < %s >", kPerfNames[cpu]);
     std::snprintf(rows[2], sizeof(rows[2]), "GPU  < %s >", kPerfNames[gpu]);
-    std::snprintf(rows[3], sizeof(rows[3]), "NEON SIGNS  < %s >",
+    std::snprintf(rows[3], sizeof(rows[3]), "WORLD EFFECTS  < %s >",
+                  vrcam::AreWorldEffectsEnabled() ? "ON" : "OFF");
+    std::snprintf(rows[4], sizeof(rows[4]), "NEON SIGNS  < %s >",
                   vrcam::AreNeonSignsEnabled() ? "ON" : "OFF");
-    std::snprintf(rows[4], sizeof(rows[4]), "COLOR GRADING  < %s >",
+    std::snprintf(rows[5], sizeof(rows[5]), "COLOR GRADING  < %s >",
                   vrcam::IsColorGradingEnabled() ? "ON" : "OFF");
+    std::snprintf(rows[6], sizeof(rows[6]), "DYNAMIC SHADOWS  < %s >",
+                  vrcam::GetDynamicShadowModeName());
     if (!hdweapons::Available()) {
-        std::snprintf(rows[5], sizeof(rows[5]),
+        std::snprintf(rows[7], sizeof(rows[7]),
                       "WEAPON MODELS  < NO FILES >");
     } else {
         const bool hd = vrcam::IsHdWeaponsEnabled();
-        std::snprintf(rows[5], sizeof(rows[5]), "WEAPON MODELS  < %s >%s",
+        std::snprintf(rows[7], sizeof(rows[7]), "WEAPON MODELS  < %s >%s",
                       hd ? "HD" : "ORIGINAL",
                       hd != hdweapons::Applied() ? "  [RESTART]" : "");
     }
-    std::snprintf(rows[6], sizeof(rows[6]), "DRAW DISTANCES");
-    std::snprintf(rows[7], sizeof(rows[7]), "RESET DEFAULTS");
-    std::snprintf(rows[8], sizeof(rows[8]), "BACK");
-    const int top = 78, rowH = 44;
-    for (int i = 0; i < 9; ++i) {
+    std::snprintf(rows[8], sizeof(rows[8]), "DRAW DISTANCES");
+    std::snprintf(rows[9], sizeof(rows[9]), "RESET DEFAULTS");
+    std::snprintf(rows[10], sizeof(rows[10]), "BACK");
+    const int top = 62, rowH = 37;
+    for (int i = 0; i < 11; ++i) {
         const int y = top + i * rowH;
         if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
         const int c = (i == sel) ? 255 : 200;
         PanelText(rows[i], cx, y, 2, c, c, (i == sel) ? 120 : c);
     }
-    PanelText("STICK SEL   L2/R2 ADJUST   B BACK", cx, kPanelH - 22, 2, 150, 185, 150);
+    char hint[64]{};
+    if (sel == 0 && renderScalePending) {
+        if (activeWidth > 0 && activeHeight > 0) {
+            std::snprintf(hint, sizeof(hint),
+                          "ACTIVE %d%%  %d X %d   PREPARING NEW BUFFER",
+                          activeRenderScalePercent, activeWidth, activeHeight);
+        } else {
+            std::snprintf(hint, sizeof(hint),
+                          "ACTIVE %d%%   PREPARING NEW BUFFER",
+                          activeRenderScalePercent);
+        }
+    } else if (sel == 0 && baseWidth > 0 && baseHeight > 0) {
+        std::snprintf(hint, sizeof(hint),
+                      "OPENXR BASE %d X %d PER EYE   L2/R2 ADJUST",
+                      baseWidth, baseHeight);
+    } else {
+        std::snprintf(hint, sizeof(hint),
+                      "STICK SEL   L2/R2 ADJUST   B BACK");
+    }
+    PanelText(hint, cx, kPanelH - 22, 2, 150, 185, 150);
 }
 
 void BuildGraphicsDistanceMenu() {
@@ -4450,6 +7250,11 @@ void BuildGraphicsDistanceMenu() {
         char row[96]{};
         if (i == settings) {
             std::snprintf(row, sizeof(row), "BACK");
+        } else if (vrcam::GraphicsDistanceSettingUsesRetail(i)) {
+            std::snprintf(row, sizeof(row), "%s  < RETAIL >%s",
+                          vrcam::GetGraphicsDistanceSettingName(i),
+                          vrcam::GraphicsDistanceSettingNeedsRestart(i)
+                              ? "  [RESTART]" : "");
         } else {
             std::snprintf(row, sizeof(row), "%s  < %dM >%s",
                           vrcam::GetGraphicsDistanceSettingName(i),
@@ -4477,8 +7282,8 @@ void BuildDrivingMenu() {
     const int sel = g_drivingSel.load(std::memory_order_relaxed);
     const int vehicleType=g_drivingVehicleType.load(std::memory_order_relaxed);
     const int rowCount=driving::GetMenuItemCount(vehicleType);
-    char rows[18][96]{};
-    bool available[18]{};
+    char rows[24][96]{};
+    bool available[24]{};
     const bool haveModel=driving::HasCurrentModelForType(vehicleType);
     for (int row=0;row<rowCount;++row) {
         const int item=driving::GetMenuItemForRow(vehicleType,row);
@@ -4517,6 +7322,12 @@ void BuildDrivingMenu() {
                     std::snprintf(rows[row],sizeof(rows[row]),
                         "THIS BIKE ACCELERATOR   < ENTER BIKE >");
                 break;
+            case driving::MENU_GLOBAL_SIDE:
+                std::snprintf(rows[row],sizeof(rows[row]),
+                    "ALL %sS SEAT SIDE   < %+d CM >",
+                    driving::VehicleTypeName(vehicleType),
+                    driving::GetGlobalSeatSideCm(vehicleType));
+                break;
             case driving::MENU_GLOBAL_FORWARD:
                 std::snprintf(rows[row],sizeof(rows[row]),
                     "ALL %sS SEAT FORWARD   < %+d CM >",
@@ -4528,6 +7339,16 @@ void BuildDrivingMenu() {
                     "ALL %sS SEAT HEIGHT   < %+d CM >",
                     driving::VehicleTypeName(vehicleType),
                     driving::GetGlobalSeatHeightCm(vehicleType));
+                break;
+            case driving::MENU_MODEL_SIDE:
+                if (haveModel)
+                    std::snprintf(rows[row],sizeof(rows[row]),
+                        "THIS MODEL SIDE CORRECTION   < %+d CM >",
+                        driving::GetCurrentModelSeatSideCm(vehicleType));
+                else
+                    std::snprintf(rows[row],sizeof(rows[row]),
+                        "THIS MODEL SIDE   < ENTER %s >",
+                        driving::VehicleTypeName(vehicleType));
                 break;
             case driving::MENU_MODEL_FORWARD:
                 if (haveModel)
@@ -4588,6 +7409,21 @@ void BuildDrivingMenu() {
                 std::snprintf(rows[row],sizeof(rows[row]),
                     "INTERIOR WINDOW TINT   < %s >",
                     driving::IsInteriorGlassHidden()?"OFF":"ON");
+                break;
+            case driving::MENU_CAR_CAMERA_TILT:
+                std::snprintf(rows[row],sizeof(rows[row]),
+                    "CAMERA MOTION   < %s >",
+                    driving::CarCameraTiltEnabled()?"WITH CAR":"LEVEL");
+                break;
+            case driving::MENU_BOAT_CAMERA_TILT:
+                std::snprintf(rows[row],sizeof(rows[row]),
+                    "CAMERA MOTION   < %s >",
+                    driving::BoatCameraTiltEnabled()?"WITH BOAT":"LEVEL");
+                break;
+            case driving::MENU_DRIVEBY_AIM:
+                std::snprintf(rows[row],sizeof(rows[row]),
+                    "DRIVE-BY AIM   < %s >",
+                    driving::IsDrivebyAimImmersive()?"IMMERSIVE":"CLASSIC");
                 break;
             case driving::MENU_RESET:
                 std::snprintf(rows[row],sizeof(rows[row]),"RESET %s %s PRESET",
@@ -4694,12 +7530,89 @@ void BuildDrivingCalibrationMenu() {
               cx,kPanelH-18,2,150,185,150);
 }
 
+void BuildBasketballMenu() {
+    PanelClear();
+    const int cx = kPanelW / 2;
+    PanelText("BASKETBALL PHYSICS", cx, 16, 4, 100, 225, 255);
+    const int sel = g_basketballSel.load(std::memory_order_relaxed);
+    constexpr int kRows = basketball::PHYS_FIELD_COUNT + 3; // + HAND + SPAWN + BACK
+    char rows[kRows][64]{};
+    static const char* const kUnits[basketball::PHYS_FIELD_COUNT] = {
+        "%", "%", "%", "DM/S", "CM", "CM", "CM", "CM", "%", "CM",
+        "", "DM/S", "", "", "", "CM", "CM", "CM", "CM", ""};
+    for (int i = 0; i < basketball::PHYS_FIELD_COUNT; ++i) {
+        std::snprintf(rows[i], sizeof(rows[i]), "%s   < %d %s >",
+                      basketball::PhysicsFieldName(i),
+                      basketball::GetPhysicsValue(i), kUnits[i]);
+    }
+    std::snprintf(rows[basketball::PHYS_FIELD_COUNT], sizeof(rows[0]),
+                  "BALL IN HAND CALIBRATION");
+    std::snprintf(rows[basketball::PHYS_FIELD_COUNT + 1], sizeof(rows[0]),
+                  "SPAWN / RECALL BALL");
+    std::snprintf(rows[basketball::PHYS_FIELD_COUNT + 2], sizeof(rows[0]),
+                  "BACK");
+    // The list outgrew the panel: show a scrolling 13-row window centred
+    // on the selection, with MORE markers - same pattern as the driving
+    // menu.
+    constexpr int kWin = 13;
+    const int shown = kRows < kWin ? kRows : kWin;
+    const int start = std::clamp(sel - kWin / 2, 0,
+                                 kRows > kWin ? kRows - kWin : 0);
+    const int top = 64, rowH = 30;
+    if (start > 0) PanelText("- MORE -", cx, 44, 2, 120, 150, 120);
+    for (int w = 0; w < shown; ++w) {
+        const int i = start + w;
+        const int y = top + w * rowH;
+        if (i == sel)
+            PanelFillRect(26, y - 4, kPanelW - 26, y + 22, 120, 40, 110, 235);
+        const int colour = i == sel ? 255 : 200;
+        PanelText(rows[i], cx, y, 2, colour, colour,
+                  i == sel ? 120 : colour);
+    }
+    if (start + shown < kRows)
+        PanelText("- MORE -", cx, top + shown * rowH + 4, 2, 120, 150, 120);
+    PanelText("STICK SEL   L2/R2 ADJUST   A ACTION", cx, kPanelH - 18,
+              2, 150, 185, 150);
+}
+
+void BuildBasketballCalibMenu() {
+    PanelClear();
+    const int cx = kPanelW / 2;
+    PanelText("BALL IN HAND", cx, 16, 4, 100, 225, 255);
+    PanelText("CALIBRATE RIGHT - LEFT IS MIRRORED", cx, 48, 2,
+              150, 190, 210);
+    const int sel = g_basketballCalibSel.load(std::memory_order_relaxed);
+    constexpr int kRows = basketball::HAND_CALIB_FIELD_COUNT + 2;
+    const int top = 82, rowH = 42;
+    for (int i = 0; i < kRows; ++i) {
+        const int y = top + i * rowH;
+        if (i == sel)
+            PanelFillRect(26, y - 4, kPanelW - 26, y + 24,
+                          120, 40, 110, 235);
+        const int c = i == sel ? 255 : 200;
+        char row[72]{};
+        if (i < basketball::HAND_CALIB_FIELD_COUNT) {
+            const char* unit = i < basketball::HAND_CALIB_PITCH ? "MM" : "DEG";
+            std::snprintf(row, sizeof(row), "%s   < %d %s >",
+                          basketball::HandCalibFieldName(i),
+                          basketball::GetHandCalibValue(i), unit);
+        } else if (i == basketball::HAND_CALIB_FIELD_COUNT) {
+            std::snprintf(row, sizeof(row), "RESET HAND POSE");
+        } else {
+            std::snprintf(row, sizeof(row), "BACK");
+        }
+        PanelText(row, cx, y, 2, c, c, i == sel ? 120 : c);
+    }
+    PanelText("BALL STAYS IN RIGHT PALM   L2/R2 ADJUST", cx,
+              kPanelH - 18, 2, 150, 185, 150);
+}
+
 void BuildLocomotionMenu() {
     PanelClear();
     const int cx=kPanelW/2;
     PanelText("LOCOMOTION",cx,16,5,100,225,255);
     const int sel=g_locomotionSel.load(std::memory_order_relaxed);
-    char rows[14][72]{};
+    char rows[15][72]{};
     std::snprintf(rows[0],sizeof(rows[0]),"MOVE DIRECTION   < %s >",
                   locomotion::MovementModeName());
     std::snprintf(rows[1],sizeof(rows[1]),"TURNING   < %s >",
@@ -4720,21 +7633,57 @@ void BuildLocomotionMenu() {
                   locomotion::ParachuteControlImmersive()?"RISERS":"STICKS");
     std::snprintf(rows[9],sizeof(rows[9]),"AUTO PARACHUTE   < %s >",
                   locomotion::AutoParachuteEnabled()?"ON":"OFF");
-    std::snprintf(rows[10],sizeof(rows[10]),"FLIGHT CAMERA   < %s >",
-                  locomotion::FlightCameraTilt()?"FULL TILT":"LEVEL");
+    std::snprintf(rows[10],sizeof(rows[10]),"VEHICLE CAMERA");
     std::snprintf(rows[11],sizeof(rows[11]),"CUTSCENES   < %s >",
                   locomotion::CutsceneModeName());
-    std::snprintf(rows[12],sizeof(rows[12]),"RECENTER VIEW");
-    std::snprintf(rows[13],sizeof(rows[13]),"BACK");
-    // 13 rows on the 512px panel: the old 52px pitch already pushed the
-    // bottom rows past the panel edge; a 32px pitch keeps everything on it.
-    const int top=64,rowH=32;
-    for (int i=0;i<14;++i) {
+    std::snprintf(rows[12],sizeof(rows[12]),"GAME CUTSCENES   < %s >",
+                  locomotion::GameCutsceneModeName());
+    std::snprintf(rows[13],sizeof(rows[13]),"RECENTER VIEW");
+    std::snprintf(rows[14],sizeof(rows[14]),"BACK");
+    // 15 rows on the 512px panel: a 30px pitch from y=56 keeps the last row
+    // and the hint line inside the panel.
+    const int top=56,rowH=30;
+    for (int i=0;i<15;++i) {
         const int y=top+i*rowH;
         if (i==sel) PanelFillRect(26,y-4,kPanelW-26,y+22,120,40,110,235);
+        if (i==10) {
+            PanelText(rows[i],cx,y,2,i==sel?255:100,
+                      i==sel?235:225,i==sel?120:255);
+        } else {
+            const int c=i==sel?255:200;
+            PanelText(rows[i],cx,y,2,c,c,i==sel?120:c);
+        }
+    }
+    PanelText("STICK SEL   L2/R2 ADJUST   A ACTION",cx,kPanelH-18,
+              2,150,185,150);
+}
+
+// Per-vehicle camera motion in one place: planes, cars, bikes and boats.
+void BuildVehicleCameraMenu() {
+    PanelClear();
+    const int cx=kPanelW/2;
+    const int sel=g_vehicleCameraSel.load(std::memory_order_relaxed);
+    PanelText("VEHICLE CAMERA",cx,40,2,100,225,255);
+    char rows[5][72]{};
+    std::snprintf(rows[0],sizeof(rows[0]),"PLANES / HELIS   < %s >",
+                  locomotion::FlightCameraTilt()?"FULL TILT":"LEVEL");
+    std::snprintf(rows[1],sizeof(rows[1]),"CARS   < %s >",
+                  driving::CarCameraTiltEnabled()?"WITH CAR":"LEVEL");
+    std::snprintf(rows[2],sizeof(rows[2]),"BIKES   < %s >",
+                  driving::IsBikeHorizonLocked()?"LEVEL":"WITH BIKE");
+    std::snprintf(rows[3],sizeof(rows[3]),"BOATS   < %s >",
+                  driving::BoatCameraTiltEnabled()?"WITH BOAT":"LEVEL");
+    std::snprintf(rows[4],sizeof(rows[4]),"BACK");
+    const int top=96,rowH=44;
+    for (int i=0;i<5;++i) {
+        const int y=top+i*rowH;
+        if (i==sel)
+            PanelFillRect(26,y-5,kPanelW-26,y+25,120,40,110,235);
         const int c=i==sel?255:200;
         PanelText(rows[i],cx,y,2,c,c,i==sel?120:c);
     }
+    PanelText("LEVEL = STABLE HORIZON (COMFORT)",cx,top+5*rowH+14,
+              2,150,185,150);
     PanelText("STICK SEL   L2/R2 ADJUST   A ACTION",cx,kPanelH-18,
               2,150,185,150);
 }
@@ -4846,23 +7795,25 @@ void BuildHudMenu() {
         std::snprintf(rows[0], sizeof(rows[0]), "PRESET   < %s >", hud::PresetName());
         std::snprintf(rows[1], sizeof(rows[1]), "GAMEPLAY HUD   < %s >",
                       hud::GameplayHudEnabled() ? "ON" : "OFF");
-        std::snprintf(rows[2],sizeof(rows[2]),"ELEMENT   < %s >",
+        std::snprintf(rows[2],sizeof(rows[2]),"HIDE WHEN NOT LOOKING   < %s >",
+                      hud::GazeAutoHideEnabled()?"ON":"OFF");
+        std::snprintf(rows[3],sizeof(rows[3]),"ELEMENT   < %s >",
                       hud::ElementName(element));
-        std::snprintf(rows[3],sizeof(rows[3]),"VISIBLE   < %s >",
+        std::snprintf(rows[4],sizeof(rows[4]),"VISIBLE   < %s >",
                       settings.enabled?"ON":"OFF");
-        std::snprintf(rows[4],sizeof(rows[4]),"SPRITE CROP + SCREEN ...");
-        std::snprintf(rows[5],sizeof(rows[5]),directText?
+        std::snprintf(rows[5],sizeof(rows[5]),"SPRITE CROP + SCREEN ...");
+        std::snprintf(rows[6],sizeof(rows[6]),directText?
                       "WRIST - TEXT LAYER HAS NO PANEL":
                       "WRIST / DASH PLACEMENT ...");
-        std::snprintf(rows[6],sizeof(rows[6]),directText?
+        std::snprintf(rows[7],sizeof(rows[7]),directText?
                       "WEAPON GRIP - NO PANEL":
                       "WEAPON GRIP PLACEMENT ...");
-        std::snprintf(rows[7],sizeof(rows[7]),directText?
+        std::snprintf(rows[8],sizeof(rows[8]),directText?
                       "TWO-HAND GRIP - NO PANEL":
                       "TWO-HAND GRIP PLACEMENT ...");
-        std::snprintf(rows[8],sizeof(rows[8]),"RESET THIS ELEMENT");
-        std::snprintf(rows[9],sizeof(rows[9]),"BACK");
-        rowCount=10;
+        std::snprintf(rows[9],sizeof(rows[9]),"RESET THIS ELEMENT");
+        std::snprintf(rows[10],sizeof(rows[10]),"BACK");
+        rowCount=11;
     }
 
     constexpr int kWin=9;
@@ -4942,9 +7893,9 @@ void BuildCalibMenu() {
     PanelText(hdr, cx, 44, 2, 255, 200, 120);
     PanelText("LEFT USES THE SAME MIRRORED PROFILE", cx, 64, 2, 145, 185, 205);
 
-    // 23 rows (0..22) in a scrolling window that keeps the selection centred, so the
+    // 24 rows (0..23) in a scrolling window that keeps the selection centred, so the
     // fixed panel stays readable at arm's length instead of shrinking the font.
-    constexpr int kRows = 23, kWin = 9;
+    constexpr int kRows = 24, kWin = 9;
     int start = sel - kWin / 2;
     if (start < 0)              start = 0;
     if (start > kRows - kWin)   start = kRows - kWin;
@@ -4957,8 +7908,11 @@ void BuildCalibMenu() {
         if (r == sel) PanelFillRect(18, y - 3, kPanelW - 18, y + 18, 120, 40, 110, 235);
         const int c = (r == sel) ? 255 : 200;
         char row[64];
-        if (r == 22) {
+        if (r == 23) {
             std::snprintf(row, sizeof(row), "BACK");
+        } else if (r == 22) {
+            std::snprintf(row, sizeof(row), "WEAPON RECOIL   < %s >",
+                          savr::calib::RecoilLevelName());
         } else if (r == 21) {
             std::snprintf(row, sizeof(row), "SAVE LASER   < %s >",
                           savr::calib::LaserLocked(type) ? "SAVED" : "PRESS A");
@@ -4990,7 +7944,8 @@ void BuildCalibMenu() {
 // Upload the current panel into the debug swapchain and describe it as a
 // head-locked quad (view space), matching the Vice City overlay's placement.
 bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
-    if (s.debug.handle == XR_NULL_HANDLE || s.viewSpace == XR_NULL_HANDLE) return false;
+    if (s.debug.handle == XR_NULL_HANDLE || s.viewSpace == XR_NULL_HANDLE ||
+        s.debug.poisoned) return false;
     const bool mainMenu = g_mainMenuActive.load(std::memory_order_relaxed);
     const bool calibMenu = g_calibActive.load(std::memory_order_relaxed);
     const bool holsterCalibMenu = g_holsterCalibActive.load(std::memory_order_relaxed);
@@ -4999,6 +7954,12 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
     const bool drivingCalibMenu =
         g_drivingCalibActive.load(std::memory_order_relaxed);
     const bool locomotionMenu = g_locomotionActive.load(std::memory_order_relaxed);
+    const bool vehicleCameraMenu =
+        g_vehicleCameraActive.load(std::memory_order_relaxed);
+    const bool basketballMenu =
+        g_basketballActive.load(std::memory_order_relaxed);
+    const bool basketballCalibMenu =
+        g_basketballCalibActive.load(std::memory_order_relaxed);
     const bool hudMenu = g_hudActive.load(std::memory_order_relaxed);
     const bool graphicsMenu = g_gfxActive.load(std::memory_order_relaxed);
     const bool graphicsDistanceMenu =
@@ -5008,7 +7969,9 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
     const bool controlsTipsA = g_controlsTipsActive.load(std::memory_order_relaxed);
     const bool aboutMenuA = g_aboutActive.load(std::memory_order_relaxed);
     const bool profilerPanel = !(mainMenu || calibMenu || holsterCalibMenu ||
-        holsterMenu || drivingMenu || drivingCalibMenu || locomotionMenu || hudMenu ||
+        holsterMenu || drivingMenu || drivingCalibMenu || locomotionMenu ||
+        vehicleCameraMenu ||
+        basketballMenu || basketballCalibMenu || hudMenu ||
         graphicsMenu || graphicsDistanceMenu || cheatMenu ||
         controlsMenuA || controlsTipsA || aboutMenuA);
 
@@ -5041,6 +8004,9 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
         else if (drivingMenu)       BuildDrivingMenu();
         else if (drivingCalibMenu)  BuildDrivingCalibrationMenu();
         else if (locomotionMenu)    BuildLocomotionMenu();
+        else if (vehicleCameraMenu) BuildVehicleCameraMenu();
+        else if (basketballCalibMenu) BuildBasketballCalibMenu();
+        else if (basketballMenu)    BuildBasketballMenu();
         else if (hudMenu)           BuildHudMenu();
         else if (graphicsMenu)      BuildGraphicsMenu();
         else if (graphicsDistanceMenu) BuildGraphicsDistanceMenu();
@@ -5050,11 +8016,7 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
     uint32_t idx = 0;
     XrSwapchainImageAcquireInfo acq{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     if (!Check(xrAcquireSwapchainImage(s.debug.handle, &acq, &idx), "acquire(debug)")) return false;
-    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wait.timeout = XR_INFINITE_DURATION;
-    if (!Check(xrWaitSwapchainImage(s.debug.handle, &wait), "wait(debug)")) {
-        XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(s.debug.handle, &rel);
+    if (!WaitSwapchainImageReady(s.debug, "debug", "wait(debug)")) {
         return false;
     }
 
@@ -5090,7 +8052,11 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
     }
 
     XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(s.debug.handle, &rel);
+    if (!Check(xrReleaseSwapchainImage(s.debug.handle, &rel),
+               "release(debug)")) {
+        PoisonSwapchain(s.debug, "debug", "release");
+        return false;
+    }
 
     quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     quad.layerFlags        = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -5115,7 +8081,8 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
 // comfortable binocular head-locked quad.
 int PresentGameplayHud(XrCompositionLayerQuad quads[3],int sequence) {
     if (!hud::ShouldRenderClassicHud()||sequence<0||
-        s.hud.handle==XR_NULL_HANDLE||s.viewSpace==XR_NULL_HANDLE) return 0;
+        s.hud.handle==XR_NULL_HANDLE||s.viewSpace==XR_NULL_HANDLE||
+        s.hud.poisoned) return 0;
     const int set=((sequence%kStereoSets)+kStereoSets)%kStereoSets;
     if (g_stereoGeneration[set].load(std::memory_order_acquire)!=sequence)
         return 0;
@@ -5126,11 +8093,7 @@ int PresentGameplayHud(XrCompositionLayerQuad quads[3],int sequence) {
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     if (!Check(xrAcquireSwapchainImage(s.hud.handle,&acquire,&index),
                "acquire(hud)")) return 0;
-    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wait.timeout=XR_INFINITE_DURATION;
-    if (!Check(xrWaitSwapchainImage(s.hud.handle,&wait),"wait(hud)")) {
-        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(s.hud.handle,&release);
+    if (!WaitSwapchainImageReady(s.hud,"hud","wait(hud)")) {
         return 0;
     }
 
@@ -5173,7 +8136,11 @@ int PresentGameplayHud(XrCompositionLayerQuad quads[3],int sequence) {
     }
 
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(s.hud.handle,&release);
+    if (!Check(xrReleaseSwapchainImage(s.hud.handle,&release),
+               "release(hud)")) {
+        PoisonSwapchain(s.hud,"hud","release");
+        return 0;
+    }
     if (!complete) return 0;
 
     struct Region {
@@ -5307,6 +8274,7 @@ void MatMul(float* o, const float* a, const float* b) {
 struct UxrhVertex { float pos[4][3]; float nrm[4][3]; float u, v; };   // 104 bytes
 struct HandMesh   { std::vector<UxrhVertex> verts; std::vector<unsigned short> idx; bool loaded = false; };
 HandMesh g_handMesh[2];
+HandMesh g_ballPalmMesh[2];
 GLuint   g_handTex = 0;
 bool     g_handAssetsTried = false;
 
@@ -5351,6 +8319,8 @@ void EnsureHandAssets() {
     char path[256];
     std::snprintf(path, sizeof(path), "%sBigHandLeft.uxrh", dir);  LoadUxrh(path, g_handMesh[0]);
     std::snprintf(path, sizeof(path), "%sBigHandRight.uxrh", dir); LoadUxrh(path, g_handMesh[1]);
+    std::snprintf(path, sizeof(path), "%sBigHandLeftPalm.uxrh", dir);  LoadUxrh(path, g_ballPalmMesh[0]);
+    std::snprintf(path, sizeof(path), "%sBigHandRightPalm.uxrh", dir); LoadUxrh(path, g_ballPalmMesh[1]);
     std::snprintf(path, sizeof(path), "%sBigHandsAlbedo.rgba", dir); g_handTex = LoadRgbaTexture(path, 1024, 1024);
 }
 
@@ -5364,7 +8334,8 @@ int            g_hIndexCount[2] = {0, 0};
 // Build both hands' meshes once per frame from the given pose snapshot (the pose
 // the displayed eye textures were baked with), so hands + weapon share one frame.
 void BuildHandMeshes(const HandPose hp[2], const TwoHandVisualState& twoHand,
-                     const driving::WheelVisualState& drivingWheel) {
+                     const driving::WheelVisualState& drivingWheel,
+                     const BallHandLock& ballLock) {
     g_hVc = 0; g_hIc = 0;
     g_hFirstIndex[0] = g_hFirstIndex[1] = 0;
     g_hIndexCount[0] = g_hIndexCount[1] = 0;
@@ -5391,10 +8362,11 @@ void BuildHandMeshes(const HandPose hp[2], const TwoHandVisualState& twoHand,
 
         float grip = std::clamp(hp[hand].grip, 0.0f, 1.0f);
         float trig = std::clamp(hp[hand].trigger, 0.0f, 1.0f);
+        bool basketballFlatPalm = false;
         const bool steeringHand = drivingWheel.active &&
                                   drivingWheel.grabbed[hand];
         if (steeringHand) {
-            // qbuild's car socket is a RenderWare matrix whose Right axis lies
+            // reference Quest build's car socket is a RenderWare matrix whose Right axis lies
             // along the rim and Forward axis is the wheel normal. Reproduce its
             // final UltimateXR anatomical decode, including LEFT parity, rather
             // than forcing a controller quaternion onto a synthetic socket.
@@ -5430,6 +8402,36 @@ void BuildHandMeshes(const HandPose hp[2], const TwoHandVisualState& twoHand,
                 std::max(grip,0.90f);
             grip = wheelGrip;
             trig = std::max(trig, wheelGrip);
+        } else if (ballLock.locked[hand]) {
+            // Palm pinned flat onto the held basketball: position AND basis
+            // come from the ball surface (wheel-grab pattern), so the hand
+            // cannot roll around or sink into the ball; fingers stay open
+            // and tangent to the surface.
+            pos = {ballLock.pos[hand][0], ballLock.pos[hand][1],
+                   ballLock.pos[hand][2]};
+            const XrVector3f lockUp{ballLock.up[hand][0],
+                                    ballLock.up[hand][1],
+                                    ballLock.up[hand][2]};
+            const XrVector3f lockFwd{ballLock.fwd[hand][0],
+                                     ballLock.fwd[hand][1],
+                                     ballLock.fwd[hand][2]};
+            if (vdot(lockUp, lockUp) > 0.25f &&
+                vdot(lockFwd, lockFwd) > 0.25f) {
+                up = vnorm(lockUp);
+                forward = vnorm(lockFwd);
+                right = vnorm(vcross(up, forward));
+                if (hand == 0) right = vscale(right, -1.0f);
+            }
+            // Exact UXRH OPEN pose. Even the former 5% grip curl made the
+            // remaining three fingers read like a pistol hand beside the ball.
+            grip = 0.0f;
+            trig = 0.0f;
+            basketballFlatPalm = true;
+            static std::uint64_t palmFrames = 0;
+            if (((++palmFrames) & 255u) == 1u) {
+                LOGI("[basketball.hand] palm_lock hand=%d open=1 pos=(%.3f %.3f %.3f)",
+                     hand, pos.x, pos.y, pos.z);
+            }
         } else if (TwoHandStateUsable(twoHand)) {
             if (hand == twoHand.primaryHand) {
                 // The game-baked weapon used this same pivot/axis correction.
@@ -5460,21 +8462,21 @@ void BuildHandMeshes(const HandPose hp[2], const TwoHandVisualState& twoHand,
                     const XrVector3f wristUp = TwoHandRotateVector(twoHand,
                         {twoHand.supportUp[0], twoHand.supportUp[1],
                          twoHand.supportUp[2]});
-                    // PhysicalWeapon publishes the fully style-aware qbuild
+                    // PhysicalWeapon publishes the fully style-aware reference Quest build
                     // visual hand frame (including LEFT mesh mirroring). The UXR
                     // builder below consumes that conventional right/forward/up
                     // basis directly; only the shared shortest arc is applied here.
                     forward = vnorm(wristForward);
                     right   = vnorm(wristRight);
                     up      = vnorm(wristUp);
-                    // qbuild's LEFT support matrix passes through one final
+                    // reference Quest build's LEFT support matrix passes through one final
                     // controller-to-UltimateXR parity test before the mesh draw.
                     // Our direct basis bypasses that encode/decode, so reproduce
                     // its final visual result explicitly here.
                     if (hand == 0) right = vscale(right, -1.0f);
                 }
 
-                // qbuild's default MAGAZINE gesture closes every finger.  A
+                // reference Quest build's default MAGAZINE gesture closes every finger.  A
                 // caller may explicitly publish the FROM_BELOW blend instead.
                 grip = twoHand.supportGestureValid
                     ? std::clamp(twoHand.supportGestureGrip, 0.0f, 1.0f) : 1.0f;
@@ -5484,16 +8486,28 @@ void BuildHandMeshes(const HandPose hp[2], const TwoHandVisualState& twoHand,
         }
 
         const float wO = (1 - grip) * (1 - trig), wG = grip * (1 - trig), wT = (1 - grip) * trig, wB = grip * trig;
-        const HandMesh& m = g_handMesh[hand];
+        const HandMesh& m = basketballFlatPalm && g_ballPalmMesh[hand].loaded
+            ? g_ballPalmMesh[hand] : g_handMesh[hand];
         const int base = g_hVc;
         for (const UxrhVertex& v : m.verts) {
             if (g_hVc >= kHandMaxV) break;
-            const float lx = v.pos[0][0] * wO + v.pos[1][0] * wG + v.pos[2][0] * wT + v.pos[3][0] * wB;
-            const float ly = v.pos[0][1] * wO + v.pos[1][1] * wG + v.pos[2][1] * wT + v.pos[3][1] * wB;
-            const float lz = v.pos[0][2] * wO + v.pos[1][2] * wG + v.pos[2][2] * wT + v.pos[3][2] * wB;
-            const float nx = v.nrm[0][0] * wO + v.nrm[1][0] * wG + v.nrm[2][0] * wT + v.nrm[3][0] * wB;
-            const float ny = v.nrm[0][1] * wO + v.nrm[1][1] * wG + v.nrm[2][1] * wT + v.nrm[3][1] * wB;
-            const float nz = v.nrm[0][2] * wO + v.nrm[1][2] * wG + v.nrm[2][2] * wT + v.nrm[3][2] * wB;
+            const auto component = [&](float open, float gripPose,
+                                       float triggerPose, float bothPose) {
+                return open * wO + gripPose * wG +
+                       triggerPose * wT + bothPose * wB;
+            };
+            const float lx = component(v.pos[0][0], v.pos[1][0],
+                                       v.pos[2][0], v.pos[3][0]);
+            const float ly = component(v.pos[0][1], v.pos[1][1],
+                                       v.pos[2][1], v.pos[3][1]);
+            const float lz = component(v.pos[0][2], v.pos[1][2],
+                                       v.pos[2][2], v.pos[3][2]);
+            const float nx = component(v.nrm[0][0], v.nrm[1][0],
+                                       v.nrm[2][0], v.nrm[3][0]);
+            const float ny = component(v.nrm[0][1], v.nrm[1][1],
+                                       v.nrm[2][1], v.nrm[3][1]);
+            const float nz = component(v.nrm[0][2], v.nrm[1][2],
+                                       v.nrm[2][2], v.nrm[3][2]);
             // UXR local axes: X->forward (wrist pulled 5.5cm back), Z->right, Y->-up.
             const XrVector3f wp = vadd(vadd(vadd(pos, vscale(forward, lx - 0.055f)), vscale(right, lz)), vscale(up, -ly));
             const XrVector3f wn = vnorm(vadd(vadd(vscale(forward, nx), vscale(right, nz)), vscale(up, -ny)));
@@ -5837,12 +8851,13 @@ float WristPanelGazeOpacity(const XrPosef& rp, const XrVector3f& centre,
     const float distance = std::sqrt(vdot(toPanel, toPanel));
     if (distance < 0.01f) return 1.0f;
     if (distance >= range) return 0.0f;
+    const float reach = distance <= range - kWristGazeFadeMetres ? 1.0f :
+        (range - distance) / kWristGazeFadeMetres;
+    if (!hud::GazeAutoHideEnabled()) return reach;
     const float facing = vdot(vscale(toPanel, 1.0f / distance), forward);
     if (facing <= kWristGazeGoneCos) return 0.0f;
     const float aim = facing >= kWristGazeFullCos ? 1.0f :
         (facing - kWristGazeGoneCos) / (kWristGazeFullCos - kWristGazeGoneCos);
-    const float reach = distance <= range - kWristGazeFadeMetres ? 1.0f :
-        (range - distance) / kWristGazeFadeMetres;
     return std::min(aim, reach);
 }
 
@@ -6243,14 +9258,15 @@ void DrawHolsterMarkers(const float* mvp) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
-// Parachute brake toggles: two small handles floating at shoulder height while
-// the canopy is open. Orange when free, green while that hand pulls it.
+// Parachute brake toggles: two small handles and their riser straps while the
+// canopy is open. Orange when free, green while that hand pulls it.
 void DrawParachuteToggles(const float* mvp) {
-    float pos[2][3]; bool grabbed[2]; bool visible;
+    float pos[2][3], anchor[2][3]; bool grabbed[2]; bool visible;
     {
         std::lock_guard<std::mutex> lock(g_headPoseMutex);
         visible = g_chuteTogglesVisible;
         std::memcpy(pos, g_chuteTogglePos, sizeof(pos));
+        std::memcpy(anchor, g_chuteAnchorPos, sizeof(anchor));
         std::memcpy(grabbed, g_chuteToggleGrabbed, sizeof(grabbed));
     }
     if (!visible) return;
@@ -6261,6 +9277,51 @@ void DrawParachuteToggles(const float* mvp) {
     glUniformMatrix4fv(g_markerMvpLoc, 1, GL_FALSE, mvp);
     glBindBuffer(GL_ARRAY_BUFFER, g_markerVbo);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_markerEbo);
+
+    // The previous implementation published and drew only the two handles;
+    // there was no strap geometry at all. Draw each riser as a tiny oriented
+    // prism instead of GL_LINES (Adreno is allowed to clamp line width to one
+    // pixel). This is 16 vertices / 24 triangles total and is effectively free.
+    int strapVc = 0, strapIc = 0;
+    for (int m = 0; m < 2; ++m) {
+        const XrVector3f start{pos[m][0], pos[m][1], pos[m][2]};
+        const XrVector3f end{anchor[m][0], anchor[m][1], anchor[m][2]};
+        const XrVector3f direction = vnorm(vsub(end, start));
+        XrVector3f side = vcross(direction, {0.0f, 1.0f, 0.0f});
+        if (vdot(side, side) < 1e-5f)
+            side = vcross(direction, {1.0f, 0.0f, 0.0f});
+        side = vscale(vnorm(side), 0.006f);
+        const XrVector3f depth = vscale(vnorm(vcross(side, direction)), 0.006f);
+        const int base = strapVc;
+        for (int endIndex = 0; endIndex < 2; ++endIndex) {
+            const XrVector3f centre = endIndex == 0 ? start : end;
+            for (int corner = 0; corner < 4; ++corner) {
+                const XrVector3f vertex = vadd(
+                    centre,
+                    vadd(vscale(side, (corner & 1) ? 1.0f : -1.0f),
+                         vscale(depth, (corner & 2) ? 1.0f : -1.0f)));
+                g_markerVerts[strapVc*3+0] = vertex.x;
+                g_markerVerts[strapVc*3+1] = vertex.y;
+                g_markerVerts[strapVc*3+2] = vertex.z;
+                ++strapVc;
+            }
+        }
+        static const unsigned short prism[36] = {
+            0,1,2, 2,1,3, 4,6,5, 5,6,7, 0,4,1, 1,4,5,
+            2,3,6, 6,3,7, 0,2,4, 4,2,6, 1,5,3, 3,5,7};
+        for (unsigned short index : prism)
+            g_markerIdx[strapIc++] = static_cast<unsigned short>(base + index);
+    }
+    glUniform4f(g_markerColLoc, 45/255.0f, 48/255.0f, 52/255.0f, 1.0f);
+    glBufferData(GL_ARRAY_BUFFER, strapVc * 3 * sizeof(float), g_markerVerts,
+                 GL_DYNAMIC_DRAW);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, strapIc * sizeof(unsigned short),
+                 g_markerIdx, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
+                          reinterpret_cast<void*>(0));
+    glDrawElements(GL_TRIANGLES, strapIc, GL_UNSIGNED_SHORT, nullptr);
+
     for (int m = 0; m < 2; ++m) {
         // Slightly elongated vertically: reads as a hanging brake handle.
         const float sx = 0.020f, sy = 0.045f, sz = 0.020f;
@@ -6282,9 +9343,6 @@ void DrawParachuteToggles(const float* mvp) {
                      GL_DYNAMIC_DRAW);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, ic * sizeof(unsigned short),
                      g_markerIdx, GL_DYNAMIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
-                              reinterpret_cast<void*>(0));
         glDrawElements(GL_TRIANGLES, ic, GL_UNSIGNED_SHORT, nullptr);
     }
     glDisableVertexAttribArray(0);
@@ -6293,7 +9351,113 @@ void DrawParachuteToggles(const float* mvp) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
-// qbuild's cabin wheel is procedural because many authored DFFs bake the stock
+// Freefall deploy ring: one closed 12-segment tube plus a short tether. It is
+// deliberately solid triangles (not GL_LINES), so Adreno cannot thin it away.
+void DrawParachuteDeployRing(const float* mvp) {
+    float pos[3]{}, anchor[3]{}, forwardRaw[3]{};
+    bool grabbed = false, visible = false;
+    {
+        std::lock_guard<std::mutex> lock(g_headPoseMutex);
+        visible = g_chuteRingVisible;
+        grabbed = g_chuteRingGrabbed;
+        std::memcpy(pos, g_chuteRingPos, sizeof(pos));
+        std::memcpy(anchor, g_chuteRingAnchor, sizeof(anchor));
+        std::memcpy(forwardRaw, g_chuteRingForward, sizeof(forwardRaw));
+    }
+    if (!visible) return;
+    EnsureMarkerProgram();
+    glUseProgram(g_markerProg);
+    glUniformMatrix4fv(g_markerMvpLoc, 1, GL_FALSE, mvp);
+    glBindBuffer(GL_ARRAY_BUFFER, g_markerVbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_markerEbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
+                          reinterpret_cast<void*>(0));
+
+    const XrVector3f p{pos[0], pos[1], pos[2]};
+    const XrVector3f a{anchor[0], anchor[1], anchor[2]};
+    XrVector3f tether = vnorm(vsub(a, p));
+    XrVector3f side = vcross(tether, {0.0f, 1.0f, 0.0f});
+    if (vdot(side, side) < 1e-5f)
+        side = vcross(tether, {1.0f, 0.0f, 0.0f});
+    side = vscale(vnorm(side), 0.004f);
+    const XrVector3f depth = vscale(vnorm(vcross(side, tether)), 0.004f);
+    int vc = 0, ic = 0;
+    for (int end = 0; end < 2; ++end) {
+        const XrVector3f centre = end ? a : p;
+        for (int corner = 0; corner < 4; ++corner) {
+            const XrVector3f point = vadd(
+                centre, vadd(vscale(side, (corner & 1) ? 1.0f : -1.0f),
+                             vscale(depth, (corner & 2) ? 1.0f : -1.0f)));
+            g_markerVerts[vc*3+0] = point.x;
+            g_markerVerts[vc*3+1] = point.y;
+            g_markerVerts[vc*3+2] = point.z;
+            ++vc;
+        }
+    }
+    static const unsigned short prism[36] = {
+        0,1,2, 2,1,3, 4,6,5, 5,6,7, 0,4,1, 1,4,5,
+        2,3,6, 6,3,7, 0,2,4, 4,2,6, 1,5,3, 3,5,7};
+    for (unsigned short index : prism) g_markerIdx[ic++] = index;
+    glUniform4f(g_markerColLoc, 55/255.0f, 58/255.0f, 62/255.0f, 1.0f);
+    glBufferData(GL_ARRAY_BUFFER, vc * 3 * sizeof(float), g_markerVerts,
+                 GL_DYNAMIC_DRAW);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, ic * sizeof(unsigned short),
+                 g_markerIdx, GL_DYNAMIC_DRAW);
+    glDrawElements(GL_TRIANGLES, ic, GL_UNSIGNED_SHORT, nullptr);
+
+    XrVector3f normal = vnorm({forwardRaw[0], forwardRaw[1], forwardRaw[2]});
+    XrVector3f up{0.0f, 1.0f, 0.0f};
+    XrVector3f right = vnorm(vcross(up, normal));
+    if (vdot(right, right) < 0.5f) right = {1.0f, 0.0f, 0.0f};
+    up = vnorm(vcross(normal, right));
+    constexpr int segments = 12;
+    constexpr float radius = 0.055f;
+    constexpr float tube = 0.009f;
+    vc = 0; ic = 0;
+    for (int segment = 0; segment < segments; ++segment) {
+        const float angle = static_cast<float>(segment) *
+            (2.0f * 3.14159265358979323846f / segments);
+        const XrVector3f radial = vadd(vscale(right, std::cos(angle)),
+                                      vscale(up, std::sin(angle)));
+        const XrVector3f centre = vadd(p, vscale(radial, radius));
+        for (int corner = 0; corner < 4; ++corner) {
+            const XrVector3f point = vadd(
+                centre, vadd(vscale(radial, (corner & 1) ? tube : -tube),
+                             vscale(normal, (corner & 2) ? tube : -tube)));
+            g_markerVerts[vc*3+0] = point.x;
+            g_markerVerts[vc*3+1] = point.y;
+            g_markerVerts[vc*3+2] = point.z;
+            ++vc;
+        }
+    }
+    for (int segment = 0; segment < segments; ++segment) {
+        const int next = (segment + 1) % segments;
+        for (int sideIndex = 0; sideIndex < 4; ++sideIndex) {
+            const unsigned short a0 = static_cast<unsigned short>(segment*4 + sideIndex);
+            const unsigned short a1 = static_cast<unsigned short>(segment*4 + (sideIndex+1)%4);
+            const unsigned short b0 = static_cast<unsigned short>(next*4 + sideIndex);
+            const unsigned short b1 = static_cast<unsigned short>(next*4 + (sideIndex+1)%4);
+            g_markerIdx[ic++] = a0; g_markerIdx[ic++] = b0; g_markerIdx[ic++] = a1;
+            g_markerIdx[ic++] = a1; g_markerIdx[ic++] = b0; g_markerIdx[ic++] = b1;
+        }
+    }
+    if (grabbed)
+        glUniform4f(g_markerColLoc, 90/255.0f, 230/255.0f, 110/255.0f, 1.0f);
+    else
+        glUniform4f(g_markerColLoc, 245/255.0f, 160/255.0f, 40/255.0f, 1.0f);
+    glBufferData(GL_ARRAY_BUFFER, vc * 3 * sizeof(float), g_markerVerts,
+                 GL_DYNAMIC_DRAW);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, ic * sizeof(unsigned short),
+                 g_markerIdx, GL_DYNAMIC_DRAW);
+    glDrawElements(GL_TRIANGLES, ic, GL_UNSIGNED_SHORT, nullptr);
+    glDisableVertexAttribArray(0);
+    glUseProgram(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
+// reference Quest build's cabin wheel is procedural because many authored DFFs bake the stock
 // wheel into chassis_hi.  Draw the calibrated VR wheel from the exact same two
 // sockets used by the grab solver and snapped hands, so all three always share
 // one centre, radius and physical angle.
@@ -6719,9 +9883,8 @@ void DrawWeaponLaser(const float* mvp, const LaserRay& ray) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
-// A short-lived, depth-tested VR streak. It deliberately keeps the prior long
-// custom tracer's readability, but uses a soft amber glow plus a narrow white
-// core instead of an opaque yellow box that looked like a second laser.
+// Vice City-style depth-tested smoke streak: it thickens as the white trace
+// fades, instead of reading as a second amber laser.
 void DrawBulletTracers(const float* mvp, XrVector3f eyePosition,
                        const BulletTracer* tracers, int count) {
     if (!tracers || count <= 0) return;
@@ -6761,14 +9924,14 @@ void DrawBulletTracers(const float* mvp, XrVector3f eyePosition,
             side = vcross(direction, {1.0f, 0.0f, 0.0f});
         side = vnorm(side);
 
-        const float age = static_cast<float>(now - tracer.bornNs) /
-                          static_cast<float>(tracer.expiresNs - tracer.bornNs);
-        const float remaining = 1.0f - std::clamp(age, 0.0f, 1.0f);
-        // Hold the full ray briefly, then fade quickly. This remains readable at
-        // Quest resolution while still looking like a gunshot flash, not a laser.
-        const float fade = remaining * remaining;
-        const float widths[2] = {0.022f, 0.006f};
-        const float alphas[2] = {0.42f * fade, 0.95f * fade};
+        const float age = std::clamp(
+            static_cast<float>(now - tracer.bornNs) /
+                static_cast<float>(tracer.expiresNs - tracer.bornNs),
+            0.0f, 1.0f);
+        const float fade = tracer.visibility * (1.0f - age);
+        const float half = std::max(0.010f, tracer.maxThickness * age);
+        const float widths[2] = {half, std::max(0.006f, half * 0.30f)};
+        const float alphas[2] = {0.40f * fade, 0.95f * fade};
         for (int layer = 0; layer < 2; ++layer) {
             const XrVector3f offset = vscale(side, widths[layer]);
             const XrVector3f p[4] = {
@@ -6781,10 +9944,7 @@ void DrawBulletTracers(const float* mvp, XrVector3f eyePosition,
                 verts[i * 3 + 1] = p[i].y;
                 verts[i * 3 + 2] = p[i].z;
             }
-            if (layer == 0)
-                glUniform4f(g_markerColLoc, 1.0f, 0.68f, 0.18f, alphas[layer]);
-            else
-                glUniform4f(g_markerColLoc, 1.0f, 0.96f, 0.72f, alphas[layer]);
+            glUniform4f(g_markerColLoc, 1.0f, 1.0f, 1.0f, alphas[layer]);
             glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
         }
@@ -6926,6 +10086,12 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
                      const TwoHandVisualState& bakedTwoHand,
                      unsigned int hudSourceTex) {
     const bool trackedVisuals = !scope.active && drivingWheel.trackedHandsEnabled;
+    bool chuteVisuals = false, chuteRingVisual = false;
+    {
+        std::lock_guard<std::mutex> lock(g_headPoseMutex);
+        chuteVisuals = g_chuteTogglesVisible;
+        chuteRingVisual = g_chuteRingVisible;
+    }
     const bool haveHands = trackedVisuals &&
                            g_hVc > 0 && g_hIc > 0 && g_handTex != 0;
     // Wrist HUD panels ride the visible wrists on foot, and the steering-
@@ -6947,6 +10113,7 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
         (!trackedVisuals || !drivingWheel.active) &&
         (!trackedVisuals || (throwableTrajectory[0].count <= 1 &&
                              throwableTrajectory[1].count <= 1)) &&
+        !chuteVisuals && !chuteRingVisual &&
         !wristWanted &&
         tracerCount <= 0 && objectiveMarkerCount <= 0) return;
     if (haveHands) EnsureHandProgram();
@@ -7072,7 +10239,7 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_TRUE);
     glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
 
-    // qbuild order: the virtual cabin control is world-depth tested first, then
+    // reference Quest build order: the virtual cabin control is world-depth tested first, then
     // the closed hands are drawn over it at the exact animated rim sockets.
     if (trackedVisuals && drivingWheel.active)
         DrawImmersiveDrivingWheel(mvp, drivingWheel);
@@ -7111,11 +10278,17 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
 
     if (trackedVisuals) {
         DrawHolsterMarkers(mvp);   // cyan cubes at the holster anchors (shares this depth pass)
-        DrawParachuteToggles(mvp); // canopy brake handles while parachuting
         DrawWeaponLaser(mvp, laser); // calibrated red beam, occluded by world + weapon
         DrawWeaponForEye(mvp);     // active weapon mesh pinned to the hand (Stage 1)
         DrawThrowableTrajectories(mvp, throwableTrajectory);
     }
+    // Riser controls are their own world-space interaction. They must remain
+    // visible even when the selected hand preset hides general tracked-hand
+    // overlays; otherwise the player has no handle to grab under the canopy.
+    if (chuteVisuals)
+        DrawParachuteToggles(mvp);
+    if (chuteRingVisual)
+        DrawParachuteDeployRing(mvp);
     DrawBulletTracers(mvp, eyePos, tracers, tracerCount); // original-SA short streak, same stereo depth
     // IMMERSIVE preset: radar + status crops worn on the wrists (or the
     // dashboard while driving), same baked poses as the hand meshes, same
@@ -7134,6 +10307,104 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
     if (!logged) { LOGI("[hands] mesh drawn %d verts %d idx", g_hVc, g_hIc); logged = true; }
 }
 
+// A repeated game sequence already exists in the OpenXR eye swapchains.  Core
+// OpenXR explicitly allows xrEndFrame to reference a swapchain without another
+// acquire/release in the current frame; the runtime uses its most recently
+// released image.  Keeping the last accepted pair lets a repeat avoid reading
+// the RenderWare ring again and, critically, avoids extending that source
+// slot's GPU lease with another fence.
+struct StereoRepeatProjectionCache {
+    bool valid{};
+    std::uint64_t epoch{};
+    int sequence{-1};
+    XrSession session{XR_NULL_HANDLE};
+    XrSpace space{XR_NULL_HANDLE};
+    XrSwapchain swapchains[2]{XR_NULL_HANDLE, XR_NULL_HANDLE};
+    XrCompositionLayerProjectionView views[2]{
+        {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+        {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+};
+
+StereoRepeatProjectionCache g_stereoRepeatProjectionCache{};
+bool g_zeroCopyRepeatDisabledUntilRestart = false;
+bool g_zeroCopyRepeatDisableLogged = false;
+
+void InvalidateStereoRepeatProjectionCache() {
+    g_stereoRepeatProjectionCache = {};
+}
+
+void ResetStereoRepeatProjectionTimingState() {
+    InvalidateStereoRepeatProjectionCache();
+}
+
+void DisableStereoRepeatProjectionUntilRestart(XrResult result) {
+    InvalidateStereoRepeatProjectionCache();
+    g_zeroCopyRepeatDisabledUntilRestart = true;
+    if (!g_zeroCopyRepeatDisableLogged) {
+        LOGE("[stereo.repeat] zero-copy disabled until process restart after xrEndFrame=%d",
+             static_cast<int>(result));
+        g_zeroCopyRepeatDisableLogged = true;
+    }
+}
+
+bool BuildCachedStereoEyeProjection(
+        XrCompositionLayerProjection& layer,
+        XrCompositionLayerProjectionView views[2],
+        int requestedSequence, std::uint64_t epoch,
+        double sequenceAgeMs, int& submittedSequence,
+        double& submittedSequenceAgeMs,
+        perf::StereoProjectionOutcome& outcome) {
+    const auto& cache = g_stereoRepeatProjectionCache;
+    if (g_zeroCopyRepeatDisabledUntilRestart || !cache.valid ||
+        requestedSequence < 0 || requestedSequence != cache.sequence ||
+        epoch != cache.epoch || cache.session != s.session ||
+        cache.space != s.space || s.swapchains.size() < 2 ||
+        s.swapchains[0].poisoned || s.swapchains[1].poisoned ||
+        cache.swapchains[0] != s.swapchains[0].handle ||
+        cache.swapchains[1] != s.swapchains[1].handle) {
+        return false;
+    }
+
+    views[0] = cache.views[0];
+    views[1] = cache.views[1];
+    // The cached views are values only.  Never retain or restore an extension
+    // pointer whose lifetime belonged to an earlier frame's stack.
+    views[0].next = nullptr;
+    views[1].next = nullptr;
+    layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    layer.space = cache.space;
+    layer.viewCount = 2;
+    layer.views = views;
+    submittedSequence = requestedSequence;
+    submittedSequenceAgeMs = sequenceAgeMs;
+    outcome = perf::StereoProjectionOutcome::Submitted;
+    return true;
+}
+
+void CommitStereoRepeatProjectionCache(
+        int sequence, std::uint64_t epoch,
+        const XrCompositionLayerProjectionView views[2]) {
+    if (sequence < 0 || s.session == XR_NULL_HANDLE ||
+        s.space == XR_NULL_HANDLE || s.swapchains.size() < 2 ||
+        s.swapchains[0].poisoned || s.swapchains[1].poisoned) {
+        InvalidateStereoRepeatProjectionCache();
+        return;
+    }
+
+    StereoRepeatProjectionCache next{};
+    next.valid = true;
+    next.epoch = epoch;
+    next.sequence = sequence;
+    next.session = s.session;
+    next.space = s.space;
+    for (int eye = 0; eye < 2; ++eye) {
+        next.swapchains[eye] = s.swapchains[eye].handle;
+        next.views[eye] = views[eye];
+        next.views[eye].next = nullptr;
+    }
+    g_stereoRepeatProjectionCache = next;
+}
+
 // True per-eye stereo present: blit each eye's game-rendered texture into that
 // eye's swapchain and describe it as a world-locked PROJECTION view carrying the
 // exact pose+frustum the eye was rendered at. Because it is a projection layer in
@@ -7143,34 +10414,61 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
 // depth swim. Fills `layer` (a projection layer) and its two `views`.
 bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
                                XrCompositionLayerProjectionView views[2],
+                               int requestedSequence,
                                int& submittedSequence,
                                bool& generationRace,
                                double& submittedSequenceAgeMs,
+                               perf::StereoProjectionOutcome& outcome,
+                               unsigned int& eyeReleaseFailureMask,
                                FxaaFrameStats& fxaaStats) {
-    if (s.swapchains.size() < 2) return false;
-
-    // Sample ONE ring set for both eyes so the pair is always temporally matched.
-    int seq = -1;
-    const int set = StereoReadSet(seq);
-    if (set < 0) return false;
-    const int expectedGeneration = seq - kStereoReadLag;
-    if (g_stereoGeneration[set].load(std::memory_order_acquire) !=
-        expectedGeneration) {
-        generationRace = true;
+    BeginXrStageProfilerFrame();
+    // From the first acquire onward, a partial left/right failure can change the
+    // runtime's implicit image for only one eye.  Retire the old pair before any
+    // such transaction and restore a cache only after both releases and a
+    // successful xrEndFrame.
+    InvalidateStereoRepeatProjectionCache();
+    outcome = perf::StereoProjectionOutcome::NotAttempted;
+    eyeReleaseFailureMask = 0;
+    if (s.swapchains.size() < 2) {
+        outcome = perf::StereoProjectionOutcome::NoSwapchains;
         return false;
     }
-    const std::uint64_t publishedNs =
-        g_stereoPublishedNs[set].load(std::memory_order_relaxed);
-    const std::uint64_t sampledNs = MonotonicNowNs();
-    if (publishedNs > 0 && sampledNs >= publishedNs) {
-        submittedSequenceAgeMs =
-            static_cast<double>(sampledNs - publishedNs) / 1e6;
+    if (s.swapchains[0].poisoned || s.swapchains[1].poisoned) {
+        outcome = perf::StereoProjectionOutcome::NoSwapchains;
+        return false;
     }
-    // These relaxed metadata loads are ordered by StereoReadSet's acquire of the
-    // sequence published last by SetStereoEyeTextures.
-    const int ew = g_stereoEyeW.load(std::memory_order_relaxed);
-    const int eh = g_stereoEyeH.load(std::memory_order_relaxed);
-    if (ew <= 0 || eh <= 0) return false;
+
+    // Use the sequence selected by the liveness gate for both eyes and pin its
+    // ring slot until both swapchain copies have completed. A wrapping producer
+    // must fail its write claim instead of changing either source underneath us.
+    StereoCandidate candidate{};
+    StereoReadLease readLease;
+    if (!LeaseStereoCandidate(requestedSequence, candidate, readLease, outcome,
+                              generationRace)) {
+        return false;
+    }
+    ScopedStereoGpuRead gpuRead(readLease);
+    const int set = candidate.set;
+    const int expectedGeneration = candidate.sequence;
+    if (!WaitStereoProducerFenceForCandidate(set, expectedGeneration)) {
+        // The direct-stereo producer published metadata before RenderQueue
+        // reached command 46. Repeat the last safe projection instead of ever
+        // sampling an incompletely submitted generation.
+        outcome = perf::StereoProjectionOutcome::NoSafePair;
+        return false;
+    }
+    if (candidate.ageMs > kStereoHardMaxAgeMs) {
+        outcome = perf::StereoProjectionOutcome::StaleRejected;
+        return false;
+    }
+    // These relaxed metadata loads are ordered by ProbeStereoCandidate's acquire
+    // of the generation published last by SetStereoEyeTextures.
+    const int ew = g_stereoEyeW[set].load(std::memory_order_relaxed);
+    const int eh = g_stereoEyeH[set].load(std::memory_order_relaxed);
+    if (ew <= 0 || eh <= 0) {
+        outcome = perf::StereoProjectionOutcome::BadDimensions;
+        return false;
+    }
     const float underWaterness = std::clamp(
         g_stereoUnderWaterness[set].load(std::memory_order_relaxed),
         0.0f, 1.0f);
@@ -7185,6 +10483,7 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
     TwoHandVisualState bakedTwoHand{};
     scopeaim::VisualState bakedScope{};
     driving::WheelVisualState drivingWheel{};
+    BallHandLock ballHandLock{};
     MobileColorState mobileColor{};
     ThrowableTrajectory throwableTrajectory[2]{};
     unsigned int bakedWeaponHandMask = 0;
@@ -7199,6 +10498,7 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
         bakedTwoHand   = g_stereoTwoHandVisualState[set];
         bakedScope     = g_stereoScopeState[set];
         drivingWheel   = g_stereoDrivingWheelState[set];
+        ballHandLock   = g_stereoBallHandLock[set];
         mobileColor    = g_stereoMobileColor[set];
         throwableTrajectory[0] = g_stereoThrowableTrajectory[set][0];
         throwableTrajectory[1] = g_stereoThrowableTrajectory[set][1];
@@ -7209,10 +10509,14 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
     // A projection layer MUST carry the pose its pixels were rendered at, or the
     // reprojection is wrong (this was the old "projection layer trembles" bug).
     // Until we have one, fall back to the theater screen rather than guess.
-    if (!haveRenderPose) return false;
+    if (!haveRenderPose) {
+        outcome = perf::StereoProjectionOutcome::MissingPose;
+        return false;
+    }
 
     if (!bakedScope.active) {
-        BuildHandMeshes(bakedHands, bakedTwoHand, drivingWheel); // same ring pose + cockpit/support correction
+        BuildHandMeshes(bakedHands, bakedTwoHand, drivingWheel,
+                        ballHandLock); // same ring pose + cockpit/support correction
         BuildWeaponMesh(bakedHands);   // (weapon-mesh path; dead until Approach-B geometry exists)
     }
     BulletTracer liveTracers[kMaxBulletTracers]{};
@@ -7259,20 +10563,46 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
         Swapchain& chain = s.swapchains[e];
         uint32_t idx = 0;
         XrSwapchainImageAcquireInfo acq{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        if (!Check(xrAcquireSwapchainImage(chain.handle, &acq, &idx), "acquire(eye)")) { ok = false; break; }
-        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-        wait.timeout = XR_INFINITE_DURATION;
-        if (!Check(xrWaitSwapchainImage(chain.handle, &wait), "wait(eye)")) {
-            XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            xrReleaseSwapchainImage(chain.handle, &rel); ok = false; break;
+        const double acquireWallStartMs = XrStageNowMs();
+        const double acquireCpuStartMs = perf::ThreadCpuMs();
+        const XrResult acquired =
+            xrAcquireSwapchainImage(chain.handle, &acq, &idx);
+        RecordXrCpuStage(e, XrCpuStage::Acquire, acquireWallStartMs,
+                         acquireCpuStartMs);
+        if (!Check(acquired, "acquire(eye)")) {
+            outcome = e == 0 ? perf::StereoProjectionOutcome::AcquireLeft
+                             : perf::StereoProjectionOutcome::AcquireRight;
+            ok = false;
+            break;
+        }
+        const double waitWallStartMs = XrStageNowMs();
+        const double waitCpuStartMs = perf::ThreadCpuMs();
+        const bool swapchainReady = WaitSwapchainImageReady(
+            chain, e == 0 ? "eye-left" : "eye-right", "wait(eye)");
+        RecordXrCpuStage(e, XrCpuStage::Wait, waitWallStartMs,
+                         waitCpuStartMs);
+        if (!swapchainReady) {
+            outcome = e == 0 ? perf::StereoProjectionOutcome::WaitLeft
+                             : perf::StereoProjectionOutcome::WaitRight;
+            ok = false;
+            break;
         }
 
+        const double copyWallStartMs = XrStageNowMs();
+        const double copyCpuStartMs = perf::ThreadCpuMs();
+        const bool copyGpuTimer = BeginXrGpuStage(
+            e == 0 ? XrGpuStage::CopyLeft : XrGpuStage::CopyRight);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s.framebuffer);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                chain.images[idx].image, 0);
         if (g_swapchainSrgb) glDisable(GL_FRAMEBUFFER_SRGB_EXT);  // raw copy + display-referred late overlays
         const GLuint sourceTexture =
             g_stereoEyeTex[set][e].load(std::memory_order_relaxed);
+        ConfigureRenderWareEyeFoveation(set, e, sourceTexture);
+        // Every path below may queue reads from the colour, depth or HUD texture
+        // belonging to this slot. The scope guard transfers the CPU lease to a
+        // GPU fence on every return path after this point.
+        gpuRead.MarkIssued();
         const bool usedFxaa = fxaaStats.requested &&
             DrawEyeFxaa(sourceTexture, ew, eh, chain.width, chain.height,
                         underWaterness, waterDepth, mobileColor,
@@ -7294,6 +10624,13 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
             glBlitFramebuffer(0, 0, ew, eh, 0, 0, chain.width, chain.height,
                               GL_COLOR_BUFFER_BIT, GL_LINEAR);
         }
+        EndXrGpuStage(copyGpuTimer);
+        RecordXrCpuStage(e, XrCpuStage::CopySubmit, copyWallStartMs,
+                         copyCpuStartMs);
+        const double overlayWallStartMs = XrStageNowMs();
+        const double overlayCpuStartMs = perf::ThreadCpuMs();
+        const bool overlayGpuTimer = BeginXrGpuStage(
+            e == 0 ? XrGpuStage::OverlayLeft : XrGpuStage::OverlayRight);
         // Mission/tutorial text is an independent immersive layer. Disabling
         // CLASSIC hides phone-HUD crops, not text or calibration samples.
         if (hudSource)
@@ -7310,12 +10647,60 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
             liveObjectiveMarkers, liveObjectiveMarkerCount,
             bakedScope, drivingWheel,
             throwableTrajectory, bakedHands, bakedTwoHand, hudSource);
-        DrawScopeOverlay(chain.width, chain.height, bakedScope);
         glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        // The second eye above is the final consumer of this ring slot's colour,
+        // depth and HUD textures. Validate the generation while the CPU lease
+        // still prevents producer reuse, then transfer that lease to the GPU
+        // completion path. The producer may reclaim the slot while the remaining
+        // source-independent scope overlay, OpenXR release and GL-state restore
+        // finish, but never before the last shared-texture sample completes.
+        if (e == 1) {
+            StereoCandidate completedCandidate{};
+            perf::StereoProjectionOutcome completedFailure =
+                perf::StereoProjectionOutcome::GenerationPost;
+            bool completedRace = false;
+            if (!ProbeStereoCandidate(expectedGeneration, completedCandidate,
+                                      completedFailure, completedRace)) {
+                generationRace = generationRace || completedRace;
+                outcome = completedRace
+                    ? perf::StereoProjectionOutcome::GenerationPost
+                    : completedFailure;
+                ok = false;
+            } else if (completedCandidate.ageMs > kStereoHardMaxAgeMs) {
+                outcome = perf::StereoProjectionOutcome::StaleRejected;
+                ok = false;
+            } else {
+                submittedSequenceAgeMs = completedCandidate.ageMs;
+            }
+            if (gpuRead.PinNow()) {
+                static bool loggedEarlySourceReadClose = false;
+                if (!loggedEarlySourceReadClose) {
+                    loggedEarlySourceReadClose = true;
+                    LOGI("[stereo.ring] source-read lifetime closed at final eye sample");
+                }
+            }
+        }
+        DrawScopeOverlay(chain.width, chain.height, bakedScope);
+        EndXrGpuStage(overlayGpuTimer);
+        RecordXrCpuStage(e, XrCpuStage::OverlaySubmit, overlayWallStartMs,
+                         overlayCpuStartMs);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
 
         XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(chain.handle, &rel);
+        const double releaseWallStartMs = XrStageNowMs();
+        const double releaseCpuStartMs = perf::ThreadCpuMs();
+        const XrResult released = xrReleaseSwapchainImage(chain.handle, &rel);
+        RecordXrCpuStage(e, XrCpuStage::Release, releaseWallStartMs,
+                         releaseCpuStartMs);
+        if (!Check(released, "release(eye)")) {
+            eyeReleaseFailureMask |= 1u << e;
+            PoisonSwapchain(chain, e == 0 ? "eye-left" : "eye-right",
+                            "release");
+            outcome = e == 0 ? perf::StereoProjectionOutcome::ReleaseLeft
+                             : perf::StereoProjectionOutcome::ReleaseRight;
+            ok = false;
+            break;
+        }
 
         // Describe this eye as a projection view: the exact eye pose (head pose
         // shifted along its right axis by half the IPD, in LOCAL space) and the
@@ -7367,13 +10752,7 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
         else                 glDisable(GL_FRAMEBUFFER_SRGB_EXT);
     }
 
-    if (g_stereoGeneration[set].load(std::memory_order_acquire) !=
-        expectedGeneration) {
-        generationRace = true;
-        return false;
-    }
     if (!ok) return false;
-
     // One world-locked projection layer holding both eye views. LOCAL space + the
     // true render pose per view = the compositor reprojects render->scan-out.
     layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -7381,10 +10760,14 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
     layer.viewCount = 2;
     layer.views     = views;
     submittedSequence = expectedGeneration;
+    outcome = perf::StereoProjectionOutcome::Submitted;
     return true;
 }
 
 void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
+    // RenderFrame always runs with the XR context current. Retire last frame's
+    // source-read fences before the producer wraps the triple buffer again.
+    RetireCompletedStereoReads();
     if (s.session == XR_NULL_HANDLE) {
         return;
     }
@@ -7392,6 +10775,7 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
 
     PollEvents();
     if (!s.running) {
+        InvalidateStereoRepeatProjectionCache();
         // STOPPING/IDLE has no xrWaitFrame to pace the present thread. Without
         // an explicit wait this loop calls updateTexImage/JNI hundreds of
         // thousands of times per second while Horizon is trying to resume the
@@ -7415,10 +10799,38 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
     static long long s_lastEnter = 0;
     static long long sPredLast = 0;
     static int sLastSubmittedStereoSequence = -1;
+    static int sConsecutiveStereoRepeats = 0;
+    static perf::StereoLivenessState sStereoLiveness =
+        perf::StereoLivenessState::Live;
+    static int sStaleBaselineSequence = -1;
+    static int sRecoveryLastSequence = -1;
+    static int sRecoveryProgress = 0;
+    static bool sLastTheaterMode = true;
     if (g_resetPresentTiming) {
         s_lastEnter = 0;
         sPredLast = 0;
         sLastSubmittedStereoSequence = -1;
+#if defined(SAVR_EXPERIMENTAL_BACKPRESSURE)
+        if (StereoBackpressureRequested()) {
+            g_stereoBackpressure.lastSubmittedSequence.store(
+                -1, std::memory_order_relaxed);
+            g_stereoBackpressure.lastSubmittedNs.store(
+                0, std::memory_order_release);
+        }
+#endif
+        sConsecutiveStereoRepeats = 0;
+        sStereoLiveness = perf::StereoLivenessState::Live;
+        sStaleBaselineSequence = -1;
+        sRecoveryLastSequence = -1;
+        sRecoveryProgress = 0;
+        sLastTheaterMode = true;
+        // READY after a pause can reuse the same XrSession handle.  Clear only
+        // cached images here; a runtime rejection latch remains fail-closed
+        // until the process creates all XR state from scratch again.
+        ResetStereoRepeatProjectionTimingState();
+        ResetStereoPhaseFeedback();
+        g_directStereoProjectionHealthy.store(false,
+                                               std::memory_order_release);
         g_resetPresentTiming = false;
     }
     const long long tEnter = nowNs();
@@ -7429,12 +10841,21 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
     XrFrameState    frameState{XR_TYPE_FRAME_STATE};
     const long long tWaitStart = nowNs();
     if (!Check(xrWaitFrame(s.session, &waitInfo, &frameState), "xrWaitFrame")) {
+        ResetStereoPhaseFeedback();
         return;
     }
     const long long tWaitEnd = nowNs();
+    // The entry poll happens immediately after the previous frame queued its
+    // source-read fence, so that fence is normally still unsignalled. xrWaitFrame
+    // then sleeps for almost a display period while the producer approaches the
+    // same triple-buffer slot. Poll again after the paced wait: this releases a
+    // completed GPU lease before GameThread wraps the ring, without ever waiting
+    // or weakening the writer/read exclusion when the GPU is genuinely late.
+    RetireCompletedStereoReads();
 
     XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
     if (!Check(xrBeginFrame(s.session, &beginInfo), "xrBeginFrame")) {
+        ResetStereoPhaseFeedback();
         return;
     }
 
@@ -7479,6 +10900,19 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
     // thread owns that judgement — it can see the player, the menu and the
     // cutscene manager — so we just follow its call here.
     s.theaterMode = !vrcam::IsStereoActive();
+    if (s.theaterMode != sLastTheaterMode) {
+        // A theater/gameplay edge is a new producer epoch. Do not let a sequence
+        // or stale streak from the previous path poison the next one.
+        sLastSubmittedStereoSequence = -1;
+        sConsecutiveStereoRepeats = 0;
+        sStereoLiveness = perf::StereoLivenessState::Live;
+        sStaleBaselineSequence = -1;
+        sRecoveryLastSequence = -1;
+        sRecoveryProgress = 0;
+        InvalidateStereoRepeatProjectionCache();
+        ResetStereoPhaseFeedback();
+        sLastTheaterMode = s.theaterMode;
+    }
     {
         static int pn = 0;
         if ((++pn % 180) == 1) {
@@ -7501,6 +10935,22 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
     int submittedStereoSequence = -1;
     bool stereoGenerationRace = false;
     double submittedStereoSequenceAgeMs = 0.0;
+    double candidateStereoSequenceAgeMs = 0.0;
+    perf::StereoProjectionOutcome stereoProjectionOutcome =
+        perf::StereoProjectionOutcome::NotAttempted;
+    perf::StereoFallbackSource stereoFallbackSource =
+        perf::StereoFallbackSource::None;
+    bool staleStereoRejected = false;
+    unsigned int eyeReleaseFailureMask = 0;
+    int projectedRepeatCount = 0;
+    bool projectedFromRecovery = false;
+    bool selectedStereoRepeat = false;
+    bool zeroCopyRepeat = false;
+    bool repeatCopyFallback = false;
+    bool projectionLayerSubmitted = false;
+    bool projectionFullCopy = false;
+    std::uint64_t projectionEpoch = 0;
+    int telemetryRecoveryProgress = 0;
     StereoSyncWaitResult stereoSyncWait{};
     FxaaFrameStats fxaaStats{};
     fxaaStats.requested = FxaaRequested();
@@ -7527,6 +10977,25 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
             (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
 
         if (posesValid) {
+            // Quest can advertise XR_KHR_visibility_mask yet return an empty
+            // successful mesh during xrBeginSession and the immediate FOCUSED
+            // transition. Retry only after xrLocateViews has produced physical
+            // stereo views; this is the first point at which the runtime has a
+            // fully materialized view configuration. Keep the retry bounded and
+            // sparse so an unsupported runtime adds no steady per-frame work.
+            static unsigned int sPostLocateMaskFrames = 0;
+            static unsigned int sPostLocateMaskRetries = 0;
+            constexpr unsigned int kPostLocateMaskRetryLimit = 8;
+            constexpr unsigned int kPostLocateMaskRetryPeriod = 30;
+            if (!g_hiddenAreaMasksReady.load(std::memory_order_acquire) &&
+                sPostLocateMaskRetries < kPostLocateMaskRetryLimit &&
+                (sPostLocateMaskFrames++ % kPostLocateMaskRetryPeriod) == 0u) {
+                ++sPostLocateMaskRetries;
+                LOGI("[stereo.mask] post-locate retry=%u/%u views=%u",
+                     sPostLocateMaskRetries, kPostLocateMaskRetryLimit,
+                     viewCount);
+                LoadHiddenAreaMasks();
+            }
             const XrPosef& l = s.views[0].pose;
             const XrPosef& r = s.views[viewCount > 1 ? 1 : 0].pose;
             XrPosef centre = l;
@@ -7574,29 +11043,187 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
         g_handPose[1] = hp[1];
     }
 
-    // Present the game frame on a screen quad. Menus: a world-locked cinema
-    // screen. Gameplay: a HEAD-LOCKED screen that fills the view — rigid to the
-    // head, so it never trembles during head rotation (the old projection layer
-    // did, because its reprojection frame did not match the game camera). The
-    // view simply lags smoothly instead.
+    // Menus/cutscenes use the trusted flat SurfaceTexture. Gameplay normally
+    // submits a world projection, with a short repeat grace for producer phase
+    // jitter. A dead producer is never allowed to leave an arbitrarily old world
+    // in the compositor: after the grace window we hold a stable neutral black
+    // view until two distinct fresh pairs prove that production has recovered.
+    if (frameState.shouldRender != XR_TRUE) {
+        g_directStereoProjectionHealthy.store(false,
+                                               std::memory_order_release);
+    }
     if (frameState.shouldRender == XR_TRUE) {
-        if (!s.theaterMode) {
+        if (!s.theaterMode &&
+            (sStereoLiveness == perf::StereoLivenessState::Live ||
+             sStereoLiveness == perf::StereoLivenessState::Grace)) {
             stereoSyncWait =
                 WaitForFreshStereoPair(sLastSubmittedStereoSequence);
         }
-        int gateSeq = -1;
-        const bool haveStereo = !s.theaterMode && StereoReadSet(gateSeq) >= 0;
-        if (haveStereo && RenderStereoEyeProjection(
-                eyeProjection, eyeViews, submittedStereoSequence,
-                stereoGenerationRace, submittedStereoSequenceAgeMs,
-                fxaaStats)) {
-            layers[0]  = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&eyeProjection);
-            layerCount = 1;
-        } else {
-            const XrSpace presentSpace = s.theaterMode ? s.space : s.viewSpace;
-            if (RenderTheaterQuad(presentSpace, theaterQuad, !s.theaterMode)) {
-                layers[0]  = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&theaterQuad);
+        if (s.theaterMode) {
+            g_directStereoProjectionHealthy.store(false,
+                                                   std::memory_order_release);
+            if (RenderTheaterQuad(s.space, theaterQuad, false,
+                                  TheaterFrameSource::GameSurface)) {
+                layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(
+                    &theaterQuad);
                 layerCount = 1;
+                stereoFallbackSource = perf::StereoFallbackSource::GameSurface;
+            } else {
+                stereoFallbackSource = perf::StereoFallbackSource::Failed;
+            }
+        } else {
+            const std::uint64_t candidateEpoch =
+                g_stereoResetEpoch.load(std::memory_order_acquire);
+            if (g_stereoRepeatProjectionCache.valid &&
+                g_stereoRepeatProjectionCache.epoch != candidateEpoch) {
+                InvalidateStereoRepeatProjectionCache();
+            }
+            const int newest = g_stereoSeq.load(std::memory_order_acquire);
+            if (newest < kStereoReadLag ||
+                (sLastSubmittedStereoSequence >= 0 &&
+                 newest - kStereoReadLag < sLastSubmittedStereoSequence)) {
+                // ResetStereoEyeTextures starts a new epoch at -1. Treat it as
+                // warm-up rather than waiting forever for a sequence larger than
+                // the previous ring's final value.
+                sLastSubmittedStereoSequence = -1;
+                sConsecutiveStereoRepeats = 0;
+                sStereoLiveness = perf::StereoLivenessState::Live;
+                sStaleBaselineSequence = -1;
+                sRecoveryLastSequence = -1;
+                sRecoveryProgress = 0;
+            }
+
+            StereoCandidate candidate{};
+            perf::StereoProjectionOutcome probeFailure =
+                perf::StereoProjectionOutcome::NoSafePair;
+            bool haveCandidate = ProbeLatestStereoCandidate(
+                candidate, probeFailure, stereoGenerationRace);
+            // If the writer has just begun wrapping the newest safe slot, the
+            // last successfully submitted generation may still be intact. Reuse
+            // that validated pair inside the normal grace window instead of
+            // flashing a different presentation path for a one-frame race.
+            if (!haveCandidate && sLastSubmittedStereoSequence >= 0 &&
+                (sStereoLiveness == perf::StereoLivenessState::Live ||
+                 sStereoLiveness == perf::StereoLivenessState::Grace)) {
+                perf::StereoProjectionOutcome previousFailure = probeFailure;
+                StereoCandidate previous{};
+                if (ProbeStereoCandidate(sLastSubmittedStereoSequence, previous,
+                                         previousFailure,
+                                         stereoGenerationRace)) {
+                    candidate = previous;
+                    haveCandidate = true;
+                }
+            }
+            // A reset can close the publication epoch while the probe is in
+            // flight.  The old swapchain image remains safe, but this frame is
+            // not allowed to prove or reuse it as part of the new epoch.
+            if (haveCandidate && candidateEpoch !=
+                    g_stereoResetEpoch.load(std::memory_order_acquire)) {
+                haveCandidate = false;
+                probeFailure = perf::StereoProjectionOutcome::GenerationPre;
+                stereoGenerationRace = true;
+            }
+            if (haveCandidate) candidateStereoSequenceAgeMs = candidate.ageMs;
+
+            bool submitProjection = false;
+            if (sStereoLiveness == perf::StereoLivenessState::Stale ||
+                sStereoLiveness == perf::StereoLivenessState::Recovering) {
+                if (haveCandidate && candidate.ageMs <= kStereoHardMaxAgeMs &&
+                    candidate.sequence > sStaleBaselineSequence) {
+                    if (candidate.sequence > sRecoveryLastSequence) {
+                        const int base = std::max(sStaleBaselineSequence,
+                                                  sRecoveryLastSequence);
+                        sRecoveryProgress = std::min(
+                            2, sRecoveryProgress +
+                                   std::max(1, candidate.sequence - base));
+                        sRecoveryLastSequence = candidate.sequence;
+                    }
+                    sStereoLiveness = perf::StereoLivenessState::Recovering;
+                    if (sRecoveryProgress >= 2) {
+                        submitProjection = true;
+                        projectedFromRecovery = true;
+                        projectedRepeatCount = 0;
+                    } else {
+                        stereoProjectionOutcome =
+                            perf::StereoProjectionOutcome::RecoveryHold;
+                    }
+                } else {
+                    staleStereoRejected = haveCandidate;
+                    stereoProjectionOutcome = haveCandidate
+                        ? perf::StereoProjectionOutcome::StaleRejected
+                        : probeFailure;
+                }
+            } else if (haveCandidate) {
+                const bool repeated = sLastSubmittedStereoSequence >= 0 &&
+                    candidate.sequence == sLastSubmittedStereoSequence;
+                selectedStereoRepeat = repeated;
+                projectedRepeatCount = repeated
+                    ? sConsecutiveStereoRepeats + 1 : 0;
+                if (candidate.ageMs > kStereoHardMaxAgeMs ||
+                    projectedRepeatCount > kStereoRepeatGracePresents) {
+                    sStereoLiveness = perf::StereoLivenessState::Stale;
+                    sStaleBaselineSequence = candidate.sequence;
+                    sRecoveryLastSequence = candidate.sequence;
+                    sRecoveryProgress = 0;
+                    staleStereoRejected = true;
+                    stereoProjectionOutcome =
+                        perf::StereoProjectionOutcome::StaleRejected;
+                } else {
+                    submitProjection = true;
+                }
+            } else {
+                stereoProjectionOutcome = probeFailure;
+            }
+
+            bool projectionReady = false;
+            if (submitProjection && selectedStereoRepeat &&
+                projectedRepeatCount > 0 &&
+                BuildCachedStereoEyeProjection(
+                    eyeProjection, eyeViews, candidate.sequence,
+                    candidateEpoch, candidate.ageMs,
+                    submittedStereoSequence, submittedStereoSequenceAgeMs,
+                    stereoProjectionOutcome)) {
+                zeroCopyRepeat = true;
+                projectionReady = true;
+            } else if (submitProjection) {
+                repeatCopyFallback = selectedStereoRepeat;
+                projectionEpoch = candidateEpoch;
+                projectionReady = RenderStereoEyeProjection(
+                    eyeProjection, eyeViews, candidate.sequence,
+                    submittedStereoSequence, stereoGenerationRace,
+                    submittedStereoSequenceAgeMs, stereoProjectionOutcome,
+                    eyeReleaseFailureMask, fxaaStats);
+                projectionFullCopy = projectionReady;
+            }
+
+            if (projectionReady) {
+                g_directStereoProjectionHealthy.store(true,
+                                                       std::memory_order_release);
+                layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(
+                    &eyeProjection);
+                layerCount = 1;
+                projectionLayerSubmitted = true;
+            } else {
+                g_directStereoProjectionHealthy.store(false,
+                                                       std::memory_order_release);
+                if (submitProjection &&
+                    stereoProjectionOutcome ==
+                        perf::StereoProjectionOutcome::StaleRejected) {
+                    sStereoLiveness = perf::StereoLivenessState::Stale;
+                    sStaleBaselineSequence = candidate.sequence;
+                    sRecoveryLastSequence = candidate.sequence;
+                    sRecoveryProgress = 0;
+                    staleStereoRejected = true;
+                }
+                if (RenderTheaterQuad(s.viewSpace, theaterQuad, true,
+                                      TheaterFrameSource::Black)) {
+                    layers[0] = reinterpret_cast<
+                        const XrCompositionLayerBaseHeader*>(&theaterQuad);
+                    layerCount = 1;
+                    stereoFallbackSource = perf::StereoFallbackSource::Black;
+                } else {
+                    stereoFallbackSource = perf::StereoFallbackSource::Failed;
+                }
             }
         }
 
@@ -7613,6 +11240,9 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
              g_drivingActive.load(std::memory_order_relaxed) ||
              g_drivingCalibActive.load(std::memory_order_relaxed) ||
              g_locomotionActive.load(std::memory_order_relaxed) ||
+             g_vehicleCameraActive.load(std::memory_order_relaxed) ||
+             g_basketballActive.load(std::memory_order_relaxed) ||
+             g_basketballCalibActive.load(std::memory_order_relaxed) ||
              g_hudActive.load(std::memory_order_relaxed) ||
              g_gfxActive.load(std::memory_order_relaxed) ||
              g_gfxDistanceActive.load(std::memory_order_relaxed) ||
@@ -7623,6 +11253,10 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
         }
     }
 
+    if (!projectionLayerSubmitted)
+        InvalidateStereoRepeatProjectionCache();
+
+    telemetryRecoveryProgress = sRecoveryProgress;
     const long long tEndStart = nowNs();
     XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime          = frameState.predictedDisplayTime;
@@ -7631,9 +11265,54 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
     endInfo.layers               = layerCount ? layers : nullptr;
     const XrResult ended = xrEndFrame(s.session, &endInfo);
     Check(ended, "xrEndFrame");
+    if (XR_FAILED(ended)) ResetStereoPhaseFeedback();
     const long long tEndDone = nowNs();
+    if (XR_SUCCEEDED(ended) && projectionLayerSubmitted &&
+        submittedStereoSequence >= 0) {
+        if (projectionFullCopy) {
+            if (projectionEpoch ==
+                g_stereoResetEpoch.load(std::memory_order_acquire)) {
+                CommitStereoRepeatProjectionCache(
+                    submittedStereoSequence, projectionEpoch, eyeViews);
+            } else {
+                InvalidateStereoRepeatProjectionCache();
+            }
+        }
+        // A successful zero-copy submission deliberately retains the exact
+        // cache that supplied this frame.
+    } else if (zeroCopyRepeat && XR_FAILED(ended)) {
+        // Fail closed on a runtime which does not honour the core swapchain
+        // reuse rule: at most one frame can exercise the path this process.
+        DisableStereoRepeatProjectionUntilRestart(ended);
+    } else if (!XR_SUCCEEDED(ended) || !projectionLayerSubmitted) {
+        InvalidateStereoRepeatProjectionCache();
+    }
     if (XR_SUCCEEDED(ended) && submittedStereoSequence >= 0) {
+        if (projectedFromRecovery) {
+            sStereoLiveness = perf::StereoLivenessState::Live;
+            sConsecutiveStereoRepeats = 0;
+            sStaleBaselineSequence = -1;
+            sRecoveryLastSequence = -1;
+            sRecoveryProgress = 0;
+        } else {
+            sConsecutiveStereoRepeats = projectedRepeatCount;
+            sStereoLiveness = projectedRepeatCount > 0
+                ? perf::StereoLivenessState::Grace
+                : perf::StereoLivenessState::Live;
+        }
         sLastSubmittedStereoSequence = submittedStereoSequence;
+#if defined(SAVR_EXPERIMENTAL_BACKPRESSURE)
+        if (StereoBackpressureRequested()) {
+            // Publish payload first and the timestamp last. The consumer's
+            // acquire load of lastSubmittedNs makes the matching sequence
+            // visible without paying release semantics on both fields.
+            g_stereoBackpressure.lastSubmittedSequence.store(
+                submittedStereoSequence, std::memory_order_relaxed);
+            g_stereoBackpressure.lastSubmittedNs.store(
+                static_cast<std::uint64_t>(tEndDone),
+                std::memory_order_release);
+        }
+#endif
     }
     const double frameThreadCpuMs = perf::ThreadCpuMs() - threadCpuT0;
 
@@ -7664,11 +11343,67 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
         .predictedDeltaMs = static_cast<double>(predDelta) / 1e6,
         .submittedStereoSequence = submittedStereoSequence,
         .stereoGenerationRace = stereoGenerationRace,
+        .stereoWriteClaimBusyDrops =
+            g_stereoWriteClaimBusyDrops.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteClaimRescues =
+            g_stereoWriteClaimRescues.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFencePollAttempts =
+            g_stereoWriteFencePollAttempts.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFencePollSkipped =
+            g_stereoWriteFencePollSkipped.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFencePollLockBusy =
+            g_stereoWriteFencePollLockBusy.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFencePollMatched =
+            g_stereoWriteFencePollMatched.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFencePollRetired =
+            g_stereoWriteFencePollRetired.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFencePollTimeouts =
+            g_stereoWriteFencePollTimeouts.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFencePollWaitFailed =
+            g_stereoWriteFencePollWaitFailed.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFencePollWallMs = static_cast<double>(
+            g_stereoWriteFencePollWallNs.exchange(
+                0, std::memory_order_acq_rel)) / 1.0e6,
+        .stereoWriteFencePollCpuMs = static_cast<double>(
+            g_stereoWriteFencePollCpuNs.exchange(
+                0, std::memory_order_acq_rel)) / 1.0e6,
+        .stereoWriteFenceWaitAttempts =
+            g_stereoWriteFenceWaitAttempts.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFenceWaitCalls =
+            g_stereoWriteFenceWaitCalls.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFenceWaitSatisfied =
+            g_stereoWriteFenceWaitSatisfied.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFenceWaitTimeouts =
+            g_stereoWriteFenceWaitTimeouts.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFenceWaitFailed =
+            g_stereoWriteFenceWaitFailed.exchange(0, std::memory_order_acq_rel),
+        .stereoWriteFenceWaitWallMs = static_cast<double>(
+            g_stereoWriteFenceWaitWallNs.exchange(
+                0, std::memory_order_acq_rel)) / 1.0e6,
+        .stereoWriteFenceWaitCpuMs = static_cast<double>(
+            g_stereoWriteFenceWaitCpuNs.exchange(
+                0, std::memory_order_acq_rel)) / 1.0e6,
+        .stereoWriteFenceWaitAgeMs = static_cast<double>(
+            g_stereoWriteFenceWaitAgeNs.exchange(
+                0, std::memory_order_acq_rel)) / 1.0e6,
+        .stereoWriteFenceWaitAgeSamples =
+            g_stereoWriteFenceWaitAgeSamples.exchange(
+                0, std::memory_order_acq_rel),
         .stereoSyncWaitAttempted = stereoSyncWait.attempted,
         .stereoSyncWaitRescued = stereoSyncWait.rescued,
         .stereoSyncWaitTimedOut = stereoSyncWait.timedOut,
         .stereoSyncWaitMs = stereoSyncWait.waitMs,
         .submittedStereoSequenceAgeMs = submittedStereoSequenceAgeMs,
+        .candidateStereoSequenceAgeMs = candidateStereoSequenceAgeMs,
+        .stereoProjectionOutcome = stereoProjectionOutcome,
+        .stereoFallbackSource = stereoFallbackSource,
+        .stereoLivenessState = sStereoLiveness,
+        .staleStereoRejected = staleStereoRejected,
+        .consecutiveStereoRepeats = sConsecutiveStereoRepeats,
+        .stereoRecoveryProgress = telemetryRecoveryProgress,
+        .stereoZeroCopyRepeat = zeroCopyRepeat,
+        .stereoRepeatCopyFallback = repeatCopyFallback,
+        .eyeReleaseFailureMask = eyeReleaseFailureMask,
         .theaterMode = s.theaterMode,
         .shouldRender = frameState.shouldRender == XR_TRUE,
         .layerCount = layerCount,
@@ -7699,6 +11434,106 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
         LOGI("present: shouldRender=%d layers=%u endFrame=%s glErr=0x%x makeCurrent=%p/%p",
              frameState.shouldRender, layerCount, XrName(ended), glErr,
              eglGetCurrentContext(), eglGetCurrentSurface(EGL_DRAW));
+        const std::uint64_t exact =
+            g_stereoPhaseResolvedExact.load(std::memory_order_relaxed);
+        const std::uint64_t lateNs =
+            g_stereoPhaseLateNs.load(std::memory_order_relaxed);
+        const std::uint64_t pendingAdvance =
+            g_stereoPacerAdvancePendingNs.load(std::memory_order_relaxed);
+        const int pendingAdvanceState =
+            pendingAdvance == kStereoPacerAdvancePublishingNs ? 2
+            : pendingAdvance == kStereoPacerAdvanceClaimingNs ? 3
+            : pendingAdvance != 0 ? 1 : 0;
+        const double pendingAdvanceUs = pendingAdvanceState == 1
+            ? static_cast<double>(pendingAdvance) / 1000.0 : 0.0;
+        LOGI("[stereo.phase] arm=%llu overlap=%llu expired=%llu "
+             "exact=%llu gap=%llu race=%llu fault=%llu "
+             "late_avg_us=%.1f late_max_us=%.1f "
+             "buckets=%llu/%llu/%llu/%llu/%llu reject=%llu "
+             "kick_req=%llu/%.3fms kick_applied=%llu/%.3fms "
+             "pending_seq=%d kick_state=%d pending_us=%.1f resets=%llu "
+             "wait_ext=%llu/%llu/%llu wait_pred=%llu/%llu/%llu "
+             "wait_outlier=%llu/%llu/%llu "
+             "wait_feedback=%llu/%llu/%llu/%llu refresh=%llu last_us=%.1f",
+             static_cast<unsigned long long>(
+                 g_stereoPhaseProbeArmed.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseProbeOverlap.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseProbeExpired.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(exact),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseResolvedGap.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseResolvedRace.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseResolvedFault.load(std::memory_order_relaxed)),
+             exact ? static_cast<double>(lateNs) /
+                         static_cast<double>(exact) / 1000.0 : 0.0,
+             static_cast<double>(g_stereoPhaseLateMaxNs.load(
+                 std::memory_order_relaxed)) / 1000.0,
+             static_cast<unsigned long long>(
+                 g_stereoPhaseLateBuckets[0].load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseLateBuckets[1].load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseLateBuckets[2].load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseLateBuckets[3].load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseLateBuckets[4].load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseCalibrationRejects.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoPhaseKickRequestedCount.load(
+                     std::memory_order_relaxed)),
+             static_cast<double>(g_stereoPhaseKickRequestedNs.load(
+                 std::memory_order_relaxed)) / 1.0e6,
+             static_cast<unsigned long long>(
+                 g_stereoPhaseKickAppliedCount.load(
+                     std::memory_order_relaxed)),
+             static_cast<double>(g_stereoPhaseKickAppliedNs.load(
+                 std::memory_order_relaxed)) / 1.0e6,
+             g_stereoPhasePendingSequence.load(std::memory_order_relaxed),
+             pendingAdvanceState,
+             pendingAdvanceUs,
+             static_cast<unsigned long long>(
+                 g_stereoPhaseResets.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncExtendedAttempts.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncExtendedRescued.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncExtendedTimeouts.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncPredictedAttempts.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncPredictedRescued.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncPredictedTimeouts.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncCadenceOutlierAttempts.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncCadenceOutlierRescued.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncCadenceOutlierTimeouts.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncFeedbackArmed.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncFeedbackAttempts.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncFeedbackRescued.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncFeedbackTimeouts.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_stereoSyncFeedbackRefreshed.load(
+                     std::memory_order_relaxed)),
+             static_cast<double>(g_stereoSyncFeedbackLateNs.load(
+                 std::memory_order_relaxed)) / 1000.0);
     }
 }
 
@@ -7708,6 +11543,11 @@ bool IsSessionRunning() {
 
 bool IsSessionFocused() {
     return g_sessionFocused.load(std::memory_order_acquire);
+}
+
+void SetTheaterCrop(int width, int height) {
+    g_theaterCropW.store(width, std::memory_order_relaxed);
+    g_theaterCropH.store(height, std::memory_order_relaxed);
 }
 
 bool RecommendedEyeSize(int& width, int& height) {

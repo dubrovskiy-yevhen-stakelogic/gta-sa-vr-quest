@@ -10,6 +10,10 @@
 #include "Log.h"
 #include "Melee.h"
 #include "PerfTelemetry.h"
+#include "Basketball.h"
+#include "MapZoom.h"
+#include "BrainDiag.h"
+#include "Pickups.h"
 #include "PhysicalWeapon.h"
 #include "ScopeAim.h"
 #include "Symbols.h"
@@ -22,6 +26,7 @@
 #include <jni.h>
 
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 
 #include <dlfcn.h>
@@ -32,6 +37,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 
 #include <atomic>
@@ -173,6 +179,25 @@ std::atomic<long long> g_outerPacerPeriodNs{kOuterPacerFallbackPeriodNs};
 std::atomic<bool> g_resetGameTiming{true};
 double g_prevGameFrameStartMs = 0.0;
 long long g_lastPacerFrameNs = 0;
+constexpr char kAbsoluteOuterPacerProperty[] =
+    "debug.savr.absolute_pacer";
+
+bool AbsoluteOuterPacerRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = true;
+        if (__system_property_get(kAbsoluteOuterPacerProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[pacer] ignoring invalid %s=%s (valid 0 or 1)",
+                      kAbsoluteOuterPacerProperty, text);
+        }
+        LOGI("[pacer] absolute_deadline=%d property=%s",
+             value ? 1 : 0, kAbsoluteOuterPacerProperty);
+        return value;
+    }();
+    return requested;
+}
 EGLDisplay g_display   = EGL_NO_DISPLAY;
 EGLContext g_context   = EGL_NO_CONTEXT;   // the engine's context (we do not own it)
 EGLSurface g_surface   = EGL_NO_SURFACE;   // the engine's window surface, refreshed each frame
@@ -204,11 +229,39 @@ bool CreateXrGl(EGLDisplay display) {
     // across contexts; each thread still keeps its OWN context current, so this
     // never re-creates the context-steal deadlock that made us decouple in the
     // first place (that was eglMakeCurrent on the engine's context from here).
-    const EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    const char* const eglExtensions = eglQueryString(display, EGL_EXTENSIONS);
+    const bool prioritySupported = eglExtensions &&
+        std::strstr(eglExtensions, "EGL_IMG_context_priority") != nullptr;
+    const EGLint defaultCtxAttribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        EGL_NONE,
+    };
+    const EGLint highCtxAttribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_HIGH_IMG,
+        EGL_NONE,
+    };
+    auto createContext = [&](EGLContext shareContext, bool& requestedHigh) {
+        requestedHigh = false;
+        if (prioritySupported) {
+            EGLContext context = eglCreateContext(
+                display, config, shareContext, highCtxAttribs);
+            if (context != EGL_NO_CONTEXT) {
+                requestedHigh = true;
+                return context;
+            }
+            LOGW("high-priority XR context failed (0x%x) - retrying default "
+                 "priority", eglGetError());
+        }
+        return eglCreateContext(display, config, shareContext,
+                                defaultCtxAttribs);
+    };
+
     EGLContext share = g_context;   // set on GameThread before this thread starts
     bool shared = false;
+    bool requestedHigh = false;
     if (share != EGL_NO_CONTEXT) {
-        g_xrContext = eglCreateContext(display, config, share, ctxAttribs);
+        g_xrContext = createContext(share, requestedHigh);
         shared = (g_xrContext != EGL_NO_CONTEXT);
         if (!shared) {
             LOGW("shared XR context failed (0x%x) - retrying unshared, stereo eye "
@@ -216,7 +269,7 @@ bool CreateXrGl(EGLDisplay display) {
         }
     }
     if (g_xrContext == EGL_NO_CONTEXT) {
-        g_xrContext = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+        g_xrContext = createContext(EGL_NO_CONTEXT, requestedHigh);
     }
     if (g_xrContext == EGL_NO_CONTEXT) {
         LOGE("eglCreateContext(XR) failed: 0x%x", eglGetError());
@@ -225,7 +278,30 @@ bool CreateXrGl(EGLDisplay display) {
     // Whether the context actually shares the engine's decides if the stereo eye
     // textures are usable here; if not, the bridge disables and we present mono.
     xr::SetStereoContextShared(shared);
-    LOGI("XR context created%s", shared ? " (shared with engine)" : " (UNSHARED - mono only)");
+    EGLint actualPriority = EGL_CONTEXT_PRIORITY_MEDIUM_IMG;
+    EGLBoolean priorityQueried = EGL_FALSE;
+    EGLint priorityQueryError = EGL_SUCCESS;
+    if (prioritySupported) {
+        priorityQueried = eglQueryContext(display, g_xrContext,
+                                          EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                                          &actualPriority);
+        if (priorityQueried != EGL_TRUE) {
+            priorityQueryError = eglGetError();
+        }
+    }
+    const auto priorityName = [](EGLint priority) {
+        switch (priority) {
+        case EGL_CONTEXT_PRIORITY_HIGH_IMG:   return "HIGH";
+        case EGL_CONTEXT_PRIORITY_MEDIUM_IMG: return "MEDIUM";
+        case EGL_CONTEXT_PRIORITY_LOW_IMG:    return "LOW";
+        default:                              return "UNKNOWN";
+        }
+    };
+    LOGI("XR context created%s priority_ext=%d requested=%s actual=%s query=%d query_err=0x%x",
+         shared ? " (shared with engine)" : " (UNSHARED - mono only)",
+         prioritySupported ? 1 : 0, requestedHigh ? "HIGH" : "DEFAULT",
+         priorityQueried == EGL_TRUE ? priorityName(actualPriority) : "N/A",
+         priorityQueried == EGL_TRUE ? 1 : 0, priorityQueryError);
 
     const EGLint pbAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     g_pbuffer = eglCreatePbufferSurface(display, config, pbAttribs);
@@ -667,16 +743,26 @@ void OnSurfaceChanged(JNIEnv* env, jclass clazz, jobject surface, jint width, ji
     int eyeWidth = width;
     int eyeHeight = height;
     xr::RecommendedEyeSize(eyeWidth, eyeHeight);
+    vrcam::SetStereoBaseSize(eyeWidth, eyeHeight);
 
-    g_gameWidth = eyeWidth;
-    g_gameHeight = eyeHeight;
-    jobject offscreen = GameSurface(env, eyeWidth, eyeHeight);
+    // The engine's flat pass is only the Android frontend/map, cutscenes and
+    // the SurfaceTexture source. Give that pass GTA SA's native 640:448 aspect
+    // instead of the nearly-square eye aspect that crops fullscreen artwork.
+    // VrCamera keeps the independent OpenXR eye size above for both stereo
+    // rasters, so gameplay resolution and projection do not change.
+    const int flatWidth=eyeWidth;
+    const int flatHeight=std::max(64,
+        static_cast<int>(std::lround(flatWidth*(448.0/640.0)))) & ~1;
+    g_gameWidth = flatWidth;
+    g_gameHeight = flatHeight;
+    xr::SetTheaterCrop(flatWidth,flatHeight); // source aspect only; no pixel crop
+    jobject offscreen = GameSurface(env, flatWidth, flatHeight);
     if (offscreen == nullptr) {
         LOGE("falling back to the shell surface - expect the render loop to die");
         offscreen = surface;
     }
 
-    g.implOnSurfaceChanged(env, clazz, offscreen, eyeWidth, eyeHeight);
+    g.implOnSurfaceChanged(env, clazz, offscreen, flatWidth, flatHeight);
 
     // Set everything up right here, on the engine's own GameThread, with its
     // context current. We do NOT take the frame loop onto a thread of our own:
@@ -901,7 +987,9 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
     enum { PG_NONE = 0, PG_MAIN, PG_CALIB, PG_HOLSTER_CALIB, PG_HOLSTERS,
            PG_DRIVING, PG_DRIVING_CALIB, PG_LOCOMOTION, PG_HUD, PG_HUD_CROP,
            PG_HUD_WRIST, PG_CHEATS, PG_GRAPHICS, PG_GRAPHICS_DISTANCES,
-           PG_CONTROLS, PG_CONTROLS_TIPS, PG_ABOUT };
+           PG_CONTROLS, PG_CONTROLS_TIPS, PG_ABOUT, PG_BASKETBALL,
+           PG_BASKETBALL_CALIB,
+           PG_VEHICLE_CAMERA };
     static int  menuPage = PG_NONE;
     static int  mainSel = 0, cheatSel = 0, cheatCategory = -1, calibSel = 0;
     static int  calibWeaponType = 0;
@@ -909,6 +997,8 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
     static int  drivingVehicleType = savr::driving::VEHICLE_BIKE;
     static int  drivingCalibSel = 0, drivingCalibHand = 0;
     static int  hudWristMode = 0;   // 0 auto (hand/dash), 4 weapon, 5 two-hand
+    static int  basketballSel = 0, basketballCalibSel = 0;
+    static int  vehicleCameraSel = 0;
     static int  locomotionSel = 0, hudSel = 0, hudCropSel = 0, hudWristSel = 0,
                 gfxSel = 0, gfxDistanceSel = 0, controlsSel = 0;
     static bool aboutFirstRun = false, aboutArmed = false;
@@ -945,10 +1035,26 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         // legacy third fallback and is deliberately GONE: B now fires the
         // drive-by/held weapon in vehicles, and the hidden chord kept opening
         // the menu mid-fight.
+        // Stereo cutscenes own the stick clicks exactly like Vice City: R3
+        // cycles director/actor cameras and L3 keeps the current camera for
+        // this named scene. Both-click recenter resumes outside a cutscene.
+        const bool cutsceneCameras = menuPage == PG_NONE &&
+            vrcam::CutsceneCameraControlsActive();
+        static bool cutsceneCyclePrev = false;
+        static bool cutsceneStorePrev = false;
+        const bool cutsceneCycle = cutsceneCameras && in.r3 && !in.l3;
+        const bool cutsceneStore = cutsceneCameras && in.l3 && !in.r3;
+        if (cutsceneCycle && !cutsceneCyclePrev)
+            vrcam::CycleCutsceneCamera();
+        if (cutsceneStore && !cutsceneStorePrev)
+            vrcam::RememberCutsceneCamera();
+        cutsceneCyclePrev = cutsceneCycle;
+        cutsceneStorePrev = cutsceneStore;
+
         // L3+R3 (both thumbstick clicks) recenters the view: the current head
         // pose becomes straight-ahead. Edge-triggered so holding does it once.
         static bool recenterPrev = false;
-        const bool recenterChord = in.l3 && in.r3;
+        const bool recenterChord = !cutsceneCameras && in.l3 && in.r3;
         if (recenterChord && !recenterPrev) vrcam::RequestRecenter();
         recenterPrev = recenterChord;
 
@@ -957,7 +1063,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         // (recenter); the Rhino is skipped — its view is forced third-person
         // and the toggle would silently flip the shared car setting instead.
         static bool viewChordPrev = false;
-        const bool viewChord = grips && in.r3 && !in.l3;
+        const bool viewChord = !cutsceneCameras && grips && in.r3 && !in.l3;
         if (viewChord && !viewChordPrev && menuPage == PG_NONE) {
             const int vehicleType = savr::driving::GetActiveVehicleType();
             if (vehicleType >= 0 &&
@@ -967,10 +1073,23 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         }
         viewChordPrev = viewChord;
 
-        // First-run welcome (VC parity): the first real movement input in
-        // gameplay opens the ABOUT window once; dismissing it persists
-        // WelcomeShown so it never returns.
-        if (menuPage == PG_NONE && inGameplay &&
+        // First-run welcome waits for the first controllable player step. Stereo
+        // can also be active in story/scripted cutscenes, so `inGameplay` alone
+        // is not proof that the left stick belongs to CJ yet.
+        const bool playerExists = g.FindPlayerPed && g.FindPlayerPed(-1);
+        const bool formalCutscene = g.CCutsceneMgr_ms_running &&
+            *g.CCutsceneMgr_ms_running;
+        bool controlsEnabled = true;
+        if (g.CPad_GetPad) {
+            if (const void* pad = g.CPad_GetPad(0)) {
+                controlsEnabled = *reinterpret_cast<const std::uint16_t*>(
+                    static_cast<const char*>(pad) + 0x110) == 0;
+            }
+        }
+        const bool widescreen = g.TheCamera &&
+            *(reinterpret_cast<const std::uint8_t*>(g.TheCamera) + 0x43) != 0;
+        if (menuPage == PG_NONE && inGameplay && playerExists &&
+            !formalCutscene && controlsEnabled && !widescreen &&
             !savr::locomotion::WelcomeSeen() &&
             (std::abs(in.leftStick[0]) >= 0.2f ||
              std::abs(in.leftStick[1]) >= 0.2f)) {
@@ -982,6 +1101,8 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         const bool openChord = grips && (in.menu || in.y);
         if (openChord && !openPrev) {
             if (menuPage == PG_HOLSTER_CALIB) savr::holster::EndCalibrationPreview();
+            if (menuPage == PG_BASKETBALL_CALIB)
+                savr::basketball::EndHandCalibration();
             menuPage = (menuPage == PG_NONE) ? PG_MAIN : PG_NONE;   // toggle whole menu
             mainSel = 0;
         }
@@ -1003,7 +1124,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         case PG_MAIN: {
             // Weapon/holster setup, driving, HUD, hand appearance, cheats,
             // graphics, controls, about and close.
-            const int N = 12;
+            const int N = 13;
             if (navUp)   mainSel = (mainSel - 1 + N) % N;
             if (navDown) mainSel = (mainSel + 1) % N;
             if (mainSel == 6) {
@@ -1036,16 +1157,59 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 }
                 else if (mainSel == 8) { menuPage = PG_GRAPHICS; gfxSel = 0; }
                 else if (mainSel == 9) { menuPage = PG_CONTROLS; controlsSel = 0; }
-                else if (mainSel == 10) { menuPage = PG_ABOUT; aboutFirstRun = false; aboutArmed = false; }
-                else if (mainSel == 11)  menuPage = PG_NONE;
+                else if (mainSel == 10) { menuPage = PG_BASKETBALL; basketballSel = 0; }
+                else if (mainSel == 11) { menuPage = PG_ABOUT; aboutFirstRun = false; aboutArmed = false; }
+                else if (mainSel == 12)  menuPage = PG_NONE;
             }
             if (back) menuPage = PG_NONE;
             break;
         }
+        case PG_BASKETBALL: {
+            constexpr int ROWS = savr::basketball::PHYS_FIELD_COUNT + 3;
+            if (navUp)   basketballSel = (basketballSel - 1 + ROWS) % ROWS;
+            if (navDown) basketballSel = (basketballSel + 1) % ROWS;
+            const int step = minus ? -1 : (plus ? 1 : 0);
+            if (basketballSel < savr::basketball::PHYS_FIELD_COUNT) {
+                if (step) savr::basketball::AdjustPhysics(basketballSel, step);
+            } else if (basketballSel == savr::basketball::PHYS_FIELD_COUNT) {
+                if (enter) {
+                    savr::basketball::BeginHandCalibration();
+                    basketballCalibSel = 0;
+                    menuPage = PG_BASKETBALL_CALIB;
+                }
+            } else if (basketballSel == savr::basketball::PHYS_FIELD_COUNT + 1) {
+                if (enter) savr::basketball::SpawnBall();
+            } else if (enter) {
+                menuPage = PG_MAIN;
+            }
+            if (back) menuPage = PG_MAIN;
+            break;
+        }
+        case PG_BASKETBALL_CALIB: {
+            constexpr int ROWS = savr::basketball::HAND_CALIB_FIELD_COUNT + 2;
+            if (navUp) basketballCalibSel = (basketballCalibSel - 1 + ROWS) % ROWS;
+            if (navDown) basketballCalibSel = (basketballCalibSel + 1) % ROWS;
+            const int step = minus ? -minus : (plus ? plus : 0);
+            if (basketballCalibSel < savr::basketball::HAND_CALIB_FIELD_COUNT) {
+                if (step) savr::basketball::AdjustHandCalib(
+                    basketballCalibSel, step);
+            } else if (basketballCalibSel ==
+                       savr::basketball::HAND_CALIB_FIELD_COUNT) {
+                if (enter) savr::basketball::ResetHandCalibration();
+            } else if (enter) {
+                savr::basketball::EndHandCalibration();
+                menuPage = PG_BASKETBALL;
+            }
+            if (back) {
+                savr::basketball::EndHandCalibration();
+                menuPage = PG_BASKETBALL;
+            }
+            break;
+        }
         case PG_CALIB: {
-            // 23 rows: 0..18 fields, 19 WEAPON LASER (global), 20 LASER BEAM
-            // mode, 21 LOCK LASER, 22 BACK.
-            constexpr int ROWS = 23;
+            // 24 rows: 0..18 fields, 19 WEAPON LASER (global), 20 LASER BEAM
+            // mode, 21 LOCK LASER, 22 WEAPON RECOIL, 23 BACK.
+            constexpr int ROWS = 24;
             if (navUp)   calibSel = (calibSel - 1 + ROWS) % ROWS;
             if (navDown) calibSel = (calibSel + 1) % ROWS;
             const int type = calibWeaponType;
@@ -1063,8 +1227,11 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             const int  mult      = (calAdjHeld < 45) ? 1 : (calAdjHeld < 105) ? 3 : 10;  // x1/x3/x10
             const bool firstTick = fire && calAdjHeld == 1;
 
-            if (calibSel == 22) {                                  // BACK
+            if (calibSel == 23) {                                  // BACK
                 if (enter || firstTick || back) { savr::calib::Save(); menuPage = PG_MAIN; }
+            } else if (calibSel == 22) {                           // WEAPON RECOIL
+                if (enter) savr::calib::CycleRecoil(+1);
+                else if (firstTick) savr::calib::CycleRecoil(dir);
             } else if (calibSel == 21) {                           // explicit persistent lock
                 if (enter || firstTick) savr::calib::LockLaser(type);
             } else if (calibSel == 20) {                           // per-weapon beam override
@@ -1118,10 +1285,9 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             if (holsterSel < savr::holster::PointCount()) {
                 if (minus) savr::holster::CyclePointSlot(holsterSel, -1);
                 if (plus) savr::holster::CyclePointSlot(holsterSel, +1);
-                // A cycles too: players read A as "confirm", and an instant
-                // clear on that press kept stranding categories. EMPTY is an
-                // explicit stop in the cycle ring instead.
-                if (enter) savr::holster::CyclePointSlot(holsterSel, +1);
+                // A is the per-socket visibility switch. The category remains
+                // assigned, so hiding a bulky back/waist weapon is reversible.
+                if (enter) savr::holster::TogglePointVisible(holsterSel);
             } else if (holsterSel == savr::holster::PointCount()) {
                 if (minus) savr::holster::AdjustGrabRadiusCm(-1);
                 if (plus)  savr::holster::AdjustGrabRadiusCm(+1);
@@ -1167,10 +1333,14 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             } else if (item==savr::driving::MENU_BIKE_ACCELERATOR&&
                       (enter||step)&&available) {
                 savr::driving::CycleCurrentBikeAcceleratorMode(step?step:+1);
+            } else if (item==savr::driving::MENU_GLOBAL_SIDE&&step) {
+                savr::driving::AdjustGlobalSeatSideCm(drivingVehicleType,step);
             } else if (item==savr::driving::MENU_GLOBAL_FORWARD&&step) {
                 savr::driving::AdjustGlobalSeatForwardCm(drivingVehicleType,step);
             } else if (item==savr::driving::MENU_GLOBAL_HEIGHT&&step) {
                 savr::driving::AdjustGlobalSeatHeightCm(drivingVehicleType,step);
+            } else if (item==savr::driving::MENU_MODEL_SIDE&&step&&available) {
+                savr::driving::AdjustCurrentModelSeatSideCm(drivingVehicleType,step);
             } else if (item==savr::driving::MENU_MODEL_FORWARD&&step&&available) {
                 savr::driving::AdjustCurrentModelSeatForwardCm(drivingVehicleType,step);
             } else if (item==savr::driving::MENU_MODEL_HEIGHT&&step&&available) {
@@ -1191,8 +1361,16 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 savr::driving::ToggleKeepRiderOnFlips();
             } else if (item==savr::driving::MENU_WHEEL_VISIBLE&&enter) {
                 savr::driving::ToggleWheelVisible();
+            } else if (item==savr::driving::MENU_CAR_CAMERA_TILT&&
+                       (enter||step)) {
+                savr::driving::ToggleCarCameraTilt();
+            } else if (item==savr::driving::MENU_BOAT_CAMERA_TILT&&
+                       (enter||step)) {
+                savr::driving::ToggleBoatCameraTilt();
             } else if (item==savr::driving::MENU_INTERIOR_GLASS&&enter) {
                 savr::driving::ToggleInteriorGlass();
+            } else if (item==savr::driving::MENU_DRIVEBY_AIM&&enter) {
+                savr::driving::ToggleDrivebyAimImmersive();
             } else if (item==savr::driving::MENU_RESET&&enter) {
                 savr::driving::ResetVehiclePreset(drivingVehicleType);
             } else if (item==savr::driving::MENU_BACK&&enter) {
@@ -1236,8 +1414,26 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             if (back) menuPage=PG_DRIVING;
             break;
         }
+        case PG_VEHICLE_CAMERA: {
+            constexpr int ROWS=5;
+            if (navUp) vehicleCameraSel=(vehicleCameraSel-1+ROWS)%ROWS;
+            if (navDown) vehicleCameraSel=(vehicleCameraSel+1)%ROWS;
+            const int step=minus?-1:(plus?1:0);
+            if (vehicleCameraSel==0&&(step||enter))
+                savr::locomotion::ToggleFlightCameraTilt();
+            else if (vehicleCameraSel==1&&(step||enter))
+                savr::driving::ToggleCarCameraTilt();
+            else if (vehicleCameraSel==2&&(step||enter))
+                savr::driving::ToggleBikeHorizonLock();
+            else if (vehicleCameraSel==3&&(step||enter))
+                savr::driving::ToggleBoatCameraTilt();
+            else if (vehicleCameraSel==4&&enter)
+                menuPage=PG_LOCOMOTION;
+            if (back) menuPage=PG_LOCOMOTION;
+            break;
+        }
         case PG_LOCOMOTION: {
-            constexpr int ROWS=14;
+            constexpr int ROWS=15;
             if (navUp) locomotionSel=(locomotionSel-1+ROWS)%ROWS;
             if (navDown) locomotionSel=(locomotionSel+1)%ROWS;
             const int step=minus?-1:(plus?1:0);
@@ -1261,13 +1457,17 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 savr::locomotion::ToggleParachuteControl();
             else if (locomotionSel==9&&(step||enter))
                 savr::locomotion::ToggleAutoParachute();
-            else if (locomotionSel==10&&(step||enter))
-                savr::locomotion::ToggleFlightCameraTilt();
+            else if (locomotionSel==10&&enter) {
+                menuPage=PG_VEHICLE_CAMERA;
+                vehicleCameraSel=0;
+            }
             else if (locomotionSel==11&&(step||enter))
                 savr::locomotion::CycleCutsceneMode(step<0?-1:+1);
-            else if (locomotionSel==12&&enter)
-                vrcam::RequestRecenter();
+            else if (locomotionSel==12&&(step||enter))
+                savr::locomotion::CycleGameCutsceneMode(step<0?-1:+1);
             else if (locomotionSel==13&&enter)
+                vrcam::RequestRecenter();
+            else if (locomotionSel==14&&enter)
                 menuPage=PG_MAIN;
             if (back) menuPage=PG_MAIN;
             break;
@@ -1275,7 +1475,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         case PG_HUD: {
             // Root: presets, element pick, and the two calibration submenus.
             // Row indices must match BuildHudMenu page 0.
-            constexpr int ROWS = 10;
+            constexpr int ROWS = 11;
             if (navUp)   hudSel = (hudSel - 1 + ROWS) % ROWS;
             if (navDown) hudSel = (hudSel + 1) % ROWS;
             const int step=minus?-1:(plus?1:0);
@@ -1289,9 +1489,13 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 if (minus) savr::hud::SetGameplayHudEnabled(false);
                 if (plus)  savr::hud::SetGameplayHudEnabled(true);
                 if (enter) savr::hud::ToggleGameplayHud();
-            } else if (hudSel==2&&(step||enter)) {
-                savr::hud::CycleCalibrationElement(step?step:+1);
+            } else if (hudSel == 2) {
+                if (minus) savr::hud::SetGazeAutoHideEnabled(false);
+                if (plus)  savr::hud::SetGazeAutoHideEnabled(true);
+                if (enter) savr::hud::ToggleGazeAutoHide();
             } else if (hudSel==3&&(step||enter)) {
+                savr::hud::CycleCalibrationElement(step?step:+1);
+            } else if (hudSel==4&&(step||enter)) {
                 if (step<0) savr::hud::SetElementEnabled(element,false);
                 else if (step>0) savr::hud::SetElementEnabled(element,true);
                 else {
@@ -1299,23 +1503,23 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                         savr::hud::GetElementSettings(element).enabled;
                     savr::hud::SetElementEnabled(element,!enabled);
                 }
-            } else if (hudSel==4&&enter) {
-                menuPage=PG_HUD_CROP; hudCropSel=0;
             } else if (hudSel==5&&enter) {
+                menuPage=PG_HUD_CROP; hudCropSel=0;
+            } else if (hudSel==6&&enter) {
                 if (!directText) {
                     menuPage=PG_HUD_WRIST; hudWristSel=0; hudWristMode=0;
                 }
-            } else if (hudSel==6&&enter) {
+            } else if (hudSel==7&&enter) {
                 if (!directText) {
                     menuPage=PG_HUD_WRIST; hudWristSel=0; hudWristMode=4;
                 }
-            } else if (hudSel==7&&enter) {
+            } else if (hudSel==8&&enter) {
                 if (!directText) {
                     menuPage=PG_HUD_WRIST; hudWristSel=0; hudWristMode=5;
                 }
-            } else if (hudSel==8&&enter) {
-                savr::hud::ResetElement(element);
             } else if (hudSel==9&&enter) {
+                savr::hud::ResetElement(element);
+            } else if (hudSel==10&&enter) {
                 menuPage = PG_MAIN;
             }
             if (back) menuPage = PG_MAIN;
@@ -1400,9 +1604,9 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_GRAPHICS: {
-            // scale, CPU, GPU, neon, grading, weapon models, distances,
-            // defaults, Back
-            const int N = 9;
+            // scale, CPU, GPU, world effects, neon, grading, dynamic shadows,
+            // weapon models, distances, defaults, Back
+            const int N = 11;
             if (navUp)   gfxSel = (gfxSel - 1 + N) % N;
             if (navDown) gfxSel = (gfxSel + 1) % N;
             const int step = minus ? -1 : (plus ? 1 : 0);
@@ -1414,33 +1618,50 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 else             gpu = (gpu + step + 4) % 4;
                 xr::SetPerfLevels(cpu, gpu);
             } else if (step && gfxSel == 3) {
-                vrcam::SetNeonSignsEnabled(step > 0);
+                vrcam::SetWorldEffectsEnabled(step > 0);
             } else if (step && gfxSel == 4) {
+                vrcam::SetNeonSignsEnabled(step > 0);
+            } else if (step && gfxSel == 5) {
                 vrcam::SetColorGradingEnabled(step > 0);
-            } else if (step && gfxSel == 5 && savr::hdweapons::Available()) {
+            } else if (step && gfxSel == 6) {
+                vrcam::AdjustDynamicShadowMode(step);
+            } else if (step && gfxSel == 7 && savr::hdweapons::Available()) {
                 vrcam::SetHdWeaponsEnabled(step > 0);
             }
             if (enter && !step && gfxSel == 3) {
-                vrcam::SetNeonSignsEnabled(!vrcam::AreNeonSignsEnabled());
+                vrcam::SetWorldEffectsEnabled(
+                    !vrcam::AreWorldEffectsEnabled());
             } else if (enter && !step && gfxSel == 4) {
-                vrcam::SetColorGradingEnabled(!vrcam::IsColorGradingEnabled());
+                vrcam::SetNeonSignsEnabled(!vrcam::AreNeonSignsEnabled());
             } else if (enter && !step && gfxSel == 5) {
+                vrcam::SetColorGradingEnabled(!vrcam::IsColorGradingEnabled());
+            } else if (enter && !step && gfxSel == 6) {
+                vrcam::AdjustDynamicShadowMode(1);
+            } else if (enter && !step && gfxSel == 7) {
                 if (savr::hdweapons::Available())
                     vrcam::SetHdWeaponsEnabled(!vrcam::IsHdWeaponsEnabled());
-            } else if (enter && gfxSel == 6) {
+            } else if (enter && gfxSel == 8) {
                 menuPage = PG_GRAPHICS_DISTANCES;
                 gfxDistanceSel = 0;
-            } else if (enter && gfxSel == 7) {
+            } else if (enter && gfxSel == 9) {
                 vrcam::ResetGraphicsDefaults();
                 xr::SetPerfLevels(3, 3);
-            } else if (enter && gfxSel == 8) {
+            } else if (enter && gfxSel == 10) {
                 menuPage = PG_MAIN;
             }
             if (back) menuPage = PG_MAIN;
             break;
         }
         case PG_CONTROLS: {
-            const int NC = 7; // layout, A, B, X, Y, tips, back
+            // Layout + five independent stick options + six button sources.
+            // This page intentionally edits only the gameplay mapping; its own
+            // navigation keeps consuming the raw left stick above.
+            const int firstStick = 1;
+            const int firstButton = firstStick + savr::locomotion::STICK_OPT_COUNT;
+            const int tipsRow = firstButton + savr::locomotion::BIND_SRC_COUNT;
+            const int resetRow = tipsRow + 1;
+            const int backRow = resetRow + 1;
+            const int NC = backRow + 1;
             if (navUp)   controlsSel = (controlsSel - 1 + NC) % NC;
             if (navDown) controlsSel = (controlsSel + 1) % NC;
             const int step = minus ? -1 : (plus ? 1 : 0);
@@ -1450,11 +1671,15 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                     layout == savr::locomotion::CONTROLS_LAYOUT_DEFAULT
                         ? savr::locomotion::CONTROLS_LAYOUT_SWAPPED_HANDS
                         : savr::locomotion::CONTROLS_LAYOUT_DEFAULT);
-            } else if (controlsSel >= 1 && controlsSel <= 4 && step) {
-                savr::locomotion::CycleButtonBinding(controlsSel - 1, step);
+            } else if (controlsSel >= firstStick && controlsSel < firstButton &&
+                       (step || enter)) {
+                savr::locomotion::ToggleStickOption(controlsSel - firstStick);
+            } else if (controlsSel >= firstButton && controlsSel < tipsRow && step) {
+                savr::locomotion::CycleButtonBinding(controlsSel - firstButton, step);
             }
-            if (enter && controlsSel == 5) menuPage = PG_CONTROLS_TIPS;
-            if (enter && controlsSel == 6) menuPage = PG_MAIN;
+            if (enter && controlsSel == tipsRow) menuPage = PG_CONTROLS_TIPS;
+            if (enter && controlsSel == resetRow) savr::locomotion::ResetControls();
+            if (enter && controlsSel == backRow) menuPage = PG_MAIN;
             if (back) menuPage = PG_MAIN;
             break;
         }
@@ -1495,6 +1720,9 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
 
         if (menuPage != PG_HOLSTER_CALIB && savr::holster::CalibrationPreviewActive())
             savr::holster::EndCalibrationPreview();
+        if (menuPage != PG_BASKETBALL_CALIB &&
+            savr::basketball::HandCalibrationActive())
+            savr::basketball::EndHandCalibration();
 
         xr::SetMainMenu    (menuPage == PG_MAIN,     mainSel);
         xr::SetCalibPage   (menuPage == PG_CALIB, calibSel, 1, calibWeaponType);
@@ -1508,6 +1736,11 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         xr::SetDrivingCalibrationMenu(menuPage == PG_DRIVING_CALIB,
                                       drivingCalibSel,drivingCalibHand);
         xr::SetLocomotionMenu(menuPage == PG_LOCOMOTION,locomotionSel);
+        xr::SetVehicleCameraMenu(menuPage == PG_VEHICLE_CAMERA,
+                                 vehicleCameraSel);
+        xr::SetBasketballMenu(menuPage == PG_BASKETBALL, basketballSel);
+        xr::SetBasketballCalibMenu(menuPage == PG_BASKETBALL_CALIB,
+                                   basketballCalibSel);
         {
             const bool hudOpen = menuPage == PG_HUD ||
                 menuPage == PG_HUD_CROP || menuPage == PG_HUD_WRIST;
@@ -1567,27 +1800,32 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
 
     // HD weapon model set: registers its image + textures once the engine is
     // ready, before any weapon streams in. Runs outside the gameplay gate so
-    // load screens cannot outrun it. Weapon calibration then follows the model
-    // set actually rendered, so HD tuning stays in its own profile.
+    // load screens cannot outrun it.
     savr::hdweapons::Tick(vrcam::IsHdWeaponsEnabled());
+    // Weapon grip/aim calibration follows the model set actually rendered, so
+    // HD calibration lands in its own profile and never overwrites the original.
     savr::calib::SetModelSet(savr::hdweapons::Applied() ? 1 : 0);
 
     // Physical ownership keeps running while on foot so throws can expire and
     // respawn. Menus/open chords only block transitions and firing; they do not
     // silently return an already-held weapon to its socket.
     if (inGameplay) {
+        const bool weaponInteractionsBlocked = anyMenu ||
+            vrcam::ParachuteWeaponInteractionBlocked();
         savr::physicalweapon::Update(
-            anyMenu,
+            weaponInteractionsBlocked,
             menuPage == PG_HOLSTER_CALIB && savr::holster::GripMarkersEnabled(),
             menuPage == PG_CALIB);
-        savr::melee::Update(anyMenu);
-        savr::scopeaim::Update(anyMenu);
-        savr::vrfire::Update(anyMenu);
-        savr::throwable::Update(anyMenu);
+        savr::melee::Update(weaponInteractionsBlocked);
+        savr::scopeaim::Update(weaponInteractionsBlocked);
+        savr::vrfire::Update(weaponInteractionsBlocked);
+        savr::throwable::Update(weaponInteractionsBlocked);
         savr::physicalweapon::EnforceBikeWeaponLimit();
         savr::physicalweapon::AutoEquipParachute();
         savr::physicalweapon::AutoAssignGadgetPoint();
         savr::cheats::Tick();
+        savr::pickups::Tick();
+        savr::basketball::Update();
     }
     else {
         savr::physicalweapon::ResetTransient();
@@ -1648,8 +1886,12 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         const float gameLT = driving ? in.triggers[0] : 0.0f;
         const float gameRT = driving ? in.triggers[1]
                                      : savr::physicalweapon::FireTrigger();
-        float gameMoveX=in.leftStick[0];
-        float gameMoveY=in.leftStick[1];
+        float gameMoveX=0.0f, gameMoveY=0.0f;
+        float gameTurnX=0.0f, gameTurnY=0.0f;
+        savr::locomotion::MapGameplaySticks(
+            in.leftStick[0], in.leftStick[1],
+            in.rightStick[0], in.rightStick[1],
+            &gameMoveX, &gameMoveY, &gameTurnX, &gameTurnY);
         // The mobile Java provider writes the pad after CPad::UpdatePads. Feed
         // it the same head-relative vector as the native hook, otherwise these
         // raw axes overwrite room-scale locomotion and movement follows CJ.
@@ -1659,26 +1901,45 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 savr::locomotion::TransformMoveStick(
                     localHeadYaw,&gameMoveX,&gameMoveY);
         }
+        // Thumbrest D-pad mode: the provider must not see the raw right
+        // stick while it acts as the D-pad.
+        const bool dpadMode = (in.thumbrest[0] || in.thumbrest[1]) &&
+                              !driving;
         g.implOnGamepadAxesChanged(env, clazz, 0,
                                    gameMoveX, -gameMoveY,
-                                   in.rightStick[0], -in.rightStick[1],
+                                   dpadMode ? 0.0f : gameTurnX,
+                                   dpadMode ? 0.0f : -gameTurnY,
                                    gameLT, gameRT);
 
-        static bool pa = false, px = false;
-        edge(in.a, pa, 0);
+        const bool sprintHeld = savr::locomotion::ActionHeld(
+            savr::locomotion::BIND_ACT_SPRINT,
+            in.a,in.b,in.x,in.y,in.l3,in.r3,!driving);
+        const bool jumpHeld = savr::locomotion::ActionHeld(
+            savr::locomotion::BIND_ACT_JUMP,
+            in.a,in.b,in.x,in.y,in.l3,in.r3,!driving);
+        const bool attackHeld = savr::locomotion::ActionHeld(
+            savr::locomotion::BIND_ACT_ATTACK,
+            in.a,in.b,in.x,in.y,in.l3,in.r3,!driving);
+        static bool pa = false, pb = false, px = false;
+        edge(sprintHeld, pa, 0);
+        edge(driving ? false : attackHeld, pb, 1);
         // In a vehicle X is owned by Driving's exact NextStationJustUp hook;
         // keep Square released so it cannot compete with the L2 brake mapping.
-        edge(driving ? false : in.x, px, 2);
+        edge(driving ? false : jumpHeld, px, 2);
         // Y is handled once by vrcam's mobile ExitVehicleJustDown hook. Sending
         // it through the generic Java provider as well duplicates the enter task.
 
-        // D-pad from the left stick, only in gameplay.
+        // D-pad from the left stick, only in gameplay - or from the RIGHT
+        // stick while a thumb rests on a thumbrest (UEVR-parity D-pad
+        // mode: gang commands / conversation replies without a chord).
         constexpr float kThreshold = 0.6f;
         static bool pu = false, pd = false, pl = false, pr = false;
-        edge(in.leftStick[1] >  kThreshold, pu, 8);   // up
-        edge(in.leftStick[1] < -kThreshold, pd, 9);   // down
-        edge(in.leftStick[0] < -kThreshold, pl, 10);  // left
-        edge(in.leftStick[0] >  kThreshold, pr, 11);  // right
+        const float dpx = dpadMode ? in.rightStick[0] : in.leftStick[0];
+        const float dpy = dpadMode ? in.rightStick[1] : in.leftStick[1];
+        edge(dpy >  kThreshold, pu, 8);   // up
+        edge(dpy < -kThreshold, pd, 9);   // down
+        edge(dpx < -kThreshold, pl, 10);  // left
+        edge(dpx >  kThreshold, pr, 11);  // right
     }
 
     // Open the game's own pause menu. Neither gamepad Start (the provider
@@ -1723,6 +1984,10 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         bBackPending = false;
     }
     pb = in.b;
+
+    // Pause-map zoom: feed the raw squeeze axes to the Menu_MapUpdate hook
+    // (it only acts while the map page is on screen).
+    savr::mapzoom::SetGrips(in.grip[0], in.grip[1]);
 
     // Laser pointer -> touch, menus only. Pointing at the theater screen and
     // clicking (A or the right trigger) is a tap there. In gameplay there is no
@@ -1774,6 +2039,7 @@ void OnDrawFrame(JNIEnv* env, jclass clazz, jfloat deltaTime) {
     // Let the engine render its frame on its own thread, into our SurfaceTexture.
     // Time it: this is the WHOLE game-frame work (logic + render) minus our pacing
     // sleep, so the profiler can split our stereo cost from the game's own cost.
+    const int frameCpuCoreStart = sched_getcpu();
     const double frameT0 = perf::MonotonicMs();
     const double frameCpuT0 = perf::ThreadCpuMs();
     const std::uint64_t renderSceneBefore = perf::RenderSceneSerial();
@@ -1793,6 +2059,12 @@ void OnDrawFrame(JNIEnv* env, jclass clazz, jfloat deltaTime) {
     // here to keep later pacing or JNI work out of engine_pre attribution.
     vrcam::EndGameFrameTelemetry();
     const std::uint64_t renderSceneAfter = perf::RenderSceneSerial();
+    const int fadeStatus = g.CCamera_GetScreenFadeStatus && g.TheCamera
+        ? g.CCamera_GetScreenFadeStatus(g.TheCamera) : -1;
+    const int cutsceneRunning = g.CCutsceneMgr_ms_running
+        ? (*g.CCutsceneMgr_ms_running ? 1 : 0) : -1;
+    const int mobileMenuOpen = g.gMobileMenu
+        ? (vrcam::IsMobileMenuOpen() ? 1 : 0) : -1;
     const double implMs = perf::MonotonicMs() - frameT0;                  // game logic + our 2x render
     const double implCpuMs = perf::ThreadCpuMs() - frameCpuT0;
     savr::xr::SetFrameMs(implMs);
@@ -1833,6 +2105,10 @@ void OnDrawFrame(JNIEnv* env, jclass clazz, jfloat deltaTime) {
                 ? (*g.CTimer_bSkipProcessThisFrame ? 1 : 0) : -1,
             .skipFrame = g.skipFrame ? static_cast<int>(*g.skipFrame) : -1,
             .renderSceneCalls = static_cast<int>(renderSceneAfter - renderSceneBefore),
+            .fadeStatus = fadeStatus,
+            .cutsceneRunning = cutsceneRunning,
+            .mobileMenuOpen = mobileMenuOpen,
+            .cpuCoreStart = frameCpuCoreStart,
             .cpuCore = sched_getcpu(),
             .stereoActive = vrcam::IsStereoActive(),
         });
@@ -1885,19 +2161,62 @@ void OnDrawFrame(JNIEnv* env, jclass clazz, jfloat deltaTime) {
     timespec now{};
     clock_gettime(CLOCK_MONOTONIC, &now);
     const long long nowNs = now.tv_sec * 1000000000LL + now.tv_nsec;
-    const long long elapsed = nowNs - g_lastPacerFrameNs;
     const long long outerPacerPeriodNs =
         g_outerPacerPeriodNs.load(std::memory_order_acquire);
-    if (g_lastPacerFrameNs != 0 && elapsed < outerPacerPeriodNs) {
-        const long long requestedNs = outerPacerPeriodNs - elapsed;
-        sleepRequestedMs = static_cast<double>(requestedNs) / 1e6;
-        timespec sleep{0, static_cast<long>(requestedNs)};
-        const double sleepT0 = perf::MonotonicMs();
-        nanosleep(&sleep, nullptr);
-        sleepActualMs = perf::MonotonicMs() - sleepT0;
+    if (AbsoluteOuterPacerRequested()) {
+        if (g_lastPacerFrameNs == 0) {
+            g_lastPacerFrameNs = nowNs;
+        } else {
+            const long long deadlineNs =
+                g_lastPacerFrameNs + outerPacerPeriodNs;
+            if (nowNs < deadlineNs) {
+                const long long requestedNs = deadlineNs - nowNs;
+                sleepRequestedMs = static_cast<double>(requestedNs) / 1e6;
+                timespec deadline{
+                    static_cast<time_t>(deadlineNs / 1000000000LL),
+                    static_cast<long>(deadlineNs % 1000000000LL)};
+                const double sleepT0 = perf::MonotonicMs();
+                int waitResult = 0;
+                do {
+                    waitResult = clock_nanosleep(
+                        CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr);
+                } while (waitResult == EINTR);
+                sleepActualMs = perf::MonotonicMs() - sleepT0;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                const long long wokeNs =
+                    now.tv_sec * 1000000000LL + now.tv_nsec;
+                if (waitResult == 0) {
+                    // Preserve the ideal deadline, not the slightly late wake.
+                    // The next frame automatically repays scheduler overshoot.
+                    g_lastPacerFrameNs = deadlineNs;
+                } else {
+                    static bool loggedFailure = false;
+                    if (!loggedFailure) {
+                        loggedFailure = true;
+                        LOGW("[pacer] clock_nanosleep failed=%d; "
+                             "rebasing without catch-up", waitResult);
+                    }
+                    g_lastPacerFrameNs = wokeNs;
+                }
+            } else {
+                // Real work missed the deadline. Rebase here so one long frame
+                // never causes a burst of short catch-up frames.
+                g_lastPacerFrameNs = nowNs;
+            }
+        }
+    } else {
+        const long long elapsed = nowNs - g_lastPacerFrameNs;
+        if (g_lastPacerFrameNs != 0 && elapsed < outerPacerPeriodNs) {
+            const long long requestedNs = outerPacerPeriodNs - elapsed;
+            sleepRequestedMs = static_cast<double>(requestedNs) / 1e6;
+            timespec sleep{0, static_cast<long>(requestedNs)};
+            const double sleepT0 = perf::MonotonicMs();
+            nanosleep(&sleep, nullptr);
+            sleepActualMs = perf::MonotonicMs() - sleepT0;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        g_lastPacerFrameNs = now.tv_sec * 1000000000LL + now.tv_nsec;
     }
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    g_lastPacerFrameNs = now.tv_sec * 1000000000LL + now.tv_nsec;
 
     submitTelemetry();
 }
@@ -1938,6 +2257,10 @@ void* RenderLoop(void*) {
                         perf::ThreadCpuMs() - updateCpuT0); // paced by xrWaitFrame
     }
 
+    // The context is still current here. Complete any shared eye-texture reads
+    // before releasing it so a future consumer epoch cannot inherit pinned ring
+    // slots or destroy a texture still referenced by the GPU.
+    xr::DrainStereoEyeReads();
     eglMakeCurrent(g_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     g_vm->DetachCurrentThread();
     return nullptr;
@@ -2049,7 +2372,7 @@ void* WaitForGameLibrary(void*) {
     savr::driving::Init();        // load DEFAULT vehicle seat offsets
     savr::locomotion::Init();     // load movement/turning comfort settings
     savr::holster::Init();        // load the persistent Vice City-style loadout
-    savr::physicalweapon::Init(); // qbuild grab/drop/transfer/catch ownership
+    savr::physicalweapon::Init(); // reference Quest build grab/drop/transfer/catch ownership
 
     // StartUserPause is only four instructions in the exact 2.11 binary. Verify
     // all of them before replacing it; OnStartUserPause reproduces its one-byte
@@ -2119,6 +2442,10 @@ void* WaitForGameLibrary(void*) {
     vrfire::SetPhysicalFireQuery(&QueryPhysicalFireHand);
     vrfire::Install();
     throwable::Install();
+    savr::pickups::Install(handle);  // physical world-pickup rise/grab
+    savr::braindiag::Install(handle);  // basketball brain-chain diagnostics
+    savr::basketball::Install(handle);  // custom immersive basketball
+    savr::mapzoom::Install(handle);  // pause-map zoom on the grips
 
     JNIEnv* env = nullptr;
     if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {

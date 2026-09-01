@@ -32,6 +32,7 @@ DEFAULT_SETTINGS_DIR = ROOT / "defaults" / "quest"
 DEFAULT_SETTING_NAMES = (
     "vr_driving.ini",
     "vr_appearance.ini",
+    "vr_basketball.ini",
     "vr_calib.ini",
     "vr_graphics.ini",
     "vr_holsters.ini",
@@ -439,6 +440,68 @@ def copy_limited(source, destination, limit: int, label: str) -> int:
         if total > limit:
             raise KitError(f"{label} exceeds the safe extraction limit of {limit} bytes")
         destination.write(block)
+
+
+def prepare_aircraft_hlod(data_apk: Path, build: Path) -> None:
+    """Generate flight HLOD from the user's verified retail data split.
+
+    Generated geometry stays below the ignored build directory. Only the
+    generator and renderer are source-controlled by the public source kit.
+    """
+    builder = ROOT / "tools" / "build_aircraft_hlod.py"
+    if not builder.is_file():
+        raise KitError(f"missing aircraft HLOD builder: {builder}")
+
+    input_root = build / "aircraft-hlod-input"
+    output_root = build / "aircraft-hlod-global"
+    ensure_inside(input_root, build)
+    ensure_inside(output_root, build)
+    if input_root.exists():
+        shutil.rmtree(input_root)
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    input_root.mkdir(parents=True)
+    output_root.mkdir(parents=True)
+
+    member_name = "assets/texdb/gta3.img"
+    image_path = input_root / "gta3.img"
+    with zipfile.ZipFile(data_apk) as archive:
+        names = {name.lower(): name for name in archive.namelist()}
+        actual_name = names.get(member_name)
+        if actual_name is None:
+            raise KitError(f"verified data_main APK is missing {member_name}")
+        info = archive.getinfo(actual_name)
+        size_limit = 1024 * 1024 * 1024
+        if info.file_size <= 0 or info.file_size > size_limit:
+            raise KitError(
+                f"unexpected {member_name} size in verified data_main APK: {info.file_size}"
+            )
+        with archive.open(info) as source, image_path.open("wb") as destination:
+            extracted = copy_limited(
+                source, destination, size_limit, "retail gta3.img"
+            )
+        if extracted != info.file_size:
+            raise KitError(f"{member_name} was truncated during HLOD preparation")
+
+    say("==> generating aircraft HLOD from user-owned retail geometry")
+    command = [
+        sys.executable,
+        str(builder),
+        "--apk", str(data_apk),
+        "--img", str(image_path),
+        "--out", str(output_root),
+        "--center", "0", "0",
+        "--radius", "5000",
+        "--tile-size", "1024",
+        "--cluster-step", "16",
+        "--cluster-colour-step", "0",
+    ]
+    result = subprocess.run(command, cwd=ROOT)
+    if result.returncode != 0:
+        raise KitError(f"aircraft HLOD generation failed: {result.returncode}")
+    pack = output_root / "aircraft.hlod"
+    if not pack.is_file() or pack.stat().st_size == 0:
+        raise KitError("aircraft HLOD generator did not produce aircraft.hlod")
 
 
 def materialize_apk_inputs(source: Path, work: Path, build_root: Path) -> list[tuple[Path, str]]:
@@ -1550,6 +1613,7 @@ def main() -> int:
         build,
     )
     if args.validate_only:
+        prepare_aircraft_hlod(package.data.path, build)
         say("validation complete; no APK or device was modified")
         return 0
 

@@ -147,7 +147,7 @@ bool BuildLauncherAim(void* player, int type, Vec3& source, Vec3& direction,
         return false;
     }
 
-    // qbuild's launcher path checks both the space between the headset and the
+    // reference Quest build's launcher path checks both the space between the headset and the
     // physical muzzle and the first half metre in front of the barrel. Suppress
     // a blocked shot instead of spawning a rocket through nearby geometry.
     if (g.CWorld_ProcessLineOfSight && g.CWorld_pIgnoreEntity) {

@@ -59,6 +59,7 @@ struct GameSymbols {
     void  (*CCutsceneMgr_Skip)();
     void  (*CCutsceneMgr_Start)();
     bool* CCutsceneMgr_ms_running;
+    char* CCutsceneMgr_ms_cutsceneName;
     void  (*implOnGamepadConnected)(void* env, void* clazz, int pad);
     void  (*implOnGamepadAxesChanged)(void* env, void* clazz, int pad,
                                       float lx, float ly, float rx, float ry,
@@ -169,6 +170,16 @@ struct GameSymbols {
     // Static analyser predicate; used for the auto-equip-parachute skydive check.
     bool  (*CPedGeometryAnalyser_IsInAir)(const void* ped);
 
+    // Duck (crouch) as a secondary ped task — the L3 crouch drives these
+    // directly because every mobile pad path (GetDuck/DuckJustDown) polls
+    // touch widgets and early-outs in VR. `this` = ped intelligence at
+    // ped+0x538 (disasm-verified via IsInAir).
+    void  (*CPedIntelligence_SetTaskDuckSecondary)(void* intelligence,
+                                                   unsigned short duration);
+    void  (*CPedIntelligence_ClearTaskDuckSecondary)(void* intelligence);
+    void* (*CPedIntelligence_GetTaskDuck)(const void* intelligence,
+                                          bool ignoreSimplestActiveCheck);
+
     // CVector is a 3-float HFA: identical registers to three float params.
     // Used for the VR aircraft climb boost (left grip + trigger).
     void  (*CPhysical_ApplyMoveForce)(void* physical, float x, float y, float z);
@@ -185,6 +196,14 @@ struct GameSymbols {
     // SCM global variable pool. Globals are 32-bit at their byte offset;
     // player_parachute.scm keeps its phase in $2D0C (3 = deploy-ready).
     void* CTheScripts_ScriptSpace;
+
+    // The object/ped script-brain table: 70 entries, 20 bytes each
+    // (disasm AddNewScriptBrain @0x437974: streamedIndex u16 @+0, type s8
+    // @+2, groupingId s8 @+3, ACTIVE u8 @+4, radius f32 @+8, model u16
+    // @+0xC, priority u16 @+0xE; free slot = 0xFFFF @+0). The basketball
+    // brain lives here — and story scripts can switch entries off, which is
+    // the classic "basketballs vanish after Madd Dogg" glitch.
+    void* CTheScripts_ScriptsForBrains;
 
     // Synchronous scene stream-in around a point (the game's teleport warm-up).
     // Used once on bail-out so the world below a skydive is already resident.
@@ -388,6 +407,11 @@ struct GameSymbols {
     void  (*CAudioEngine_ReportBulletHit)(void* audioEngine, void* entity,
                                           unsigned char surface,
                                           Vec3* position, float angleDegrees);
+    // Frontend jingle (score/beep feedback for the custom basketball).
+    void  (*CAudioEngine_ReportFrontendAudioEvent)(void* audioEngine,
+                                                   int eventId,
+                                                   float volumeChange,
+                                                   float speed);
     // Physical contact thud for props: the same call CPhysical::ApplyCollision
     // makes when CJ's body pushes an object, so a punch on the gym bag picks
     // the authored AE_SURFACE_TYPE_PUNCHBAG sound instead of a bullet impact.
@@ -602,6 +626,8 @@ struct GameSymbols {
     void* CPad_GetGroupControlForward;
     bool  (*CPad_GetSprint)(void* pad, int sprintType);
     bool  (*CPad_NextStationJustUp)(void* pad);
+    bool  (*CPad_LastStationJustUp)(void* pad);
+    signed char (*CAudioEngine_GetCurrentRadioStationID)(void* audioEngine);
     // Mobile SA's enter/exit query polls the touch ENTER_CAR widget rather than
     // CControllerState.ButtonTriangle. Hooking this exact exported query lets
     // Touch Y behave like Vice City's Triangle without synthesising screen taps.

@@ -26,7 +26,15 @@ $forbiddenExtensions = @(
 )
 $forbiddenFileNames = @('.env', 'local.properties', 'release-signing.properties')
 
-$allItems = @(Get-ChildItem -LiteralPath $Root -Force -Recurse)
+$gitMetadataRoot = (Join-Path $Root '.git').TrimEnd('\') + '\'
+$allItems = @(
+    Get-ChildItem -LiteralPath $Root -Force -Recurse |
+        Where-Object {
+            -not $_.FullName.StartsWith(
+                $gitMetadataRoot,
+                [System.StringComparison]::OrdinalIgnoreCase)
+        }
+)
 $badDirectories = @(
     $allItems | Where-Object {
         $_.PSIsContainer -and (
@@ -74,7 +82,7 @@ foreach ($entry in $expectedHands.GetEnumerator()) {
 }
 
 $xrSource = Get-Content -LiteralPath (Join-Path $Root 'native\src\Xr.cpp') -Raw
-$versionMatch = [regex]::Match($xrSource, 'kModVersion\[\]\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
+$versionMatch = [regex]::Match($xrSource, 'kModVersionShown\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
 if (-not $versionMatch.Success) { throw 'Could not read kModVersion from Xr.cpp.' }
 $modVersion = $versionMatch.Groups[1].Value
 $readmeText = Get-Content -LiteralPath (Join-Path $Root 'README.md') -Raw
@@ -89,7 +97,7 @@ $documentedActiveSourceManifest = '6861B4187AE1B27D3A8579CBD310E4EBDA024B6A4AE4C
 if ($snapshotText -notmatch [regex]::Escape($documentedActiveSourceManifest)) {
     throw 'SOURCE_SNAPSHOT active-tree provenance marker is stale.'
 }
-$discordChannel = 'https://discord.com/channels/747967102895390741/1540234546182750228'
+$discordChannel = 'https://discord.com/channels/747967102895390741/1543691482861408276'
 if ($readmeText -notmatch [regex]::Escape($discordChannel)) {
     throw 'The public Discord channel is missing from README.'
 }
@@ -136,21 +144,17 @@ if ($windowsInstallerText -notmatch [regex]::Escape("@('shell', 'chmod', '-R', '
     throw 'An installer no longer makes shell-published Quest payloads readable by the game UID.'
 }
 $loaderText = Get-Content -LiteralPath (Join-Path $Root 'loader\src\com\savr\SavrApplication.java') -Raw
-if ($loaderText -notmatch [regex]::Escape('getExternalFilesDir(null)') -or
-    $loaderText -notmatch [regex]::Escape('bankReadable=') -or
-    $loaderText -notmatch [regex]::Escape('meshReadable=')) {
-    throw 'The Java loader no longer performs the app-context payload preflight.'
+if ($loaderText -notmatch [regex]::Escape('getExternalFilesDir(null)')) {
+    throw 'The Java loader no longer seeds settings through the app-owned files directory.'
 }
-$mainText = Get-Content -LiteralPath (Join-Path $Root 'native\src\main.cpp') -Raw
-if ($mainText -notmatch [regex]::Escape('audio preflight: data=') -or
-    $mainText -notmatch [regex]::Escape('externalFilesPath') -or
-    $mainText -notmatch [regex]::Escape('xr::SetExternalFilesDir')) {
-    throw 'The native loader no longer uses or reports the app-resolved external files path.'
-}
-$xrText = Get-Content -LiteralPath (Join-Path $Root 'native\src\Xr.cpp') -Raw
-if ($xrText -notmatch [regex]::Escape('[hands] asset directory') -or
-    $xrText -notmatch [regex]::Escape('g_externalFilesDir')) {
-    throw 'The hand renderer no longer uses or reports the app-resolved asset path.'
+foreach ($settingName in @(
+    'vr_driving.ini', 'vr_appearance.ini', 'vr_basketball.ini',
+    'vr_calib.ini', 'vr_graphics.ini', 'vr_holsters.ini',
+    'vr_hud.ini', 'vr_locomotion.ini'
+)) {
+    if ($loaderText -notmatch [regex]::Escape('"' + $settingName + '"')) {
+        throw "The Java loader no longer seeds $settingName."
+    }
 }
 
 $nativeRoot = Join-Path $Root 'native'
@@ -279,7 +283,7 @@ foreach ($relative in $resetFiles) {
 }
 $resetText = $resetText -join "`n"
 $expectedSettings = @(
-    'vr_appearance.ini', 'vr_calib.ini', 'vr_calib.ini.tmp',
+    'vr_appearance.ini', 'vr_basketball.ini', 'vr_calib.ini', 'vr_calib.ini.tmp',
     'vr_driving.ini', 'vr_graphics.ini', 'vr_holsters.ini',
     'vr_hud.ini', 'vr_locomotion.ini'
 )

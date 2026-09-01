@@ -7,7 +7,7 @@ namespace savr::throwable {
 // responsible for ammo, fuse, projectile allocation, effects and crime events.
 bool Install();
 
-// qbuild-compatible interaction: press/hold R2 to publish a collision-clipped
+// reference Quest build-compatible interaction: press/hold R2 to publish a collision-clipped
 // trajectory, release R2 to call the native projectile path with that launch.
 // Call once per on-foot GameThread frame after PhysicalWeapon::Update.
 void Update(bool interactionsBlocked);

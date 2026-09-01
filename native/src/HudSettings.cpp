@@ -15,10 +15,11 @@ namespace {
 constexpr const char* kPath =
     "/sdcard/Android/data/com.rockstargames.gtasa/files/vr_hud.ini";
 
-// qbuild ships CLASSIC as the approachable default.  SA follows that behaviour
+// reference Quest build ships CLASSIC as the approachable default.  SA follows that behaviour
 // so a new test build immediately proves that the integration is active.
 std::atomic<int>  g_preset{CLASSIC};
 std::atomic<bool> g_enabled{true};
+std::atomic<bool> g_gazeAutoHide{true};
 std::atomic<int>  g_objectiveMarkerMode{OBJECTIVE_ORIGINAL};
 std::once_flag    g_initOnce;
 std::mutex        g_saveMutex;
@@ -34,7 +35,7 @@ struct ElementDefaults {
 // real-image crops; Health contains the complete top-right status block.
 constexpr ElementDefaults kElementDefaults[ELEMENT_COUNT] = {
     {1,   0, 104, 284, 284,  25, 47, 28, 34,  2}, // radar
-    {1, 788,  40, 216,  88,  53, 44,  8,  2, 10}, // complete top-right status
+    {1, 776,  16, 216,  48,  53, 42,  8,  3, 14}, // complete top-right status
     {0, 348, 308, 676, 264,  40, 40, 23,  5, 10}, // large mission messages
     {1, 200,   0, 624, 240,  36, 34, 24, 15, 10}, // help/tutorial/brief text
     {1,   0,   0,  64,  64,  62, 26, 24,  8, 10}, // mission timers/counters
@@ -183,6 +184,7 @@ void Load() {
     }
     int preset = CLASSIC;
     int enabled = 1;
+    int gazeAutoHide = 1;
     int objectiveMarkerMode = OBJECTIVE_ORIGINAL;
     if (FILE* file = std::fopen(kPath, "r")) {
         char line[96];
@@ -192,6 +194,8 @@ void Load() {
                 preset = ClampPreset(value);
             else if (std::sscanf(line, "GameplayHud=%d", &value) == 1)
                 enabled = value != 0;
+            else if (std::sscanf(line, "HudGazeAutoHide=%d", &value) == 1)
+                gazeAutoHide = value != 0;
             else if (std::sscanf(line, "ObjectiveMarkers=%d", &value) == 1)
                 objectiveMarkerMode = ClampObjectiveMarkerMode(value);
             else {
@@ -261,6 +265,7 @@ void Load() {
         g_element[MESSAGES][ELEMENT_SCALE].store(10,std::memory_order_relaxed);
     g_preset.store(preset, std::memory_order_release);
     g_enabled.store(enabled != 0, std::memory_order_release);
+    g_gazeAutoHide.store(gazeAutoHide != 0, std::memory_order_release);
     g_objectiveMarkerMode.store(objectiveMarkerMode, std::memory_order_release);
     LOGI("hud settings: preset=%s enabled=%d objective=%d",
          preset == CLASSIC ? "CLASSIC" : "IMMERSIVE",
@@ -272,10 +277,24 @@ void EnsureLoaded() { std::call_once(g_initOnce, Load); }
 void Save() {
     EnsureLoaded();
     std::lock_guard<std::mutex> lock(g_saveMutex);
-    if (FILE* file = std::fopen(kPath, "w")) {
+    FILE* file = std::fopen(kPath, "w");
+    if (file == nullptr) {
+        // Player-report fix: the installer pushes a default vr_hud.ini over
+        // adb, which some firmwares leave shell-owned and unwritable for the
+        // app through FUSE - every crop calibration then silently died with
+        // this fopen and "reset on restart". Unlinking the foreign file is
+        // allowed (the directory is ours) and the rewrite then succeeds.
+        std::remove(kPath);
+        file = std::fopen(kPath, "w");
+        LOGW("hud settings: save retry after unlink -> %s",
+             file ? "ok" : "still failing");
+    }
+    if (file != nullptr) {
         std::fprintf(file, "HudPreset=%d\n", g_preset.load(std::memory_order_acquire));
         std::fprintf(file, "GameplayHud=%d\n",
                      g_enabled.load(std::memory_order_acquire) ? 1 : 0);
+        std::fprintf(file, "HudGazeAutoHide=%d\n",
+                     g_gazeAutoHide.load(std::memory_order_acquire) ? 1 : 0);
         std::fprintf(file, "ObjectiveMarkers=%d\n",
                      g_objectiveMarkerMode.load(std::memory_order_acquire));
         for (int element = 0; element < ELEMENT_COUNT; ++element) {
@@ -336,6 +355,21 @@ void SetGameplayHudEnabled(bool enabled) {
 }
 
 void ToggleGameplayHud() { SetGameplayHudEnabled(!GameplayHudEnabled()); }
+
+bool GazeAutoHideEnabled() {
+    EnsureLoaded();
+    return g_gazeAutoHide.load(std::memory_order_acquire);
+}
+
+void SetGazeAutoHideEnabled(bool enabled) {
+    EnsureLoaded();
+    if (g_gazeAutoHide.exchange(enabled, std::memory_order_acq_rel) != enabled)
+        Save();
+}
+
+void ToggleGazeAutoHide() {
+    SetGazeAutoHideEnabled(!GazeAutoHideEnabled());
+}
 
 bool ShouldRenderClassicHud() {
     return GameplayHudEnabled() && CurrentPreset() == CLASSIC;

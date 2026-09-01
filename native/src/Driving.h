@@ -12,6 +12,10 @@ namespace savr::driving {
 enum Mode {
     MODE_DEFAULT = 0,
     MODE_IMMERSIVE,
+    // Vice City Quest parity: steer cars/bikes by ROTATING the controller
+    // (aim-pose yaw against a reference captured on the first throttle
+    // press). No wheel grab; hands stay free.
+    MODE_MOTION,
     MODE_COUNT
 };
 
@@ -65,6 +69,15 @@ enum OffsetField {
     F_BOAT_SEAT_HEIGHT,
     F_IMMERSIVE_BOAT_SEAT_DISTANCE,
     F_IMMERSIVE_BOAT_SEAT_HEIGHT,
+    // Appended for config-array compatibility with existing installs.  Each
+    // vehicle category/mode now owns a lateral seat offset just like forward
+    // and height; the old F_SIDE remains DEFAULT CAR side.
+    F_BIKE_SEAT_SIDE,
+    F_IMMERSIVE_CAR_SEAT_SIDE,
+    F_IMMERSIVE_BIKE_SEAT_SIDE,
+    F_PLANE_SEAT_SIDE,
+    F_BOAT_SEAT_SIDE,
+    F_IMMERSIVE_BOAT_SEAT_SIDE,
     F_COUNT
 };
 
@@ -120,8 +133,10 @@ enum MenuItem {
     MENU_CAMERA_VIEW,
     MENU_BICYCLE_MODE,
     MENU_BIKE_ACCELERATOR,
+    MENU_GLOBAL_SIDE,
     MENU_GLOBAL_FORWARD,
     MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE,
     MENU_MODEL_FORWARD,
     MENU_MODEL_HEIGHT,
     MENU_CONTROL_CALIBRATION,
@@ -133,6 +148,9 @@ enum MenuItem {
     MENU_KEEP_RIDER_ON_FLIPS,
     MENU_WHEEL_VISIBLE,
     MENU_INTERIOR_GLASS,
+    MENU_DRIVEBY_AIM,
+    MENU_CAR_CAMERA_TILT,
+    MENU_BOAT_CAMERA_TILT,
     MENU_RESET,
     MENU_BACK
 };
@@ -207,14 +225,19 @@ bool IsMenuItemAvailable(int vehicleType, int item);
 
 int GetGlobalSeatForwardCm(int vehicleType);
 int GetGlobalSeatHeightCm(int vehicleType);
+int GetGlobalSeatSideCm(int vehicleType);
 void AdjustGlobalSeatForwardCm(int vehicleType, int direction);
 void AdjustGlobalSeatHeightCm(int vehicleType, int direction);
+void AdjustGlobalSeatSideCm(int vehicleType, int direction);
 int GetCurrentModelSeatForwardCm(int vehicleType);
 int GetCurrentModelSeatHeightCm(int vehicleType);
+int GetCurrentModelSeatSideCm(int vehicleType);
 void AdjustCurrentModelSeatForwardCm(int vehicleType, int direction);
 void AdjustCurrentModelSeatHeightCm(int vehicleType, int direction);
+void AdjustCurrentModelSeatSideCm(int vehicleType, int direction);
 int GetActiveSeatForwardCm();
 int GetActiveSeatHeightCm();
+int GetActiveSeatSideCm();
 int GetActiveVehicleType();
 int GetActiveVehicleModelId();
 const char* GetActiveVehicleModelName();
@@ -251,6 +274,24 @@ void ToggleKeepRiderOnFlips();
 bool GetActiveBikeVisualBasis(float right[3], float forward[3], float up[3]);
 bool IsInteriorGlassHidden();
 void ToggleInteriorGlass();
+// Car camera motion: LEVEL (default) keeps the yaw-only comfort base with a
+// level horizon; FULL TILT takes the whole car basis, so hills, jumps and
+// body roll throw the view with the car (the aircraft FULL TILT of cars).
+bool CarCameraTiltEnabled();
+void ToggleCarCameraTilt();
+// Boats (vehicle appearance 4): LEVEL horizon vs full-hull tilt.
+bool BoatCameraTiltEnabled();
+void ToggleBoatCameraTilt();
+// DEFAULT-driving drive-by style. CLASSIC keeps the stock grip+B auto-aim;
+// IMMERSIVE draws a one-handed sidearm and aims/fires it with the tracked hand
+// (like immersive driving) while the car stays on ordinary stick control.
+// Global toggle, persisted with the loadout.
+bool IsDrivebyAimImmersive();
+void ToggleDrivebyAimImmersive();
+// True when the current vehicle should use the physical (hand-aimed) weapon
+// system: immersive DRIVING, or any driving with the immersive drive-by option
+// on. Weapon/fire/render gates read this; driving CONTROL never does.
+bool VehicleWeaponsImmersive();
 bool ShouldUseTrackedHands();
 void SetMenuPreview(bool active, int calibrationHand = -1);
 
@@ -261,6 +302,14 @@ void ResetInteraction();
 void RefreshVisualTracking();
 
 bool GetWheelVisualState(WheelVisualState* out);
+// Motion steering hand (0 left / 1 right), persisted as MotionSteeringHand.
+int  GetMotionSteeringHand();
+void ToggleMotionSteeringHand();
+// True while MOTION steering owns the wheel (car/bike, mode = MOTION); the
+// input pump must then feed the provider the motion value, not the stick.
+bool MotionSteeringActive();
+float MotionSteeringValue();
+
 bool GetGrabbedHandVisual(int hand, float position[3], float right[3],
                           float up[3], float forward[3]);
 

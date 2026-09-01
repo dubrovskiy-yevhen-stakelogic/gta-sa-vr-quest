@@ -1,5 +1,6 @@
 #include "VrCamera.h"
 
+#include "AircraftHlod.h"
 #include "Calib.h"
 #include "Driving.h"
 #include "EyeDepth.h"
@@ -16,8 +17,13 @@
 #include "TrafficCensus.h"
 #include "Xr.h"
 
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+
 #include <sys/mman.h>
 #include <sys/system_properties.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -26,6 +32,7 @@
 #include <bit>
 #include <cerrno>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -34,6 +41,7 @@
 #include <dlfcn.h>
 #include <limits>
 #include <mutex>
+#include <vector>
 
 namespace savr::vrcam {
 namespace {
@@ -58,6 +66,14 @@ constexpr std::size_t kOffGenerationMultiplier = 0xF8;
 // 20% earlier. A value of 1.0 disables the behavior without another APK.
 constexpr float kDefaultLinkedLodPrefetchFactor = 1.20f;
 constexpr char kLinkedLodPrefetchProperty[] = "debug.savr.lod_prefetch";
+
+// The OpenXR runtime exposes the exact triangles that are hidden by the
+// headset lenses. Stamp those pixels into the eye depth buffer before the
+// opaque world so the mobile GPU can reject fragment work that can never reach
+// the display. This changes neither eye resolution nor visible geometry. A
+// process-start property provides a clean runtime A/B without another APK.
+constexpr bool kDefaultHiddenAreaMaskEnabled = true;
+constexpr char kHiddenAreaMaskProperty[] = "debug.savr.hidden_area_mask";
 
 // Unified phone-like distance profile. User-facing distances now live in the
 // persisted Graphics menu below; this hidden switch remains the emergency
@@ -178,12 +194,13 @@ constexpr float kPhoneStaticVisibilityFarFloorM = 0.0f;
 constexpr char kStaticVisibilityFarFloorProperty[] =
     "debug.savr.visibility_far_m";
 
-// Aircraft use GTA's authored BIG-building parent LODs as a cheap city
-// horizon.  ScanWorld already keeps ordinary 50 m sectors at the retail 300 m
-// detail radius, while its separate 200 m LOD-sector wedge follows the RW far
-// plane.  Grow an explicit horizontal ground footprint with AGL, then convert
-// it to the slant distance required by the camera.  This avoids the old failure
-// mode where a fixed far plane covered less ground on every metre of climb.
+// The expanded aircraft shell is kept behind one compile-time A/B switch. The
+// flight capture at the 45 m gate showed an abrupt retail 625 m -> ~1.1 km
+// projection jump and 170..250 extra BIG roots. Keep only the cheap HLOD colour
+// underlay inside the live retail fog and the corrected scan direction; the
+// expensive deterministic detail union and authored-root shell remain off.
+constexpr bool kAircraftExpandedCoarseShellEnabled = false;
+// Expanded-shell constants retained for a later, separately budgeted profile.
 constexpr float kAircraftLodBaseGroundRadiusM = 900.0f;
 constexpr float kAircraftLodGroundRadiusPerAltitude = 2.0f;
 // The first root-shell flight showed that the 1.8 km disk was already drawing
@@ -196,23 +213,22 @@ constexpr float kAircraftLodMaxGroundRadiusM = 1500.0f;
 constexpr float kAircraftLodScanMarginM = 100.0f;
 constexpr float kAircraftLodFarMarginM = 100.0f;
 constexpr float kAircraftLodMaxFarClipM = 5000.0f;
+constexpr float kAircraftLodEngageAltitudeM = 45.0f;
+constexpr float kAircraftLodDisengageAltitudeM = 30.0f;
 // Retail already reaches roughly 2.2 at the top of the user's measured
 // take-off, so an altitude/150 target below that was a no-op.  Start at the
 // retail high-altitude baseline and add deterministic AGL compensation.
 constexpr float kAircraftLodBaseLowLodScale = 2.2f;
 constexpr float kAircraftLodShortestRootDrawDistanceM = 400.0f;
 constexpr float kAircraftLodMaxLowLodScale = 4.0f;
-// The stock far LOD scan is a forward horizontal wedge.  Scan only the true
-// authored parent LODs in the BIG grid through a bounded 360-degree disk from
-// the first aircraft frame. A smaller take-off disk left a 500..900 m annulus
-// entirely owned by the pitch-dependent retail wedge and produced large blue
-// cuts as soon as the plane lifted. Linked BIG children remain forbidden.
-// Rootless, long-range standalone shells are handled separately through a
-// resident-only horizontal union below: this fills the pitch-dependent middle
-// distance without turning the whole BIG grid into a 360-degree detail pass.
+// The stock far LOD scan is a forward horizontal wedge.  Keep its textured BIG
+// parents only through a bounded 360-degree disk from the first aircraft frame.
+// Beyond this cap the dedicated, much cheaper HLOD mesh still owns the full
+// altitude-compensated 1.2..1.8 km silhouette; retaining hundreds of textured
+// parents behind opaque distance fog only caused take-off streaming churn.
+// Linked BIG children remain forbidden.
 constexpr float kAircraftLodSupplementalStartAltitudeM = 0.0f;
-constexpr float kAircraftLodSupplementalMaxRadiusM =
-    kAircraftLodMaxGroundRadiusM;
+constexpr float kAircraftLodSupplementalMaxRadiusM = 650.0f;
 constexpr int kAircraftLodSupplementalSectorLimit = 320;
 // Stock ScanBig stamps a root before deciding whether its heading is eligible
 // for streaming.  A flat first-N array therefore inherits stock's HMD order:
@@ -264,12 +280,14 @@ constexpr int kAircraftStandaloneHorizonAttemptLimit = 256;
 // the map footprint, resident-only policy and admission budget remain bounded.
 constexpr float kAircraftOrdinaryHorizonMinSlantDistanceM = 100.0f;
 constexpr float kAircraftOrdinaryHorizonMaxGroundDistanceM = 300.0f;
-// Runtime 0.9.88 proved that the old 96-entry ceiling was not the city
-// bottleneck: only about 30..47 rootless entries were source-safe while the
-// replay itself cost roughly 0.7 ms. Keep a 48-cell omnidirectional shell and
-// carry that exact spatial choice into the next stock frame. This raises dense
-// city coverage without allowing sparse scenes to spend all 96 old slots.
+// The deterministic replay below keeps its 48-cell shell.  The first-pass
+// stock-range union is a separate exact transaction: the last dense-city
+// capture contained 154 safe inner candidates across all gaze directions.
+// Admit that whole measured set (plus small headroom) under one shared limit,
+// counting stock hits and rescues identically so head movement cannot trade a
+// free stock object for a capped off-frustum miss.
 constexpr int kAircraftOrdinaryHorizonForcedLimit = 48;
+constexpr int kAircraftOrdinaryFirstPassUnionLimit = 160;
 // Runtime 0.9.63 proved that the slant compensation and the bounded prefetch
 // were healthy, but neither can see an entity whose 50 m ordinary sector was
 // never visited.  Above 200 m AGL, add a final resident-only forward annulus.
@@ -293,6 +311,11 @@ constexpr int kAircraftOrdinaryOuterFarPriorityLimitMax =
     kAircraftOrdinaryOuterPriorityLimitMax -
     kAircraftOrdinaryOuterNearPriorityLimitMax;
 constexpr float kAircraftOrdinaryOuterFarBandStartM = 400.0f;
+// Remaining safe stock-range BUILDING/DUMMY entries use the same maximum-over-
+// all-gazes rule under a separate cap.  The latest dense-city capture reached
+// 108 eligible entries, so 128 covers that measured set without widening
+// streaming or draw range.
+constexpr int kAircraftStockPitchMaxRescueLimit = 128;
 // ScanSectorList writes CEntity::m_nScanCode before SetupMap decides whether
 // the entity is visible.  A later sector pass therefore cannot recover an
 // entity rejected by the current head pitch.  Capture the bounded ordinary
@@ -315,6 +338,20 @@ constexpr int kAircraftOrdinaryRadialReplaySectorLimit = 512;
 constexpr int kAircraftOrdinaryRadialSectorSnapshotLimit = 4096;
 constexpr int kAircraftOrdinaryInnerAngularBins = 12;
 constexpr int kAircraftOrdinaryInnerRadialBins = 4;
+// A second, independent 16x3 roster is chosen only after the complete 300 m
+// static disk is known.  It carries substantial rootless inner candidates into
+// the next stock scan, where their per-call radial threshold can be widened
+// before retail would discard them.  The former 12x2 grid left only two radial
+// representatives in each broad direction; the flight capture still showed a
+// boundary house toggling while the complete candidate set stayed healthy.
+// Forty-eight world-space cells remain a small, resident-only fixed budget but
+// retain enough angular/radial samples that pitch and yaw no longer choose a
+// different sparse city slice.
+constexpr int kAircraftOrdinaryStockMaxAngularBins = 16;
+constexpr int kAircraftOrdinaryStockMaxRadialBins = 3;
+constexpr int kAircraftOrdinaryStockMaxLimit =
+    kAircraftOrdinaryStockMaxAngularBins *
+    kAircraftOrdinaryStockMaxRadialBins;
 constexpr int kAircraftOrdinaryOuterAngularBins = 8;
 constexpr int kAircraftOrdinaryOuterRadialBins = 4;
 constexpr float kAircraftOrdinaryLargeBuildingMinBoundRadiusM = 12.0f;
@@ -356,11 +393,30 @@ constexpr int kAircraftOrdinaryPrefetchQueueLimit = 8;
 // coexist with its fully opaque detail child in the ordinary render list.  On
 // mobile the two meshes have too little depth separation to be a stable
 // fallback and were observed to fight while head pitch changed.  Keep full
-// detail through the configured 180 m building-detail radius, then choose the
-// already-confirmed cheap parent exclusively.  All list mutation below is
-// fail-closed and requires exact one-to-one membership in both retail arrays.
-constexpr float kAircraftOpaqueChildMinimumExclusiveDistanceM = 180.0f;
+// detail through a fixed 300 m aircraft disk, then choose the already-confirmed
+// cheap parent exclusively.  All list mutation below is fail-closed and
+// requires exact one-to-one membership in both retail arrays.
+constexpr float kAircraftOpaqueChildMinimumExclusiveDistanceM = 300.0f;
 constexpr int kAircraftOpaqueChildCaptureLimit = 256;
+// The completed-list pass is narrower than the rejected proxy experiments: it
+// removes only an exact opaque linked child when its authored parent is already
+// retained in the retail LOD array.  This extends the same child/parent
+// exclusivity proof to multi-child parents beyond the fixed detail disk.  The
+// unrelated untextured megamesh stays disabled.
+constexpr bool kAircraftFinalListChildPruneEnabled = true;
+constexpr bool kAircraftMegaMeshEnabled = false;
+// The per-entity shell proved both expensive and incomplete in dense cities.
+// Build the already-resident authored LOD parents into a few untextured world-
+// space batches instead.  Stock geometry is rendered after these batches and
+// therefore replaces the proxy wherever it exists; the proxy remains only in
+// gaps.  Keep a near exclusion so coarse parents cannot occlude useful street-
+// level detail, and hard-cap all copied geometry independently of retail lists.
+constexpr float kAircraftMegaMeshMinGroundDistanceM = 220.0f;
+constexpr float kAircraftMegaMeshRebuildDistanceM = 100.0f;
+constexpr int kAircraftMegaMeshRebuildFrames = 72;
+constexpr int kAircraftMegaMeshBatchLimit = 3;
+constexpr int kAircraftMegaMeshVerticesPerBatch = 60000;
+constexpr int kAircraftMegaMeshIndicesPerBatch = 180000;
 // Every retained witness is captured by the same verified SetupBig call only
 // after CaptureAircraftRootForUnion has accepted that root.  Sharing the
 // union ceiling prevents this auxiliary array from disabling an otherwise
@@ -411,6 +467,7 @@ static_assert(kAircraftOrdinaryHorizonForcedLimitMax == 80);
 static_assert(kAircraftOrdinaryInnerAngularBins *
                   kAircraftOrdinaryInnerRadialBins ==
               kAircraftOrdinaryHorizonForcedLimit);
+static_assert(kAircraftOrdinaryStockMaxLimit == 48);
 static_assert(kAircraftOrdinaryOuterAngularBins *
                   kAircraftOrdinaryOuterRadialBins ==
               kAircraftOrdinaryOuterPriorityLimitMax);
@@ -487,6 +544,7 @@ enum GraphicsDistanceField {
     GFXDIST_ROADSIDE_GATE,
     GFXDIST_TRAFFIC_SPAWN,
     GFXDIST_PED_SPAWN,
+    GFXDIST_FLIGHT_DISTANCE,
     GFXDIST_COUNT,
 };
 
@@ -513,17 +571,19 @@ constexpr std::array<GraphicsDistanceSpec, GFXDIST_COUNT>
         {"RoadsideGateM", "ROADSIDE GATE", {120, 150, 180, 220, 260}, 5, 2, false},
         {"TrafficSpawnM", "TRAFFIC SPAWN", {120, 140, 160, 0, 0}, 3, 1, true},
         {"PedSpawnM", "PED SPAWN", {60, 75, 90, 105, 120}, 5, 2, false},
+        {"FlightDistanceM", "FLIGHT DISTANCE", {0, 750, 1000, 1250, 1500}, 5, 0, false},
     }};
 
 constexpr float kEyeRenderScales[] = {
     0.60f, 0.70f, 0.80f, 0.90f, 1.00f, 1.10f,
+    1.25f, 1.50f, 1.75f, 2.00f,
 };
 constexpr int kRenderScaleCount =
     static_cast<int>(sizeof(kEyeRenderScales) / sizeof(kEyeRenderScales[0]));
-// 110% supersampling: the author-calibrated baseline the RESET DEFAULTS row
-// restores, so players who wander through the graphics menu land back on the
-// intended look.
-constexpr int kDefaultRenderScaleIndex = 5;
+// Native 100% is the public baseline. Quest Games Optimizer users commonly
+// raise the app resolution externally, so silently stacking 110% on top wastes
+// GPU time. The menu still exposes up to 200% for deliberate local testing.
+constexpr int kDefaultRenderScaleIndex = 4;
 const char* const kGraphicsSettingsPath =
     "/sdcard/Android/data/com.rockstargames.gtasa/files/vr_graphics.ini";
 
@@ -531,14 +591,34 @@ std::once_flag g_graphicsSettingsLoadOnce;
 std::mutex g_graphicsSettingsSaveMutex;
 std::array<std::atomic<int>, GFXDIST_COUNT> g_graphicsDistanceChoice{};
 std::atomic<int> g_requestedRenderScaleIndex{kDefaultRenderScaleIndex};
+std::atomic<int> g_appliedRenderScaleIndex{kDefaultRenderScaleIndex};
+std::atomic<bool> g_worldEffectsEnabled{true};
 std::atomic<bool> g_neonSignsEnabled{true};
 std::atomic<bool> g_colorGradingEnabled{true};
+constexpr int kShadowModeOff = 0;
+constexpr int kShadowModeSimple = 1;
+constexpr int kShadowModeHybrid = 2;
+constexpr int kShadowModeFull = 3;
+constexpr int kShadowModeCount = 4;
+constexpr int kDefaultShadowMode = kShadowModeSimple;
+std::atomic<int> g_dynamicShadowMode{kDefaultShadowMode};
 std::atomic<bool> g_hdWeaponsEnabled{false};
 std::atomic<std::uint32_t> g_neonSignsSeenMask{0};
 int g_currentRenderScaleIndex = kDefaultRenderScaleIndex;
 
 int ClampRenderScaleIndex(int index) {
     return std::clamp(index, 0, kRenderScaleCount - 1);
+}
+
+int ClampShadowMode(int mode) {
+    return std::clamp(mode, kShadowModeOff, kShadowModeFull);
+}
+
+const char* ShadowModeName(int mode) {
+    static constexpr const char* kNames[kShadowModeCount] = {
+        "OFF", "SIMPLE", "HYBRID", "FULL",
+    };
+    return kNames[ClampShadowMode(mode)];
 }
 
 int ClampDistanceChoice(int field, int choice) {
@@ -564,8 +644,11 @@ int NearestDistanceChoice(int field, int metres) {
 
 void LoadGraphicsSettings() {
     int renderScale = kDefaultRenderScaleIndex;
+    bool worldEffects = true;
     bool neonSigns = true;
     bool colorGrading = true;
+    int shadowMode = kDefaultShadowMode;
+    bool shadowModeExplicit = false;
     bool hdWeapons = false;
     std::array<int, GFXDIST_COUNT> choices{};
     for (int i = 0; i < GFXDIST_COUNT; ++i)
@@ -581,12 +664,28 @@ void LoadGraphicsSettings() {
                 renderScale = value;
                 continue;
             }
+            if (std::strcmp(key, "Effects") == 0) {
+                worldEffects = value != 0;
+                continue;
+            }
             if (std::strcmp(key, "Neon") == 0) {
                 neonSigns = value != 0;
                 continue;
             }
             if (std::strcmp(key, "ColorGrading") == 0) {
                 colorGrading = value != 0;
+                continue;
+            }
+            if (std::strcmp(key, "DynamicShadows") == 0) {
+                // Migrate the original boolean key to the current Quest-safe
+                // public default, while an explicit ShadowMode below wins.
+                if (!shadowModeExplicit)
+                    shadowMode = value != 0 ? kDefaultShadowMode : kShadowModeOff;
+                continue;
+            }
+            if (std::strcmp(key, "ShadowMode") == 0) {
+                shadowMode = ClampShadowMode(value);
+                shadowModeExplicit = true;
                 continue;
             }
             if (std::strcmp(key, "HdWeapons") == 0) {
@@ -606,22 +705,30 @@ void LoadGraphicsSettings() {
     renderScale = ClampRenderScaleIndex(renderScale);
     g_currentRenderScaleIndex = renderScale;
     g_requestedRenderScaleIndex.store(renderScale, std::memory_order_release);
+    g_appliedRenderScaleIndex.store(renderScale, std::memory_order_release);
+    g_worldEffectsEnabled.store(worldEffects, std::memory_order_release);
     g_neonSignsEnabled.store(neonSigns, std::memory_order_release);
     g_colorGradingEnabled.store(colorGrading, std::memory_order_release);
+    shadowMode = ClampShadowMode(shadowMode);
+    g_dynamicShadowMode.store(shadowMode, std::memory_order_release);
     g_hdWeaponsEnabled.store(hdWeapons, std::memory_order_release);
     for (int i = 0; i < GFXDIST_COUNT; ++i) {
         g_graphicsDistanceChoice[i].store(
             ClampDistanceChoice(i, choices[i]), std::memory_order_release);
     }
-    LOGI("[graphics.settings] loaded scale=%d%% neon=%d vehicle=%dm ped=%dm "
-         "trees=%dm traffic_spawn=%dm ped_spawn=%dm",
+    LOGI("[graphics.settings] loaded scale=%d%% effects=%d neon=%d grade=%d shadows=%s "
+         "vehicle=%dm ped=%dm trees=%dm traffic_spawn=%dm ped_spawn=%dm flight=%dm",
          static_cast<int>(kEyeRenderScales[renderScale] * 100.0f + 0.5f),
+         worldEffects ? 1 : 0,
          neonSigns ? 1 : 0,
+         colorGrading ? 1 : 0,
+          ShadowModeName(shadowMode),
          kGraphicsDistanceSpecs[GFXDIST_VEHICLE_DETAIL].metres[choices[GFXDIST_VEHICLE_DETAIL]],
          kGraphicsDistanceSpecs[GFXDIST_PED_DRAW].metres[choices[GFXDIST_PED_DRAW]],
          kGraphicsDistanceSpecs[GFXDIST_TREES_PALMS].metres[choices[GFXDIST_TREES_PALMS]],
          kGraphicsDistanceSpecs[GFXDIST_TRAFFIC_SPAWN].metres[choices[GFXDIST_TRAFFIC_SPAWN]],
-         kGraphicsDistanceSpecs[GFXDIST_PED_SPAWN].metres[choices[GFXDIST_PED_SPAWN]]);
+         kGraphicsDistanceSpecs[GFXDIST_PED_SPAWN].metres[choices[GFXDIST_PED_SPAWN]],
+         kGraphicsDistanceSpecs[GFXDIST_FLIGHT_DISTANCE].metres[choices[GFXDIST_FLIGHT_DISTANCE]]);
 }
 
 void EnsureGraphicsSettingsLoaded() {
@@ -665,12 +772,21 @@ void SaveGraphicsSettings() {
         const int renderScale = ClampRenderScaleIndex(
             g_requestedRenderScaleIndex.load(std::memory_order_acquire));
         bool ok = std::fprintf(file, "RenderScale=%d\n", renderScale) >= 0;
+        ok = std::fprintf(file, "Effects=%d\n",
+                          g_worldEffectsEnabled.load(std::memory_order_acquire)
+                              ? 1 : 0) >= 0 && ok;
         ok = std::fprintf(file, "Neon=%d\n",
                           g_neonSignsEnabled.load(std::memory_order_acquire)
                               ? 1 : 0) >= 0 && ok;
         ok = std::fprintf(file, "ColorGrading=%d\n",
                           g_colorGradingEnabled.load(std::memory_order_acquire)
-                              ? 1 : 0) >= 0 && ok;
+                               ? 1 : 0) >= 0 && ok;
+        ok = std::fprintf(file, "DynamicShadows=%d\n",
+                          g_dynamicShadowMode.load(std::memory_order_acquire) !=
+                                  kShadowModeOff ? 1 : 0) >= 0 && ok;
+        ok = std::fprintf(file, "ShadowMode=%d\n",
+                          ClampShadowMode(g_dynamicShadowMode.load(
+                              std::memory_order_acquire))) >= 0 && ok;
         ok = std::fprintf(file, "HdWeapons=%d\n",
                           g_hdWeaponsEnabled.load(std::memory_order_acquire)
                               ? 1 : 0) >= 0 && ok;
@@ -1587,9 +1703,47 @@ enum class DeferredFinishDrainReason : std::uint8_t {
     WaitBypassCollision,
 };
 
+enum class GameUpdateSubsystem : std::uint8_t {
+    Game,
+    Streaming,
+    TextureDatabase,
+    TexturePump,
+    TextureLoad,
+    ModelRequests,
+    Scripts,
+    PathStreaming,
+    Population,
+    World,
+    Pickups,
+    Camera,
+    Plants,
+    Audio,
+    Count,
+};
+
+struct GameUpdateTiming {
+    int calls{};
+    double wallMs{};
+    double cpuMs{};
+    double maxWallMs{};
+};
+
 void DrainDeferredRenderQueueFinish(DeferredFinishDrainReason reason);
+void DrainBatchedTextureUploads(const char* reason);
 
 struct EnginePreProfile {
+    struct RqUnsizedCaller {
+        std::uintptr_t offset{};
+        int calls{};
+        double wallMs{};
+        double cpuMs{};
+        double maxWallMs{};
+        int beforeScanCalls{};
+        int mainScanCalls{};
+        int afterScanCalls{};
+    };
+    static constexpr std::size_t kRqUnsizedCallerSlots = 8;
+
     bool captured{};
     EnginePreStage stage{EnginePreStage::Inactive};
     double callbackStartMonoMs{};
@@ -1613,6 +1767,10 @@ struct EnginePreProfile {
     int rqSizedFlushCalls{};
     int rqNearEndFlushCalls{};
     int rqExplicitFlushCalls{};
+    std::array<RqUnsizedCaller, kRqUnsizedCallerSlots> rqUnsizedCallers{};
+    int rqUnsizedCallerOverflowCalls{};
+    double rqUnsizedCallerOverflowWallMs{};
+    double rqUnsizedCallerOverflowCpuMs{};
     int rqBeforeScanCalls{};
     double rqBeforeScanWallMs{};
     double rqBeforeScanCpuMs{};
@@ -1636,6 +1794,9 @@ struct EnginePreProfile {
     double rqFinishDrainMaxWallMs{};
     int rqFinishPendingDepthMax{};
     int rqFinishPendingFaults{};
+    std::array<GameUpdateTiming,
+               static_cast<std::size_t>(GameUpdateSubsystem::Count)>
+        gameUpdate{};
 };
 
 EnginePreProfile g_enginePreProfile{};
@@ -1650,10 +1811,17 @@ std::atomic<std::uint64_t> g_deferredRenderQueueFinishFaults{};
 std::uint64_t g_deferredRenderQueueFinishFaultsReported{};
 
 bool IsVerifiedRenderQueueFinishLifecycle(
-    const EnginePreProfile& profile);
+        const EnginePreProfile& profile);
 void PublishRenderQueueFinishNextFrameTicket(
-    const EnginePreProfile& profile);
+        const EnginePreProfile& profile);
 void AcknowledgeDeferredRenderQueueFinishFaults(int reportedFaults);
+bool RenderQueueFinishEyeOverlapRequested();
+bool RenderQueueFinishEyeSetOverlapRequested();
+bool RenderQueueEyeSetBackingRequested();
+bool CaptureRenderQueueEyeSetBacking(std::uint64_t stereoSequence,
+                                     unsigned int eyeSet,
+                                     std::uint64_t* generationOut);
+void WaitRenderQueueEyeSetBackingTicket(std::uint64_t generation);
 
 bool EnginePreProfileOwnedByCurrentThread() {
     return g_enginePreProfileActive.load(std::memory_order_acquire) &&
@@ -1665,7 +1833,15 @@ EnginePreProfile ConsumeEnginePreProfile() {
     EnginePreProfile snapshot{};
     if (g_enginePreOwnerThread.load(std::memory_order_relaxed) !=
             __builtin_thread_pointer() ||
-        !g_enginePreProfileActive.exchange(false,
+        !g_enginePreProfileActive.load(std::memory_order_acquire)) {
+        return snapshot;
+    }
+    // ES2Texture::UploadMip copies its payload into RenderQueue before issuing
+    // a synchronous Flush.  The scoped batching hook postpones only that Flush;
+    // close the batch while the profiler still owns this thread so the one real
+    // drain is attributed to the same frame instead of disappearing into tail.
+    DrainBatchedTextureUploads("profile_close");
+    if (!g_enginePreProfileActive.exchange(false,
                                            std::memory_order_acq_rel)) {
         return snapshot;
     }
@@ -1682,6 +1858,178 @@ EnginePreProfile ConsumeEnginePreProfile() {
     snapshot = g_enginePreProfile;
     g_enginePreProfile.stage = EnginePreStage::Inactive;
     return snapshot;
+}
+
+class ScopedGameUpdateTiming {
+public:
+    explicit ScopedGameUpdateTiming(GameUpdateSubsystem subsystem)
+        : subsystem_(subsystem), active_(EnginePreProfileOwnedByCurrentThread()) {
+        if (!active_) return;
+        wallStartMs_ = NowMs();
+        cpuStartMs_ = perf::ThreadCpuMs();
+    }
+
+    ~ScopedGameUpdateTiming() {
+        if (!active_ || !EnginePreProfileOwnedByCurrentThread()) return;
+        const double wallMs = std::max(0.0, NowMs() - wallStartMs_);
+        const double cpuMs = std::max(0.0, perf::ThreadCpuMs() - cpuStartMs_);
+        auto& timing = g_enginePreProfile.gameUpdate[
+            static_cast<std::size_t>(subsystem_)];
+        ++timing.calls;
+        timing.wallMs += wallMs;
+        timing.cpuMs += cpuMs;
+        timing.maxWallMs = std::max(timing.maxWallMs, wallMs);
+    }
+
+private:
+    GameUpdateSubsystem subsystem_{};
+    bool active_{};
+    double wallStartMs_{};
+    double cpuStartMs_{};
+};
+
+const GameUpdateTiming& GameUpdateSample(
+        const EnginePreProfile& profile, GameUpdateSubsystem subsystem) {
+    return profile.gameUpdate[static_cast<std::size_t>(subsystem)];
+}
+
+void LogGameUpdateHitch(const EnginePreProfile& profile, int sequence) {
+    if (!profile.captured || profile.mainScanCalls != 1 ||
+        profile.mainScanEntryMonoMs < profile.callbackStartMonoMs ||
+        profile.mainScanEntryCpuMs < profile.callbackStartCpuMs) {
+        return;
+    }
+    const double preWallMs =
+        profile.mainScanEntryMonoMs - profile.callbackStartMonoMs;
+    const double preCpuMs =
+        profile.mainScanEntryCpuMs - profile.callbackStartCpuMs;
+    const auto& game = GameUpdateSample(profile, GameUpdateSubsystem::Game);
+    if (preWallMs < 16.0 && game.wallMs < 16.0) return;
+
+    // A continuously overloaded scene can otherwise emit seventy-two long
+    // lines per second. Eight samples retain the hitch distribution while
+    // keeping logcat and the GameThread out of the measurement.
+    static double logWindowStartMs = 0.0;
+    static int logsInWindow = 0;
+    const double nowMs = NowMs();
+    if (logWindowStartMs <= 0.0 || nowMs - logWindowStartMs >= 1000.0) {
+        logWindowStartMs = nowMs;
+        logsInWindow = 0;
+    }
+    if (logsInWindow >= 8) return;
+    ++logsInWindow;
+
+    const auto& streaming = GameUpdateSample(
+        profile, GameUpdateSubsystem::Streaming);
+    const auto& textureDatabase = GameUpdateSample(
+        profile, GameUpdateSubsystem::TextureDatabase);
+    const auto& texturePump = GameUpdateSample(
+        profile, GameUpdateSubsystem::TexturePump);
+    const auto& textureLoad = GameUpdateSample(
+        profile, GameUpdateSubsystem::TextureLoad);
+    const auto& modelRequests = GameUpdateSample(
+        profile, GameUpdateSubsystem::ModelRequests);
+    const auto& scripts = GameUpdateSample(
+        profile, GameUpdateSubsystem::Scripts);
+    const auto& path = GameUpdateSample(
+        profile, GameUpdateSubsystem::PathStreaming);
+    const auto& population = GameUpdateSample(
+        profile, GameUpdateSubsystem::Population);
+    const auto& world = GameUpdateSample(
+        profile, GameUpdateSubsystem::World);
+    const auto& pickups = GameUpdateSample(
+        profile, GameUpdateSubsystem::Pickups);
+    const auto& camera = GameUpdateSample(
+        profile, GameUpdateSubsystem::Camera);
+    const auto& plants = GameUpdateSample(
+        profile, GameUpdateSubsystem::Plants);
+    const auto& audio = GameUpdateSample(
+        profile, GameUpdateSubsystem::Audio);
+    const double knownGameWallMs = streaming.wallMs + scripts.wallMs +
+        path.wallMs + population.wallMs + world.wallMs + pickups.wallMs +
+        camera.wallMs + plants.wallMs;
+    const double residualGameWallMs = std::max(
+        0.0, game.wallMs - knownGameWallMs);
+
+    LOGI("[perf.hitch.game] seq=%d pre W/CPU/block=%.3f/%.3f/%.3f "
+         "game W/CPU/residual=%.3f/%.3f/%.3f audio=%.3f/%.3f",
+         sequence, preWallMs, preCpuMs,
+         std::max(0.0, preWallMs - preCpuMs),
+         game.wallMs, game.cpuMs, residualGameWallMs,
+         audio.wallMs, audio.cpuMs);
+    LOGI("[perf.hitch.game.sub] seq=%d "
+         "stream=%.3f/%.3f scripts=%.3f/%.3f path=%d:%.3f/%.3f "
+         "pop=%d:%.3f/%.3f world=%.3f/%.3f pickup=%.3f/%.3f "
+         "camera=%d:%.3f/%.3f plants=%.3f/%.3f",
+         sequence,
+         streaming.wallMs, streaming.cpuMs,
+         scripts.wallMs, scripts.cpuMs,
+         path.calls, path.wallMs, path.cpuMs,
+         population.calls, population.wallMs, population.cpuMs,
+         world.wallMs, world.cpuMs,
+         pickups.wallMs, pickups.cpuMs,
+         camera.calls, camera.wallMs, camera.cpuMs,
+         plants.wallMs, plants.cpuMs);
+    LOGI("[perf.hitch.stream] seq=%d "
+         "texdb=%d:%.3f/%.3f/max%.3f "
+         "pump=%d:%.3f/%.3f/max%.3f "
+         "load=%d:%.3f/%.3f/max%.3f "
+         "models=%d:%.3f/%.3f/max%.3f",
+         sequence,
+         textureDatabase.calls, textureDatabase.wallMs,
+         textureDatabase.cpuMs, textureDatabase.maxWallMs,
+         texturePump.calls, texturePump.wallMs,
+         texturePump.cpuMs, texturePump.maxWallMs,
+         textureLoad.calls, textureLoad.wallMs,
+         textureLoad.cpuMs, textureLoad.maxWallMs,
+         modelRequests.calls, modelRequests.wallMs,
+         modelRequests.cpuMs, modelRequests.maxWallMs);
+}
+
+void LogRenderQueueUnsizedCallerHitch(const EnginePreProfile& profile,
+                                      int sequence) {
+    const double blockedMs = std::max(
+        0.0, profile.rqFlushWallMs - profile.rqFlushCpuMs);
+    if (profile.rqNearEndFlushCalls <= 0 ||
+        (blockedMs < 2.0 && profile.rqFlushMaxWallMs < 2.0)) {
+        return;
+    }
+
+    std::array<std::size_t, EnginePreProfile::kRqUnsizedCallerSlots> order{};
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](std::size_t lhs,
+                                               std::size_t rhs) {
+        const auto& a = profile.rqUnsizedCallers[lhs];
+        const auto& b = profile.rqUnsizedCallers[rhs];
+        const double aBlocked = std::max(0.0, a.wallMs - a.cpuMs);
+        const double bBlocked = std::max(0.0, b.wallMs - b.cpuMs);
+        if (aBlocked != bBlocked) return aBlocked > bBlocked;
+        if (a.wallMs != b.wallMs) return a.wallMs > b.wallMs;
+        return a.calls > b.calls;
+    });
+
+    LOGI("[perf.hitch.rq] seq=%d unsized=%d "
+         "W/CPU/block/max=%.3f/%.3f/%.3f/%.3f "
+         "overflow c/W/CPU=%d/%.3f/%.3f",
+         sequence, profile.rqNearEndFlushCalls,
+         profile.rqFlushWallMs, profile.rqFlushCpuMs, blockedMs,
+         profile.rqFlushMaxWallMs,
+         profile.rqUnsizedCallerOverflowCalls,
+         profile.rqUnsizedCallerOverflowWallMs,
+         profile.rqUnsizedCallerOverflowCpuMs);
+    for (std::size_t rank = 0; rank < 3 && rank < order.size(); ++rank) {
+        const auto& caller = profile.rqUnsizedCallers[order[rank]];
+        if (caller.calls <= 0) break;
+        LOGI("[perf.hitch.rq.caller] seq=%d rank=%zu lr=0x%llx "
+             "c/W/CPU/block/max=%d/%.3f/%.3f/%.3f/%.3f "
+             "stage before/main/after=%d/%d/%d",
+             sequence, rank,
+             static_cast<unsigned long long>(caller.offset),
+             caller.calls, caller.wallMs, caller.cpuMs,
+             std::max(0.0, caller.wallMs - caller.cpuMs),
+             caller.maxWallMs, caller.beforeScanCalls,
+             caller.mainScanCalls, caller.afterScanCalls);
+    }
 }
 
 class ScopedEnginePreMainScan {
@@ -1776,6 +2124,106 @@ void WriteV3(std::uintptr_t base, std::size_t off, V3 v) {
 
 struct CamBasis { V3 right, forward, up, pos; };
 
+// The mobile GLES backend mirrors the active camera fog range in a separate
+// emulator state. Updating RwCamera::fogPlane alone is therefore insufficient
+// on builds where RwCameraBeginUpdate has already copied the retail values.
+// Resolve the exact 2.11 exports and keep the bridge fail-open on any fingerprint
+// mismatch: the plain RwCamera field path below remains the retail fallback.
+struct MobileDistanceFogApi {
+    using SetupFn = void (*)(float, float, float, float, float);
+    using GetFn = float* (*)();
+    SetupFn setup{};
+    GetFn getParameters{};
+    GetFn getColor{};
+    bool attempted{};
+    bool ready{};
+};
+
+MobileDistanceFogApi& DistanceFogApi() {
+    static MobileDistanceFogApi api{};
+    if (api.attempted) return api;
+    api.attempted = true;
+    void* const handle = dlopen("libGame.so", RTLD_NOLOAD | RTLD_NOW);
+    if (!handle || !g.LoadBase) {
+        if (handle) dlclose(handle);
+        LOGW("[lod.air.fog] mobile bridge unavailable: libGame/base missing");
+        return api;
+    }
+    api.setup = reinterpret_cast<MobileDistanceFogApi::SetupFn>(
+        dlsym(handle, "_Z20emu_DistanceFogSetupfffff"));
+    api.getParameters = reinterpret_cast<MobileDistanceFogApi::GetFn>(
+        dlsym(handle, "_Z28emu_DistanceFogGetParametersv"));
+    api.getColor = reinterpret_cast<MobileDistanceFogApi::GetFn>(
+        dlsym(handle, "_Z23emu_DistanceFogGetColorv"));
+    const auto exactOffset = [](const void* pointer, std::uintptr_t offset) {
+        return pointer && reinterpret_cast<std::uintptr_t>(pointer) -
+            g.LoadBase == offset;
+    };
+    api.ready = exactOffset(reinterpret_cast<const void*>(api.setup), 0x73e234u) &&
+        exactOffset(reinterpret_cast<const void*>(api.getParameters), 0x73e2d0u) &&
+        exactOffset(reinterpret_cast<const void*>(api.getColor), 0x73e2c4u);
+    if (!api.ready) {
+        api.setup = nullptr;
+        api.getParameters = nullptr;
+        api.getColor = nullptr;
+        LOGW("[lod.air.fog] mobile bridge disabled: retail fingerprint mismatch");
+    } else {
+        LOGI("[lod.air.fog] mobile distance-fog bridge ready");
+    }
+    dlclose(handle);
+    return api;
+}
+
+struct MobileDistanceFogSnapshot {
+    float start{};
+    float end{};
+    float color[3]{};
+    bool valid{};
+};
+
+MobileDistanceFogSnapshot CaptureMobileDistanceFog() {
+    MobileDistanceFogSnapshot snapshot{};
+    auto& api = DistanceFogApi();
+    if (!api.ready) return snapshot;
+    const float* const parameters = api.getParameters();
+    const float* const color = api.getColor();
+    if (!parameters || !color || !std::isfinite(parameters[0]) ||
+        !std::isfinite(parameters[1]) || parameters[1] <= parameters[0] ||
+        !std::isfinite(color[0]) || !std::isfinite(color[1]) ||
+        !std::isfinite(color[2])) {
+        return snapshot;
+    }
+    snapshot.start = parameters[0];
+    snapshot.end = parameters[1];
+    snapshot.color[0] = color[0];
+    snapshot.color[1] = color[1];
+    snapshot.color[2] = color[2];
+    snapshot.valid = true;
+    return snapshot;
+}
+
+bool ApplyMobileDistanceFog(const MobileDistanceFogSnapshot& snapshot,
+                            float start, float end) {
+    auto& api = DistanceFogApi();
+    if (!api.ready || !snapshot.valid || !std::isfinite(start) ||
+        !std::isfinite(end) || end <= start + 1.0f) {
+        return false;
+    }
+    api.setup(start, end, snapshot.color[0], snapshot.color[1], snapshot.color[2]);
+    return true;
+}
+
+// RenderScene configures the mobile distance-fog emulator after the outer
+// stereo wrapper has begun.  Keep the aircraft override available to the
+// already-hooked CClouds::Render point inside RenderScene, after that stock
+// setup has happened and before world geometry is submitted.
+thread_local bool g_aircraftFogSceneOverridePending = false;
+thread_local MobileDistanceFogSnapshot g_aircraftFogSceneSnapshot{};
+thread_local float g_aircraftFogSceneStart = 0.0f;
+thread_local float g_aircraftFogSceneEnd = 0.0f;
+thread_local MobileDistanceFogSnapshot g_aircraftGroundFogBaseline{};
+thread_local bool g_aircraftFogWasActive = false;
+
 CamBasis ReadCam(std::uintptr_t cam) {
     return {ReadV3(cam, kOffRight), ReadV3(cam, kOffForward),
             ReadV3(cam, kOffUp),    ReadV3(cam, kOffPos)};
@@ -1785,6 +2233,185 @@ void WriteCam(std::uintptr_t cam, const CamBasis& b) {
     WriteV3(cam, kOffForward, b.forward);
     WriteV3(cam, kOffUp,      b.up);
     WriteV3(cam, kOffPos,     b.pos);
+}
+
+struct SkyBackdropVertex {
+    V3 position{};
+    V3 normal{};
+    std::uint32_t color{};
+    float u{};
+    float v{};
+};
+static_assert(sizeof(SkyBackdropVertex) == 36,
+              "RxObjSpace3DVertex layout changed");
+
+struct SkyBackdropApi {
+    const unsigned char* currentColours{};
+    bool attempted{};
+    bool ready{};
+};
+
+SkyBackdropApi& GetSkyBackdropApi() {
+    static SkyBackdropApi api{};
+    if (api.attempted) return api;
+    api.attempted = true;
+    void* const handle = dlopen("libGame.so", RTLD_NOLOAD | RTLD_NOW);
+    if (!handle || !g.LoadBase) {
+        if (handle) dlclose(handle);
+        LOGW("[vr.sky] continuous backdrop unavailable: libGame/base missing");
+        return api;
+    }
+    api.currentColours = reinterpret_cast<const unsigned char*>(
+        dlsym(handle, "_ZN10CTimeCycle16m_CurrentColoursE"));
+    // Exact retail 2.11 fingerprint. The six channels used below are the
+    // uint16 sky-top RGB fields at 0x24..0x28 and sky-bottom RGB at 0x2a..0x2e,
+    // as read by CClouds::RenderSkyPolys itself.
+    api.ready = api.currentColours &&
+        reinterpret_cast<std::uintptr_t>(api.currentColours) - g.LoadBase ==
+            0x00a153b0u;
+    if (!api.ready) {
+        api.currentColours = nullptr;
+        LOGW("[vr.sky] continuous backdrop disabled: timecycle fingerprint mismatch");
+    }
+    dlclose(handle);
+    return api;
+}
+
+void RenderWorldStableSkyPolys(std::uintptr_t cam,
+                               const MobileDistanceFogSnapshot& fog) {
+    if (!g.CClouds_RenderSkyPolys) return;
+    auto retailFallback = [] {
+        // Unknown data must preserve the original single camera-facing sky.
+        g.CClouds_RenderSkyPolys();
+    };
+    if (cam == 0u || !g.RwRenderStateSet || !g.RwIm3DTransform ||
+        !g.RwIm3DRenderIndexedPrimitive || !g.RwIm3DEnd) {
+        retailFallback();
+        return;
+    }
+
+    const V3 centre = ReadV3(cam, kOffPos);
+    auto& api = GetSkyBackdropApi();
+    if (!std::isfinite(centre.x) || !std::isfinite(centre.y) ||
+        !std::isfinite(centre.z) || !api.ready) {
+        retailFallback();
+        return;
+    }
+
+    struct Rgb { float r{}, g{}, b{}; };
+    const auto readChannel = [&](std::size_t offset) -> float {
+        std::uint16_t value{};
+        std::memcpy(&value, api.currentColours + offset, sizeof(value));
+        return static_cast<float>(std::min<std::uint16_t>(value, 255u));
+    };
+    const Rgb skyTop{readChannel(0x24u), readChannel(0x26u),
+                     readChannel(0x28u)};
+    const Rgb skyBottom{readChannel(0x2au), readChannel(0x2cu),
+                        readChannel(0x2eu)};
+    const auto fogChannel = [](float value, float fallback) {
+        if (!std::isfinite(value)) return fallback;
+        return std::clamp(value <= 1.5f ? value * 255.0f : value,
+                          0.0f, 255.0f);
+    };
+    const Rgb below = fog.valid
+        ? Rgb{fogChannel(fog.color[0], skyBottom.r),
+              fogChannel(fog.color[1], skyBottom.g),
+              fogChannel(fog.color[2], skyBottom.b)}
+        : skyBottom;
+    const auto mix = [](float a, float b, float t) {
+        return a + (b - a) * t;
+    };
+    const auto pack = [&](const Rgb& a, const Rgb& b, float t) {
+        t = std::clamp(t, 0.0f, 1.0f);
+        t = t * t * (3.0f - 2.0f * t);
+        const auto byte = [](float value) -> std::uint32_t {
+            return static_cast<std::uint32_t>(std::clamp(
+                static_cast<int>(std::lround(value)), 0, 255));
+        };
+        const std::uint32_t r = byte(mix(a.r, b.r, t));
+        const std::uint32_t g = byte(mix(a.g, b.g, t));
+        const std::uint32_t bl = byte(mix(a.b, b.b, t));
+        return 0xff000000u | (bl << 16u) | (g << 8u) | r;
+    };
+
+    // Retail builds one 30 m camera-facing rectangle. Four rotated copies made
+    // the visible square in VR. Replace all of them with one closed, opaque,
+    // world-Z sphere: head yaw/pitch only changes the view through it, while
+    // the timecycle horizon smoothly reaches the zenith and nadir without an
+    // edge, corner, transparent shell or extra overdraw layers.
+    constexpr int kSegments = 32;
+    constexpr int kLatitudeBands = 12;
+    constexpr int kVertexCount = (kLatitudeBands + 1) * (kSegments + 1);
+    constexpr int kIndexCount = kLatitudeBands * kSegments * 6;
+    constexpr float kRadius = 30.0f;
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kTwoPi = kPi * 2.0f;
+    static_assert(kVertexCount <= 1024 && kIndexCount <= 3072,
+                  "sky backdrop exceeds safe mobile Im3D batch");
+    thread_local std::array<SkyBackdropVertex, kVertexCount> vertices{};
+    thread_local std::array<unsigned short, kIndexCount> indices{};
+
+    int vertexCount = 0;
+    for (int latitude = 0; latitude <= kLatitudeBands; ++latitude) {
+        const float v = static_cast<float>(latitude) /
+            static_cast<float>(kLatitudeBands);
+        const float elevation = -0.5f * kPi + v * kPi;
+        const float radial = std::cos(elevation) * kRadius;
+        const float z = centre.z + std::sin(elevation) * kRadius;
+        const float blend = std::abs(elevation) / (0.5f * kPi);
+        const std::uint32_t color = elevation >= 0.0f
+            ? pack(skyBottom, skyTop, blend)
+            : pack(skyBottom, below, blend);
+        for (int segment = 0; segment <= kSegments; ++segment) {
+            const float angle = kTwoPi * static_cast<float>(segment) /
+                static_cast<float>(kSegments);
+            vertices[vertexCount++] = {
+                {centre.x + std::cos(angle) * radial,
+                 centre.y + std::sin(angle) * radial, z},
+                {}, color, 0.0f, 0.0f};
+        }
+    }
+    int indexCount = 0;
+    for (int latitude = 0; latitude < kLatitudeBands; ++latitude) {
+        const int row = latitude * (kSegments + 1);
+        const int next = row + kSegments + 1;
+        for (int segment = 0; segment < kSegments; ++segment) {
+            const unsigned short a = static_cast<unsigned short>(row + segment);
+            const unsigned short b = static_cast<unsigned short>(a + 1);
+            const unsigned short c = static_cast<unsigned short>(next + segment);
+            const unsigned short d = static_cast<unsigned short>(c + 1);
+            indices[indexCount++] = a;
+            indices[indexCount++] = c;
+            indices[indexCount++] = b;
+            indices[indexCount++] = b;
+            indices[indexCount++] = c;
+            indices[indexCount++] = d;
+        }
+    }
+
+    g.RwRenderStateSet(1, nullptr);                       // no texture
+    g.RwRenderStateSet(6, nullptr);                       // ZTEST off
+    g.RwRenderStateSet(8, nullptr);                       // ZWRITE off
+    g.RwRenderStateSet(12, nullptr);                      // opaque
+    g.RwRenderStateSet(14, nullptr);                      // fog off
+    g.RwRenderStateSet(20, reinterpret_cast<void*>(1));   // cull none
+    constexpr unsigned int kIm3DFlags = 1u | 8u | 16u;
+    constexpr int kTriangleList = 3;
+    if (!g.RwIm3DTransform(vertices.data(), vertexCount, nullptr,
+                           kIm3DFlags)) {
+        retailFallback();
+        return;
+    }
+    g.RwIm3DRenderIndexedPrimitive(kTriangleList, indices.data(), indexCount);
+    g.RwIm3DEnd();
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOGI("[vr.sky] continuous world-Z backdrop segments=%d bands=%d "
+             "retail_radius=%.1fm", kSegments, kLatitudeBands,
+             static_cast<double>(kRadius));
+    }
 }
 
 // OpenXR-space vector into GTA world space, expressed against the base camera.
@@ -1918,6 +2545,24 @@ constexpr float kTrafficTerminalCleanupNearM = 15.0f;
 void UpdateStaticCullCone() {
     g_staticCullCone = {};
     if (!g_vrBaseValid || !g_origin.valid) return;
+    // The aircraft render list must not rotate with the pilot's head.  A live
+    // HMD cone made the same tree/building alternate between detail and HLOD
+    // while the plane itself had not changed direction.  Use the yaw-only
+    // vehicle/body basis for the complete aircraft transaction; the existing
+    // 300 m radial safety/selector remains the maximum bounded union around it.
+    if (driving::GetActiveVehicleType() == driving::VEHICLE_PLANE) {
+        const float horizontalLength = std::hypot(
+            g_vrBase.forward.x, g_vrBase.forward.y);
+        if (!std::isfinite(horizontalLength) || horizontalLength < 0.05f)
+            return;
+        g_staticCullCone.forward = {
+            g_vrBase.forward.x / horizontalLength,
+            g_vrBase.forward.y / horizontalLength,
+            0.0f,
+        };
+        g_staticCullCone.valid = true;
+        return;
+    }
     // A pitched skydive base breaks the cone's yaw-centric assumptions and
     // culled geometry that was plainly in view. Fail open during the dive
     // (and the short pitch transition) — the 45m safety circle remains.
@@ -2517,7 +3162,20 @@ bool ShouldRunStereo() {
         if (const void* pad = g.CPad_GetPad(0)) {
             if (*reinterpret_cast<const std::uint16_t*>(
                     static_cast<const char*>(pad) + 0x110) != 0) {
-                return false;
+                // GAMEPLAY cutscene vs shop UI: mid-mission scripted cameras
+                // also disable controls, but they raise the widescreen
+                // borders (CCamera+0x43 - SetWideScreenOn stores the 0x100
+                // halfword at +0x42, disasm-verified) while shop menus stay
+                // full-frame. Widescreen + a non-CINEMA game-cutscene mode
+                // keeps stereo running: FIRST PERSON stays in CJ's head,
+                // CINEMATIC rides the script camera. Everything else keeps
+                // the theater (shops need the laser pointer).
+                const bool widescreen = g.TheCamera &&
+                    *(reinterpret_cast<const std::uint8_t*>(g.TheCamera) +
+                      0x43) != 0;
+                if (!(widescreen && locomotion::GameCutsceneMode() != 0)) {
+                    return false;
+                }
             }
         }
     }
@@ -2580,6 +3238,148 @@ void UpdateTrafficCarCap(bool liveStereoGameplay) {
     }
 }
 
+// L3 crouch latch is shared between the pad hook, which owns the task, and
+// the camera anchor, which must lower the physical viewpoint as well.
+// GameThread only.
+bool g_duckLatched = false;
+float g_crouchBlend = 0.0f;
+
+constexpr int kMaxCutsceneCameraActors = 50;
+char g_cutsceneCameraScene[64]{};
+int g_cutsceneCameraIndex = 0;
+void* g_cutsceneCameraActor = nullptr;
+double g_scriptedCutsceneLastWideMs = -1.0;
+struct CutsceneActorAnchorCache {
+    CamBasis basis{};
+    void* actor{};
+    double validAtMs{-1.0};
+    int headAxis{-1}; // 0=right, 1=up, 2=at; selected once per actor
+    float headAxisSign{1.0f};
+};
+CutsceneActorAnchorCache g_cutsceneActorAnchorCache{};
+
+bool FormalCutsceneRunning() {
+    return g.CCutsceneMgr_ms_running && *g.CCutsceneMgr_ms_running;
+}
+
+bool ScriptedCutsceneRunning() {
+    if (FormalCutsceneRunning() || !g.TheCamera) {
+        g_scriptedCutsceneLastWideMs = -1.0;
+        return false;
+    }
+    // Vice City parity: the letterbox is the authoritative marker for an
+    // in-world scripted scene. Some SA mission scripts leave player controls
+    // enabled, so requiring CPad+0x110 made the R3/L3 camera UI appear to work
+    // only in a subset of gameplay cutscenes.
+    const bool widescreen = *(
+        reinterpret_cast<const std::uint8_t*>(g.TheCamera) + 0x43) != 0;
+    const double nowMs = NowMs();
+    if (widescreen) g_scriptedCutsceneLastWideMs = nowMs;
+    // Several mission cameras clear the letterbox for one or two frames while
+    // blending between shots. Treat that as the same scene: dropping to normal
+    // gameplay for those frames made the remembered actor camera visibly flash
+    // back to the director and also briefly restored the HUD.
+    return widescreen || (g_scriptedCutsceneLastWideMs >= 0.0 &&
+                          nowMs - g_scriptedCutsceneLastWideMs <= 250.0);
+}
+
+bool CutsceneCameraControlsActiveInternal() {
+    if (FormalCutsceneRunning()) return locomotion::CutsceneMode() != 0;
+    if (ScriptedCutsceneRunning()) return locomotion::GameCutsceneMode() != 0;
+    return false;
+}
+
+bool ActorHasPosedHead(void* actor) {
+    if (!actor || !g.GetAnimHierarchyFromSkinClump || !g.RpHAnimIDGetIndex ||
+        !g.RpHAnimHierarchyGetMatrixArray) return false;
+    void* clump = *reinterpret_cast<void**>(
+        static_cast<std::uint8_t*>(actor) + 0x20);
+    void* hierarchy = clump ? g.GetAnimHierarchyFromSkinClump(clump) : nullptr;
+    if (!hierarchy || g.RpHAnimIDGetIndex(hierarchy, 5 /* BONE_HEAD */) < 0)
+        return false;
+    return g.RpHAnimHierarchyGetMatrixArray(hierarchy) != nullptr;
+}
+
+int StageCutsceneCameraActors(void** actors, int capacity) {
+    if (!actors || capacity <= 0) return 0;
+    int staged = 0;
+    if (FormalCutsceneRunning() && g.CCutsceneMgr_ms_pCutsceneObjects &&
+        g.CCutsceneMgr_ms_numCutsceneObjs) {
+        const int count = std::clamp(*g.CCutsceneMgr_ms_numCutsceneObjs,
+                                     0, kMaxCutsceneCameraActors);
+        auto** objects = reinterpret_cast<void**>(
+            g.CCutsceneMgr_ms_pCutsceneObjects);
+        for (int i = 0; i < count && staged < capacity; ++i) {
+            if (ActorHasPosedHead(objects[i])) actors[staged++] = objects[i];
+        }
+        return staged;
+    }
+    // Gameplay letterbox scenes have no CCutsceneObject array. The player is
+    // still a real skinned ped, so camera 1 is their head (director remains 0).
+    if (ScriptedCutsceneRunning() && g.FindPlayerPed) {
+        void* player = g.FindPlayerPed(-1);
+        if (ActorHasPosedHead(player)) actors[staged++] = player;
+    }
+    return staged;
+}
+
+void BuildCutsceneSceneKey(char out[64]) {
+    const char* raw = FormalCutsceneRunning() && g.CCutsceneMgr_ms_cutsceneName
+        ? g.CCutsceneMgr_ms_cutsceneName : "scripted";
+    int written = 0;
+    for (int i = 0; raw && raw[i] && i < 63; ++i) {
+        const unsigned char c = static_cast<unsigned char>(raw[i]);
+        const bool safe = (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.';
+        if (safe) out[written++] = static_cast<char>(c);
+    }
+    if (written == 0) {
+        const char* fallback = FormalCutsceneRunning() ? "story" : "scripted";
+        std::strncpy(out, fallback, 63);
+        written = static_cast<int>(std::strlen(out));
+    }
+    out[written] = '\0';
+}
+
+int EffectiveCutsceneCameraIndex() {
+    void* actors[kMaxCutsceneCameraActors]{};
+    const int cameras = StageCutsceneCameraActors(
+        actors, kMaxCutsceneCameraActors) + 1;
+    return g_cutsceneCameraIndex >= 0 && g_cutsceneCameraIndex < cameras
+        ? g_cutsceneCameraIndex : 0;
+}
+
+void RefreshCutsceneCameraState() {
+    if (!CutsceneCameraControlsActiveInternal()) {
+        g_cutsceneCameraScene[0] = '\0';
+        g_cutsceneCameraActor = nullptr;
+        g_cutsceneActorAnchorCache = {};
+        return;
+    }
+    char scene[64]{};
+    BuildCutsceneSceneKey(scene);
+    if (std::strcmp(scene, g_cutsceneCameraScene) != 0) {
+        g_cutsceneActorAnchorCache = {};
+        std::strncpy(g_cutsceneCameraScene, scene,
+                     sizeof(g_cutsceneCameraScene) - 1);
+        g_cutsceneCameraScene[sizeof(g_cutsceneCameraScene) - 1] = '\0';
+        const int remembered = locomotion::RememberedCutsceneCamera(scene);
+        const int mode = FormalCutsceneRunning()
+            ? locomotion::CutsceneMode() : locomotion::GameCutsceneMode();
+        g_cutsceneCameraIndex = remembered >= 0 ? remembered : (mode == 2 ? 1 : 0);
+        LOGI("[cutscene.camera] scene=%s selected=%d remembered=%d",
+             scene, g_cutsceneCameraIndex, remembered >= 0 ? 1 : 0);
+    }
+    void* actors[kMaxCutsceneCameraActors]{};
+    const int staged = StageCutsceneCameraActors(
+        actors, kMaxCutsceneCameraActors);
+    const int effective = EffectiveCutsceneCameraIndex();
+    void* const selected = effective > 0 && effective <= staged
+        ? actors[effective - 1] : nullptr;
+    g_cutsceneCameraActor = selected;
+}
+
 void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
     static thread_local bool inHook = false;
 
@@ -2615,12 +3415,24 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
             // stereo from wherever the game itself is filming.
             const bool cutsceneRunning = g.CCutsceneMgr_ms_running &&
                 *g.CCutsceneMgr_ms_running;
+            RefreshCutsceneCameraState();
+
+            // GAMEPLAY cutscene (mid-mission scripted camera: controls
+            // disabled + widescreen while CCutsceneMgr is idle). CINEMATIC
+            // rides the script's own camera exactly like story cutscenes -
+            // keep `base` at the stock camera and skip the ped anchor.
+            // FIRST PERSON simply keeps the regular ped anchor below.
+            const bool gameplayCinematic = !cutsceneRunning &&
+                ScriptedCutsceneRunning() &&
+                locomotion::GameCutsceneMode() != 0 &&
+                EffectiveCutsceneCameraIndex() == 0;
 
             // Stable first-person anchor. Vehicle state is deliberately resolved
             // before the ped matrix: during enter-car the seated skin and vehicle
             // are already valid while CPed::m_matrix can still be null/stale. A
             // ped-first gate here used to leave `base` at the stock chase camera.
-            if (void* ped = (!cutsceneRunning && g.FindPlayerPed)
+            if (void* ped = (!cutsceneRunning && !gameplayCinematic &&
+                             g.FindPlayerPed)
                     ? g.FindPlayerPed(-1) : nullptr) {
                 void* vehicle = g.FindPlayerVehicle ?
                     g.FindPlayerVehicle(-1, false) : nullptr;
@@ -2628,9 +3440,15 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                     g.PlayerIsEnteringCar();
                 const bool thirdPersonView = vehicle != nullptr &&
                     !enteringVehicle && driving::ThirdPersonViewActive();
-                constexpr float kEyeHeight  = 0.72f;
+                constexpr float kEyeHeightStanding = 0.72f;
                 constexpr float kEyeForward = 0.12f;
                 constexpr float kVehicleFallbackEyeHeight = 0.85f;
+                // Blend the eye down over a few frames so crouching reads as
+                // body motion rather than a camera teleport.
+                g_crouchBlend += ((g_duckLatched ? 1.0f : 0.0f) -
+                                  g_crouchBlend) * 0.15f;
+                const float kEyeHeight =
+                    kEyeHeightStanding - 0.38f * g_crouchBlend;
 
                 const std::uintptr_t pedMtx = *reinterpret_cast<std::uintptr_t*>(
                     reinterpret_cast<char*>(ped) + 0x18);
@@ -2913,8 +3731,14 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                         g.CPed_GetBonePosition(ped,&gameHead,5,true);
                         const V3 liveHead{gameHead.x,gameHead.y,gameHead.z};
                         const V3 delta=liveHead-pedPosition;
-                        if (Finite(liveHead)&&Dot(delta,delta)<4.0f)
+                        if (Finite(liveHead)&&Dot(delta,delta)<4.0f) {
                             anchorPosition=liveHead;
+                            // The live animation may already lower the head;
+                            // min prevents double-lowering while still making
+                            // the VR crouch visible on rigid animations.
+                            anchorPosition.z=std::min(anchorPosition.z,
+                                pedPosition.z+kEyeHeight);
+                        }
                     }
                     anchorReady = true;
                     anchorSource = enteringVehicle ? "entry-head" : "ped";
@@ -2936,8 +3760,11 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                                               gameHead.z};
                             const V3 delta=liveHead-
                                 V3{pc.x,pc.y,pc.z};
-                            if (Finite(liveHead)&&Dot(delta,delta)<4.0f)
+                            if (Finite(liveHead)&&Dot(delta,delta)<4.0f) {
                                 anchorPosition=liveHead;
+                                anchorPosition.z=std::min(anchorPosition.z,
+                                    pc.z+kEyeHeight);
+                            }
                         }
                         anchorReady = true;
                         anchorSource = "coords-fallback";
@@ -3011,7 +3838,18 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                             }
                             xr::InputState in{};
                             xr::GetInput(in);
-                            const float rx = in.rightStick[0];
+                            float mappedMoveX=0.0f,mappedMoveY=0.0f;
+                            float mappedTurnX=0.0f,mappedTurnY=0.0f;
+                            locomotion::MapGameplaySticks(
+                                in.leftStick[0],in.leftStick[1],
+                                in.rightStick[0],in.rightStick[1],
+                                &mappedMoveX,&mappedMoveY,
+                                &mappedTurnX,&mappedTurnY);
+                            // Thumbrest D-pad mode owns the right stick: no
+                            // snap/smooth turning while it is active.
+                            const float rx =
+                                (in.thumbrest[0] || in.thumbrest[1])
+                                    ? 0.0f : mappedTurnX;
                             const double now=NowMs();
                             static double previousTurnMs=now;
                             const float dt=static_cast<float>(
@@ -3034,8 +3872,7 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                             }
                             if (locomotion::GetMovementMode()==
                                     locomotion::MOVEMENT_HEAD_TURN) {
-                                const float move=std::sqrt(in.leftStick[0]*in.leftStick[0]+
-                                                           in.leftStick[1]*in.leftStick[1]);
+                                const float move=std::hypot(mappedMoveX,mappedMoveY);
                                 const float headYaw=CurrentLocalHeadYaw();
                                 constexpr float threshold=10.0f*
                                     3.14159265358979323846f/180.0f;
@@ -3069,10 +3906,20 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                                     g.CVehicle_GetVehicleAppearance(vehicle);
                                 return a == 3 || a == 5;
                             }();
-                        if (aircraftTilt) {
+                        const bool carTilt = vehicle != nullptr &&
+                            !thirdPersonView && vehicleBasisValid &&
+                            driving::CarCameraTiltEnabled() &&
+                            g.CVehicle_GetVehicleAppearance &&
+                            g.CVehicle_GetVehicleAppearance(vehicle) == 1;
+                        const bool boatTilt = vehicle != nullptr &&
+                            !thirdPersonView && vehicleBasisValid &&
+                            driving::BoatCameraTiltEnabled() &&
+                            g.CVehicle_GetVehicleAppearance &&
+                            g.CVehicle_GetVehicleAppearance(vehicle) == 4;
+                        if (aircraftTilt || carTilt || boatTilt) {
                             // Realistic flight: the camera base takes the full
-                            // airframe basis — bank and the horizon banks with
-                            // you, the yoke stays put in front of the pilot.
+                            // vehicle basis — bank and the horizon bank with
+                            // the body, while cockpit controls stay put.
                             base.right = vehicleRight * -1.0f;
                             base.forward = vehicleForward;
                             base.up = vehicleUp;
@@ -3153,8 +4000,8 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                         // chase view sits exactly on the stock camera and takes
                         // no seat or eye-forward offsets at all.
                         if (vehicle != nullptr && !thirdPersonView) {
-                            seatSide=vehicleIsBike?0.0f:static_cast<float>(
-                                driving::GetOffsetCm(driving::F_SIDE))/100.0f;
+                            seatSide=static_cast<float>(
+                                driving::GetActiveSeatSideCm())/100.0f;
                             // The selected category/mode global seat and the
                             // current model correction are additive, matching
                             // the current Vice City vehicle calibration model.
@@ -3195,56 +4042,22 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                 }
             }
 
-            // FIRST PERSON cutscenes sit on the CUTSCENE CJ's live head bone.
-            // The visible CJ is a CCutsceneObject actor (the real player ped
-            // is parked off-stage during cutscenes); his entry is the actor
-            // with the player model index 0. Yaw comes from the actor root so
-            // the view faces where CJ faces; the director camera stays for
-            // CINEMATIC and whenever the actor/bone is missing this frame.
-            if (cutsceneRunning && locomotion::CutsceneMode() == 2 &&
-                g.CCutsceneMgr_ms_pCutsceneObjects &&
-                g.CCutsceneMgr_ms_numCutsceneObjs &&
+            // Vice City parity: camera 0 keeps the director; R3-selected actor
+            // cameras sit on that staged actor's live head bone. L3 persistence
+            // is handled by the input layer. A missing/late actor fails open to
+            // the director camera for this frame.
+            bool liveCutsceneActorAnchor = false;
+            if (CutsceneCameraControlsActiveInternal() &&
+                g_cutsceneCameraActor &&
                 g.GetAnimHierarchyFromSkinClump && g.RpHAnimIDGetIndex &&
                 g.RpHAnimHierarchyGetMatrixArray) {
-                // CJ's actor uses the dedicated cutscene player model
-                // ("csplay" from cuts.img), not the streamed player model 0.
-                static int csplayModelId = -1;
-                if (csplayModelId < 0 && g.CModelInfo_GetModelInfoByName) {
-                    int resolved = -1;
-                    if (g.CModelInfo_GetModelInfoByName("csplay", &resolved) &&
-                        resolved >= 0) {
-                        csplayModelId = resolved;
-                        LOGI("[cutscene.fp] csplay model id=%d", resolved);
-                    }
-                }
-                std::uint8_t* actor = nullptr;
-                const int actorCount =
-                    std::clamp(*g.CCutsceneMgr_ms_numCutsceneObjs, 0, 50);
-                auto** actors = reinterpret_cast<std::uint8_t**>(
-                    g.CCutsceneMgr_ms_pCutsceneObjects);
-                for (int i = 0; i < actorCount; ++i) {
-                    std::uint8_t* candidate = actors[i];
-                    if (candidate == nullptr) continue;
-                    const int candidateModel =
-                        *reinterpret_cast<std::uint16_t*>(candidate + 0x32);
-                    if (candidateModel == csplayModelId ||
-                        candidateModel == 0) {
-                        actor = candidate;
-                        break;
-                    }
-                }
+                auto* actor = static_cast<std::uint8_t*>(g_cutsceneCameraActor);
                 static unsigned int actorLogCounter = 0;
                 if ((++actorLogCounter % 120u) == 1u) {
-                    char ids[128]{};
-                    int len = 0;
-                    for (int i = 0; i < actorCount && len < 100; ++i) {
-                        len += std::snprintf(ids + len, sizeof(ids) - len,
-                            " %d", actors[i] ? static_cast<int>(
-                                *reinterpret_cast<std::uint16_t*>(
-                                    actors[i] + 0x32)) : -1);
-                    }
-                    LOGI("[cutscene.fp] actors=%d csplay=%d anchor=%d ids:%s",
-                         actorCount, csplayModelId, actor != nullptr, ids);
+                    LOGI("[cutscene.camera] scene=%s camera=%d model=%d",
+                         g_cutsceneCameraScene, EffectiveCutsceneCameraIndex(),
+                         static_cast<int>(*reinterpret_cast<std::uint16_t*>(
+                             actor + 0x32)));
                 }
                 void* actorClump = actor
                     ? *reinterpret_cast<void**>(actor + 0x20) : nullptr;
@@ -3267,9 +4080,45 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                         fy = *reinterpret_cast<float*>(actorMtx + 0x14);
                     }
                     const float yawLen = std::sqrt(fx * fx + fy * fy);
-                    if (Finite(head) && Dot(head, head) > 0.01f &&
-                        std::isfinite(yawLen) && yawLen > 0.1f) {
-                        const V3 fwd{fx / yawLen, fy / yawLen, 0.0f};
+                    if (Finite(head) && Dot(head, head) > 0.01f) {
+                        const V3 rootForward =
+                            std::isfinite(yawLen) && yawLen > 0.1f
+                            ? V3{fx / yawLen, fy / yawLen, 0.0f}
+                            : V3{0.0f, 1.0f, 0.0f};
+                        // Scripted in-game scenes stage the live player ped. Its
+                        // root matrix is authoritative: the posed head axes can
+                        // use a different convention and were observed pointing
+                        // exactly backwards. Formal cutscene actors can have a
+                        // frozen root. Match Vice City exactly: CPedIK rotates
+                        // the head about local X/Z, leaving posed local Y (Up)
+                        // as the actor's look direction.
+                        if (g_cutsceneActorAnchorCache.actor != actor) {
+                            g_cutsceneActorAnchorCache.actor = actor;
+                            g_cutsceneActorAnchorCache.headAxis = -1;
+                        }
+                        const bool scriptedActor = !FormalCutsceneRunning();
+                        const V3 headUp{headBone.u[0], headBone.u[1], 0.0f};
+                        g_cutsceneActorAnchorCache.headAxis =
+                            scriptedActor ? -1 : 1;
+                        g_cutsceneActorAnchorCache.headAxisSign = 1.0f;
+                        V3 fwd = scriptedActor
+                            ? rootForward
+                            : headUp;
+                        const float headLookLen = std::sqrt(
+                            std::max(0.0f, Dot(fwd, fwd)));
+                        if (!Finite(fwd) || !std::isfinite(headLookLen) ||
+                            headLookLen < 0.01f) fwd = rootForward;
+                        else fwd = fwd * (1.0f / headLookLen);
+                        static unsigned int directionLogCounter = 0;
+                        if ((++directionLogCounter % 120u) == 1u) {
+                            LOGI("[cutscene.camera] direction root=(%.3f %.3f) "
+                                 "source=%s axis=%d sign=%+.0f chosen=(%.3f %.3f)",
+                                 fx, fy,
+                                 scriptedActor ? "actor_root" : "head_up",
+                                 g_cutsceneActorAnchorCache.headAxis,
+                                 g_cutsceneActorAnchorCache.headAxisSign,
+                                 fwd.x, fwd.y);
+                        }
                         // right = up x forward (the game's handedness); the
                         // opposite cross mirrored the view left/right.
                         base.right   = V3{-fwd.y, fwd.x, 0.0f};
@@ -3279,8 +4128,23 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                                        fwd * 0.05f;
                         g_vrBase = base;
                         g_vrBaseValid = true;
+                        g_cutsceneActorAnchorCache.basis = base;
+                        g_cutsceneActorAnchorCache.validAtMs = NowMs();
+                        liveCutsceneActorAnchor = true;
                     }
                 }
+            }
+            // Actor arrays and HAnim matrices can be unavailable for a frame
+            // while a cutscene switches shots.  Reusing only the last validated
+            // value for a quarter second prevents a single director-camera frame
+            // flashing in the headset; no stale actor pointer is dereferenced.
+            if (!liveCutsceneActorAnchor && CutsceneCameraControlsActiveInternal() &&
+                g_cutsceneCameraIndex > 0 &&
+                g_cutsceneActorAnchorCache.validAtMs >= 0.0 &&
+                NowMs() - g_cutsceneActorAnchorCache.validAtMs <= 250.0) {
+                base = g_cutsceneActorAnchorCache.basis;
+                g_vrBase = base;
+                g_vrBaseValid = true;
             }
 
             const V3 headPos{hp[0], hp[1], hp[2]};
@@ -3352,10 +4216,24 @@ constexpr int kParachuteDeployWidget = 187;
 // mainV1.scm polls widget 8 via opcode 0A52 right beside the
 // ANSWER0..ANSWER5 / CELSKIP GXT keys — the incoming-call answer flow.
 constexpr int kPhoneAnswerWidget = 8;
+// DrawHelpIcon name map (2.11 chain @0x502270): the world "press to start /
+// quit" prompt widgets scripts poll near mission markers and minigame gear,
+// and the basketball shot button basketb.scm HOLDS (opcode 0A51 maps to
+// CTouchInterface::IsTouched — handler @0x449ffc).
+constexpr int kMissionStartWidget = 69;    // widget_mission_start
+constexpr int kMissionCancelWidget = 71;   // widget_mission_cancel
+constexpr int kMinigameStartWidget = 73;   // widget_minigame_start
+constexpr int kMinigameCancelWidget = 74;  // widget_minigame_cancel
+constexpr int kBasketballShootWidget = 87; // widget_basketball_shoot
 // Latched once our deploy press goes through: freefall controls (dive) end
 // and the physical riser toggles take over. Cleared when the ped leaves the
 // parachute state (landed / vehicle / weapon change).
 std::atomic<bool> g_parachuteCanopyOpen{false};
+std::atomic<bool> g_parachuteDeployPullRequested{false};
+// Visual-only suppression while the deploy ring is needed. Gameplay weapon
+// ownership is untouched and becomes visible again as soon as the canopy is
+// open or the parachute state ends.
+std::atomic<bool> g_hideWeaponsForChuteDeploy{false};
 
 // The skydive/parachute state: on foot, parachute is the active weapon, and
 // the ped is genuinely airborne.
@@ -3390,7 +4268,8 @@ bool ParachuteDeployChordActive() {
     if (!ParachuteScriptDeployReady()) return false;
     xr::InputState in{};
     xr::GetInput(in);
-    return in.a;   // A opens the canopy (right trigger is the dive)
+    return in.a || g_parachuteDeployPullRequested.load(
+                       std::memory_order_acquire);
 }
 
 // Both grips + right trigger answers an incoming cell-phone call. The widget
@@ -3403,6 +4282,25 @@ bool PhoneAnswerChordActive() {
     xr::GetInput(in);
     return in.grip[0] >= 0.75f && in.grip[1] >= 0.75f &&
            in.triggers[1] >= 0.70f;
+}
+
+// A answers a world "press to start" prompt (basketball, gym gear, minigame
+// markers). The widgets are only polled while such a prompt is on screen, so
+// a stray A elsewhere does nothing. Grips must be open — every grips chord
+// means something else.
+bool MissionStartPressActive() {
+    if (g_inputBlocked.load(std::memory_order_relaxed)) return false;
+    xr::InputState in{};
+    xr::GetInput(in);
+    return in.a && in.grip[0] < 0.55f && in.grip[1] < 0.55f;
+}
+
+// Both grips + B quits the active minigame (mission/minigame cancel).
+bool MissionCancelChordActive() {
+    if (g_inputBlocked.load(std::memory_order_relaxed)) return false;
+    xr::InputState in{};
+    xr::GetInput(in);
+    return in.b && in.grip[0] >= 0.75f && in.grip[1] >= 0.75f;
 }
 
 // Accept/decline prompt bridge. Mobile yes/no prompts poll a PAIR of touch
@@ -3562,6 +4460,19 @@ int OnWidgetTouchedQuery(int widgetId, void* outTouchPos, int touchIndex) {
     const int original = g_origWidgetTouched
         ? g_origWidgetTouched(widgetId, outTouchPos, touchIndex) : 0;
     LogWidgetPoll("touched", widgetId);
+    // Basketball shot charge: basketb.scm holds widget_basketball_shoot via
+    // opcode 0A51 (= IsTouched) only while CJ carries the ball. Hold the
+    // right trigger to wind up, release at the top of the jump — the
+    // script's own shot-meter mechanics, driven by a physical trigger.
+    if (widgetId == kBasketballShootWidget && !original &&
+        !g_inputBlocked.load(std::memory_order_relaxed)) {
+        xr::InputState shootIn{};
+        xr::GetInput(shootIn);
+        if (shootIn.triggers[1] >= 0.50f) {
+            FillTouchPos(outTouchPos);
+            return 1;
+        }
+    }
     if ((widgetId == 160 || widgetId == 156) &&
         NowMs() >= g_promptStatsUntilMs.load(std::memory_order_relaxed))
         return original;
@@ -3596,7 +4507,9 @@ bool OnWidgetReleased(int widgetId, void* outTouchPos, int touchIndex) {
     }
     if (widgetId == kParachuteDeployWidget && !original &&
         ParachuteDeployChordActive()) {
-        LOGI("[vr.touch] parachute deploy (A pressed)");
+        const bool ring = g_parachuteDeployPullRequested.exchange(
+            false, std::memory_order_acq_rel);
+        LOGI("[vr.touch] parachute deploy (%s)", ring ? "ring pulled" : "A pressed");
         g_parachuteCanopyOpen.store(true, std::memory_order_relaxed);
         return true;
     }
@@ -3606,14 +4519,52 @@ bool OnWidgetReleased(int widgetId, void* outTouchPos, int touchIndex) {
 
     // Incoming call: the phone widget is polled only while it rings, so a
     // held chord simply answers on the next script poll.
-    if (widgetId == kPhoneAnswerWidget && !original &&
-        PhoneAnswerChordActive()) {
-        LOGI("[vr.touch] phone answered (grips + right trigger)");
+    if (widgetId == kPhoneAnswerWidget && !original) {
+        if (PhoneAnswerChordActive()) {
+            LOGI("[vr.touch] phone answered (grips + right trigger)");
+            return true;
+        }
+        // Nag guard: a story call left ringing (catch-up calls after the
+        // progression bump) auto-answers after six seconds, so testing is
+        // not interrupted by a phone that never gives up.
+        static double firstRingMs = 0.0;
+        static double lastRingMs = 0.0;
+        const double nowRingMs = NowMs();
+        if (nowRingMs - lastRingMs > 3000.0) firstRingMs = nowRingMs;
+        lastRingMs = nowRingMs;
+        if (nowRingMs - firstRingMs > 6000.0) {
+            firstRingMs = nowRingMs;
+            LOGI("[vr.touch] phone auto-answered after 6s ring");
+            return true;
+        }
+    }
+
+    // World start/quit prompts (basketball court, gym gear, minigame
+    // markers): A starts, both grips + B quits. Logged via the shared poll
+    // tracer so field captures show WHEN a court prompt goes live.
+    if (widgetId == kMissionStartWidget || widgetId == kMinigameStartWidget ||
+        widgetId == kMissionCancelWidget ||
+        widgetId == kMinigameCancelWidget) {
+        LogWidgetPoll("released", widgetId);
+    }
+    if ((widgetId == kMissionStartWidget ||
+         widgetId == kMinigameStartWidget) &&
+        !original && MissionStartPressActive()) {
+        LOGI("[vr.touch] start prompt widget=%d (A)", widgetId);
+        return true;
+    }
+    if ((widgetId == kMissionCancelWidget ||
+         widgetId == kMinigameCancelWidget) &&
+        !original && MissionCancelChordActive()) {
+        LOGI("[vr.touch] cancel prompt widget=%d (grips+B)", widgetId);
         return true;
     }
 
     if (widgetId != 161 && widgetId != kParachuteDeployWidget &&
-        widgetId != 175 && widgetId != kPhoneAnswerWidget) {
+        widgetId != 175 && widgetId != kPhoneAnswerWidget &&
+        widgetId != kMissionStartWidget && widgetId != kMissionCancelWidget &&
+        widgetId != kMinigameStartWidget &&
+        widgetId != kMinigameCancelWidget) {
         const double nowMs = NowMs();
         int slot = -1;
         for (int i = 0; i < 4; ++i) {
@@ -3678,6 +4629,11 @@ void OnUpdatePads() {
 
     xr::InputState in{};
     xr::GetInput(in);
+    float mappedMoveX=0.0f,mappedMoveY=0.0f;
+    float mappedTurnX=0.0f,mappedTurnY=0.0f;
+    locomotion::MapGameplaySticks(
+        in.leftStick[0],in.leftStick[1],in.rightStick[0],in.rightStick[1],
+        &mappedMoveX,&mappedMoveY,&mappedTurnX,&mappedTurnY);
 
     // Always advance the physical Y latch, including theater/menu/blocked frames.
     // Otherwise a Y used in the two-grip menu chord can become a delayed vehicle
@@ -3686,7 +4642,7 @@ void OnUpdatePads() {
     const bool enterOnFoot = g.FindPlayerVehicle == nullptr ||
         g.FindPlayerVehicle(-1, false) == nullptr;
     const bool enterHeld = locomotion::ActionHeld(
-        locomotion::BIND_ACT_ENTER, in.a, in.b, in.x, in.y,
+        locomotion::BIND_ACT_ENTER, in.a, in.b, in.x, in.y, in.l3, in.r3,
         enterOnFoot);
     const bool yJustDown = enterHeld && !yWasDown;
     yWasDown = enterHeld;
@@ -3711,7 +4667,7 @@ void OnUpdatePads() {
     // NewState is the first member of CPad; LeftStickX at +0x00, LeftStickY at
     // +0x02, both int16 in [-128,127]. Forward (stick pushed up) must be negative.
     auto* ns = reinterpret_cast<int16_t*>(pad);
-    float moveX=in.leftStick[0],moveY=in.leftStick[1];
+    float moveX=mappedMoveX,moveY=mappedMoveY;
     locomotion::TransformMoveStick(CurrentLocalHeadYaw(),&moveX,&moveY);
     ns[0] = static_cast<int16_t>(std::clamp(moveX,-1.0f,1.0f) *  127.0f);
     ns[1] = static_cast<int16_t>(std::clamp(moveY,-1.0f,1.0f) * -127.0f);
@@ -3725,7 +4681,7 @@ void OnUpdatePads() {
     // chord and never reach the game.
     void* vehicle = g.FindPlayerVehicle ? g.FindPlayerVehicle(-1, false)
                                         : nullptr;
-    if (vehicle && driving::GetMode() == driving::MODE_DEFAULT && !bothGrips) {
+    if (vehicle && !driving::VehicleWeaponsImmersive() && !bothGrips) {
         const bool left  = in.b && in.grip[0] >= 0.55f && in.grip[1] < 0.55f;
         const bool right = in.b && in.grip[1] >= 0.55f && in.grip[0] < 0.55f;
         const bool bike =
@@ -3735,6 +4691,25 @@ void OnUpdatePads() {
         if (left)  { ns[4] = 0; ns[5] = 255; }   // look left, not handbrake
         if (right) { ns[6] = 0; ns[7] = 255; }   // look right, not handbrake
         if (left || right || forward) ns[17] = 255;  // Circle = drive-by fire
+    }
+
+    // Thumbrest D-pad (UEVR-port parity, community request): while a thumb
+    // rests on either thumbrest, the right stick presses the D-pad - gang
+    // recruit/dismiss (up/down), conversation replies and other D-pad
+    // interactions - and turning is suppressed in the turn handler. On foot
+    // only: vehicles keep their whole stick vocabulary (Hydra nozzles!).
+    const bool dpadModeNow =
+        (in.thumbrest[0] || in.thumbrest[1]) && vehicle == nullptr;
+    static bool dpadModeWas = false;
+    if (dpadModeNow != dpadModeWas) {
+        dpadModeWas = dpadModeNow;
+        LOGI("[input] thumbrest dpad %s", dpadModeNow ? "ON" : "OFF");
+    }
+    if (dpadModeNow) {
+        if (mappedTurnY >  0.5f) ns[8]  = 255;   // DPadUp
+        if (mappedTurnY < -0.5f) ns[9]  = 255;   // DPadDown
+        if (mappedTurnX < -0.5f) ns[10] = 255;   // DPadLeft
+        if (mappedTurnX >  0.5f) ns[11] = 255;   // DPadRight
     }
 
     // Aircraft flight sticks, ported from the desktop VR build. Left stick is
@@ -3751,8 +4726,8 @@ void OnUpdatePads() {
         const auto deadzone = [](float v) {
             return std::abs(v) < 0.18f ? 0.0f : v;
         };
-        float lx = deadzone(in.leftStick[0]);
-        float ly = deadzone(in.leftStick[1]);
+        float lx = deadzone(mappedMoveX);
+        float ly = deadzone(mappedMoveY);
         const float ax = std::abs(lx), ay = std::abs(ly);
         constexpr float kDominance = 0.85f;
         if (ax > ay) ly *= std::max(0.0f, 1.0f - kDominance * (ax - ay));
@@ -3767,9 +4742,9 @@ void OnUpdatePads() {
         ns[0] = static_cast<int16_t>(std::clamp(lx, -1.0f, 1.0f) *  127.0f);
         ns[1] = static_cast<int16_t>(std::clamp(ly, -1.0f, 1.0f) * -127.0f);
         ns[2] = static_cast<int16_t>(
-            std::clamp(deadzone(in.rightStick[0]), -1.0f, 1.0f) *  127.0f);
+            std::clamp(deadzone(mappedTurnX), -1.0f, 1.0f) *  127.0f);
         ns[3] = static_cast<int16_t>(
-            std::clamp(deadzone(in.rightStick[1]), -1.0f, 1.0f) * -127.0f);
+            std::clamp(deadzone(mappedTurnY), -1.0f, 1.0f) * -127.0f);
         // B fires the aircraft's weapons (Hydra rockets/gun = the vehicle
         // fire button). Grips are otherwise unused in the cockpit.
         if (in.b) ns[17] = 255;
@@ -3783,7 +4758,7 @@ void OnUpdatePads() {
         {
             const int flightModel = *reinterpret_cast<const std::uint16_t*>(
                 reinterpret_cast<const char*>(vehicle) + 0x32);
-            const float nozzleStick = deadzone(in.rightStick[1]);
+            const float nozzleStick = deadzone(mappedTurnY);
             if (flightModel == 520 && std::abs(nozzleStick) > 0.0f) {
                 auto* nozzleAngle = reinterpret_cast<std::uint16_t*>(
                     reinterpret_cast<char*>(vehicle) + 0xa88);
@@ -3848,7 +4823,7 @@ void OnUpdatePads() {
         gesturemove::Update(gesturePed, swimming, gestureBlocked, gm);
         if (gm.forward > 0.0f) {
             const float stickMagnitude =
-                std::abs(in.leftStick[0]) + std::abs(in.leftStick[1]);
+                std::abs(mappedMoveX) + std::abs(mappedMoveY);
             if (stickMagnitude < 0.25f) {
                 float gestureX = 0.0f, gestureY = gm.forward;
                 locomotion::TransformMoveStick(
@@ -3866,8 +4841,86 @@ void OnUpdatePads() {
     // ButtonSquare (ns[14]) is SA's jump.
     if (vehicle == nullptr &&
         locomotion::ActionHeld(locomotion::BIND_ACT_JUMP,
-                               in.a, in.b, in.x, in.y, true))
+                               in.a, in.b, in.x, in.y, in.l3, in.r3, true))
         ns[14] = 255;
+
+    if (vehicle == nullptr &&
+        locomotion::ActionHeld(locomotion::BIND_ACT_ATTACK,
+                               in.a,in.b,in.x,in.y,in.l3,in.r3,true))
+        ns[17] = 255;
+
+    // Crouch on L3, driven straight through the duck secondary task. Every
+    // mobile PAD path is dead: GetDuck (@0x49ef8c) and DuckJustDown
+    // (@0x49f018) poll touch widgets and additionally early-out before the
+    // poll in VR — the widget bridge never even saw widget 32 asked for.
+    // ped+0x538 = m_pIntelligence (disasm-verified).
+    {
+        // Raw click visibility: if this line never appears while clicking
+        // the left stick, the stickclick binding itself is dead (and then
+        // the L3+R3 recenter cannot work either).
+        static bool l3RawPrev = false;
+        if (in.l3 != l3RawPrev) {
+            l3RawPrev = in.l3;
+            LOGI("[vr.touch] L3 %s (r3=%d vehicle=%d)",
+                 in.l3 ? "down" : "up", in.r3 ? 1 : 0,
+                 vehicle != nullptr ? 1 : 0);
+        }
+        // Own latch instead of querying the task: ClearTaskDuckSecondary
+        // aborts asynchronously, so a task-state toggle mis-read rapid
+        // clicks ("stand, stand, duck"). The latch is deterministic and the
+        // per-frame re-assert survives anything else clearing the task.
+        bool& duckLatched = g_duckLatched;
+        static bool duckL3Prev = false;
+        static double duckClickAtMs = 0.0;
+        const bool duckL3 = vehicle == nullptr &&
+            locomotion::ActionHeld(locomotion::BIND_ACT_CROUCH,
+                                   in.a,in.b,in.x,in.y,in.l3,in.r3,true) &&
+            !(in.l3 && in.r3);
+        const double duckNowMs = NowMs();
+        if (duckL3 && !duckL3Prev && duckNowMs - duckClickAtMs > 400.0) {
+            duckClickAtMs = duckNowMs;
+            duckLatched = !duckLatched;
+            LOGI("[vr.touch] crouch toggle (L3) -> %s",
+                 duckLatched ? "duck" : "stand");
+        }
+        duckL3Prev = duckL3;
+        // A ducked ped cannot reliably start the enter-vehicle task, so the
+        // enter/exit press always restores standing first.
+        if (vehicle != nullptr || in.y) duckLatched = false;
+        if (g.FindPlayerPed && g.CPedIntelligence_SetTaskDuckSecondary &&
+            g.CPedIntelligence_ClearTaskDuckSecondary &&
+            g.CPedIntelligence_GetTaskDuck) {
+            if (void* duckPed = g.FindPlayerPed(-1)) {
+                std::uint8_t* intelligence = nullptr;
+                std::memcpy(&intelligence,
+                            static_cast<std::uint8_t*>(duckPed) + 0x538,
+                            sizeof(intelligence));
+                if (intelligence) {
+                    const bool hasTask =
+                        g.CPedIntelligence_GetTaskDuck(intelligence, true) !=
+                        nullptr;
+                    static int duckSetCount = 0;
+                    static double duckLogAt = 0.0;
+                    if (duckLatched && !hasTask) {
+                        // Duration 0 = held until cleared.
+                        g.CPedIntelligence_SetTaskDuckSecondary(
+                            intelligence, 0);
+                        ++duckSetCount;
+                    } else if (!duckLatched && hasTask) {
+                        g.CPedIntelligence_ClearTaskDuckSecondary(
+                            intelligence);
+                    }
+                    const double duckNowSec = NowMs() * 0.001;
+                    if (duckLatched && duckNowSec - duckLogAt > 1.0) {
+                        duckLogAt = duckNowSec;
+                        LOGI("[vr.touch] duck hold task=%d sets/s=%d",
+                             hasTask ? 1 : 0, duckSetCount);
+                        duckSetCount = 0;
+                    }
+                }
+            }
+        }
+    }
 
     // Arm the yes/no prompt answers (R2 accept / L2 decline) on trigger
     // edges — only on foot with empty hands so combat fire never answers a
@@ -4064,8 +5117,26 @@ void OnUpdatePads() {
     // joystick via opcode 0494 (CPad::GetLeftAnalogue = NewState sticks), so
     // everything routes through the ns[] writes below.
     bool chuteTogglesVisible = false;
+    bool chuteRingVisible = false;
     const bool parachuteAir = vehicle == nullptr && ParachuteStateActive();
+    const bool chuteImmersive = locomotion::ParachuteControlImmersive();
     g_parachuteAirState.store(parachuteAir, std::memory_order_relaxed);
+    g_hideWeaponsForChuteDeploy.store(
+        parachuteAir && !g_parachuteCanopyOpen.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    {
+        static int previousChuteVisualState = -1;
+        const int visualState = (parachuteAir ? 1 : 0) |
+            (g_parachuteCanopyOpen.load(std::memory_order_relaxed) ? 2 : 0) |
+            (chuteImmersive ? 4 : 0);
+        if (visualState != previousChuteVisualState) {
+            previousChuteVisualState = visualState;
+            LOGI("[vr.chute.visual] air=%d canopy=%d control=%s",
+                 parachuteAir ? 1 : 0,
+                 g_parachuteCanopyOpen.load(std::memory_order_relaxed) ? 1 : 0,
+                 chuteImmersive ? "RISERS" : "STICKS");
+        }
+    }
     // Scene warm-ups so the world below the skydive is already streamed. The
     // first cut warmed at the PLAYER's position — hundreds of metres up in
     // the air where nothing is in streaming range (13-26ms no-ops in the
@@ -4116,7 +5187,78 @@ void OnUpdatePads() {
                 ns[1] = -127;
             }
             g_skydiveDiveView.store(diving, std::memory_order_relaxed);
-        } else if (!locomotion::ParachuteControlImmersive()) {
+
+            // Physical deploy ring: hangs at the right side of the chest in a
+            // yaw-only body frame. Either free hand may grip it; a short pull
+            // away/down sends the exact same widget-187 pulse as the A button.
+            static bool ringGrabbed = false;
+            static int ringHand = -1;
+            static float ringGrabPos[3]{};
+            float head[3]{}, headQ[4]{};
+            float ringPos[3]{}, ringAnchor[3]{}, ringForward[3]{};
+            bool ringValid = false;
+            if (ParachuteScriptDeployReady() && xr::GetHeadPose(head, headQ)) {
+                const float fx = -(2.0f * (headQ[0]*headQ[2] + headQ[3]*headQ[1]));
+                const float fz = -(1.0f - 2.0f * (headQ[0]*headQ[0] + headQ[1]*headQ[1]));
+                const float len = std::sqrt(fx*fx + fz*fz);
+                if (len > 0.05f) {
+                    const float fwdX = fx/len, fwdZ = fz/len;
+                    const float rightX = -fwdZ, rightZ = fwdX;
+                    ringForward[0] = fwdX; ringForward[1] = 0.0f; ringForward[2] = fwdZ;
+                    // Close to the lower-right sternum, not outside the
+                    // controller's comfortable reach volume.
+                    ringPos[0] = head[0] + fwdX*0.20f + rightX*0.11f;
+                    ringPos[1] = head[1] - 0.25f;
+                    ringPos[2] = head[2] + fwdZ*0.20f + rightZ*0.11f;
+                    ringAnchor[0] = ringPos[0] - rightX*0.04f;
+                    ringAnchor[1] = ringPos[1] + 0.20f;
+                    ringAnchor[2] = ringPos[2] - rightZ*0.04f;
+                    ringValid = true;
+                }
+            }
+            xr::HandPose ringHands[2]{};
+            xr::GetHandPoses(ringHands);
+            if (!ringValid) {
+                ringGrabbed = false;
+                ringHand = -1;
+            } else if (!ringGrabbed) {
+                for (int hand = 0; hand < 2; ++hand) {
+                    if (!ringHands[hand].valid || in.grip[hand] < 0.55f)
+                        continue;
+                    const float dx = ringHands[hand].gripPos[0] - ringPos[0];
+                    const float dy = ringHands[hand].gripPos[1] - ringPos[1];
+                    const float dz = ringHands[hand].gripPos[2] - ringPos[2];
+                    if (dx*dx + dy*dy + dz*dz > 0.24f*0.24f) continue;
+                    ringGrabbed = true;
+                    ringHand = hand;
+                    std::memcpy(ringGrabPos, ringHands[hand].gripPos,
+                                sizeof(ringGrabPos));
+                    break;
+                }
+            } else if (ringHand < 0 || !ringHands[ringHand].valid ||
+                       in.grip[ringHand] < 0.35f) {
+                ringGrabbed = false;
+                ringHand = -1;
+            } else {
+                std::memcpy(ringPos, ringHands[ringHand].gripPos,
+                            sizeof(ringPos));
+                const float dx = ringPos[0] - ringGrabPos[0];
+                const float dy = ringPos[1] - ringGrabPos[1];
+                const float dz = ringPos[2] - ringGrabPos[2];
+                const float travel = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if (travel >= 0.14f || dy <= -0.10f) {
+                    g_parachuteDeployPullRequested.store(true,
+                                                         std::memory_order_release);
+                    ringGrabbed = false;
+                    ringHand = -1;
+                }
+            }
+            if (ringValid) {
+                chuteRingVisible = true;
+                xr::SetParachuteDeployRing(ringPos, ringAnchor, ringForward,
+                                           ringGrabbed, true);
+            }
+        } else if (!chuteImmersive) {
             // DEFAULT canopy control: the sticks steer through the script's
             // joystick path; no toggles, no riser grabbing.
             g_skydiveDiveView.store(false, std::memory_order_relaxed);
@@ -4135,6 +5277,7 @@ void OnUpdatePads() {
             chuteTogglesVisible = true;
             float head[3]{}, headQ[4]{};
             float togglePos[2][3]{};
+            float toggleAnchor[2][3]{};
             bool toggleValid = false;
             if (xr::GetHeadPose(head, headQ)) {
                 // Yaw-flattened head frame: the toggles hang with the body,
@@ -4150,6 +5293,12 @@ void OnUpdatePads() {
                         togglePos[side][0] = head[0] + fwdX*0.24f + rightX*lateral;
                         togglePos[side][1] = head[1] - 0.04f;
                         togglePos[side][2] = head[2] + fwdZ*0.24f + rightZ*lateral;
+                        const float anchorLateral = side == 0 ? -0.23f : 0.23f;
+                        toggleAnchor[side][0] = head[0] + fwdX*0.08f +
+                            rightX*anchorLateral;
+                        toggleAnchor[side][1] = head[1] + 0.58f;
+                        toggleAnchor[side][2] = head[2] + fwdZ*0.08f +
+                            rightZ*anchorLateral;
                     }
                     toggleValid = true;
                 }
@@ -4199,16 +5348,21 @@ void OnUpdatePads() {
                          pull[0], pull[1], steer, flare);
             }
             if (toggleValid)
-                xr::SetParachuteToggles(togglePos, riserGrabbed, true);
+                xr::SetParachuteToggles(togglePos, toggleAnchor,
+                                         riserGrabbed, true);
             else
                 chuteTogglesVisible = false;
         }
     } else {
         g_parachuteCanopyOpen.store(false, std::memory_order_relaxed);
         g_skydiveDiveView.store(false, std::memory_order_relaxed);
+        g_parachuteDeployPullRequested.store(false, std::memory_order_release);
+        g_hideWeaponsForChuteDeploy.store(false, std::memory_order_relaxed);
     }
     if (!chuteTogglesVisible)
-        xr::SetParachuteToggles(nullptr, nullptr, false);
+        xr::SetParachuteToggles(nullptr, nullptr, nullptr, false);
+    if (!chuteRingVisible)
+        xr::SetParachuteDeployRing(nullptr, nullptr, nullptr, false, false);
 
     // Enter/exit is owned exclusively by the exact ExitVehicleJustDown hook
     // below. Do not also write CPad::NewState here: Android's controller state is
@@ -4259,6 +5413,244 @@ bool OnExitVehicleJustDown(void* pad, bool onFoot, void* vehicle, bool arg3,
 using RenderSceneFn = void (*)(bool);
 RenderSceneFn g_origRenderScene = nullptr;
 
+// Retail 2.11 mobile shadow policy. MobileSettings is an array of 38 entries,
+// each 0x28 bytes; the live int for entry 5 (SHADOWS) is settings+0xd8.
+// Value 0 disables the real-time manager, 1 renders the cheap/direct path, and
+// 2 enables CRealTimeShadowManager plus the advanced offscreen resolve.
+constexpr int kMobileShadowSettingIndex = 5;
+constexpr int kMobileShadowOff = 0;
+constexpr int kMobileShadowDirect = 1;
+constexpr int kMobileShadowAdvanced = 2;
+constexpr unsigned int kVehicleShadowBudgetPerFrame = 8;
+constexpr unsigned int kShadowDiagnosticFrames = 600;
+
+using MobileSettingsSetFn = void (*)(int setting, int value);
+using MenuSaveSettingsFn = void (*)();
+using StoreShadowForVehicleFn = void (*)(void* vehicle, int shadowType);
+
+void* g_mobileSettingsBase = nullptr;
+bool* g_mobileSettingsLoaded = nullptr;
+int* g_mobileShadowLevel = nullptr;
+MobileSettingsSetFn g_mobileSettingsSet = nullptr;
+MenuSaveSettingsFn g_menuSaveSettings = nullptr;
+StoreShadowForVehicleFn g_origStoreShadowForVehicle = nullptr;
+std::atomic<bool> g_dynamicShadowSettingsReady{false};
+std::atomic<bool> g_dynamicShadowDirectRouteReady{false};
+std::atomic<bool> g_vehicleShadowBudgetHookReady{false};
+void* g_shadowPlayerVehicle = nullptr;
+unsigned int g_ambientVehicleShadowsThisFrame = 0;
+unsigned int g_mobileSettingsInitializedFrames = 0;
+
+struct DynamicShadowDiagnostics {
+    unsigned int frames{};
+    unsigned long long levelOverrides{};
+    unsigned long long gtaSetSaves{};
+    unsigned long long directEyePasses{};
+    unsigned long long vehicleRequests{};
+    unsigned long long vehicleAccepted{};
+    unsigned long long vehicleSimple{};
+    unsigned long long playerVehicleAccepted{};
+    unsigned long long vehicleBudgetDrops{};
+    unsigned long long vehicleDisabledDrops{};
+    unsigned int maxStoredShadows{};
+    int lastMobileLevel{-1};
+};
+DynamicShadowDiagnostics g_dynamicShadowDiagnostics{};
+
+bool ReadEntityWorldPosition(const void* entity, V3* out);
+
+bool MobileShadowSettingsInitialized() {
+    // Initialize fills two descriptor pointers at the head of each 0x28-byte
+    // entry. BSS is zero before that point, including before the first native
+    // OnDrawFrame, so this prevents an early gta_sa.set write.
+    return g_mobileSettingsBase &&
+        *reinterpret_cast<void* const*>(g_mobileSettingsBase) != nullptr;
+}
+
+int ReadMobileShadowLevel() {
+    return g_dynamicShadowSettingsReady.load(std::memory_order_acquire) &&
+            g_mobileShadowLevel && MobileShadowSettingsInitialized()
+        ? *g_mobileShadowLevel : -1;
+}
+
+int CurrentShadowMode() {
+    return ClampShadowMode(
+        g_dynamicShadowMode.load(std::memory_order_acquire));
+}
+
+int DesiredMobileShadowLevel(int mode) {
+    if (mode == kShadowModeOff) return kMobileShadowOff;
+    if (mode == kShadowModeSimple) return kMobileShadowDirect;
+    return kMobileShadowAdvanced;
+}
+
+bool MobileShadowSettingsSafeToWrite() {
+    return MobileShadowSettingsInitialized() &&
+        ((g_mobileSettingsLoaded && *g_mobileSettingsLoaded) ||
+         g_mobileSettingsInitializedFrames >= 4);
+}
+
+void ApplyDynamicShadowPreference() {
+    if (!g_dynamicShadowSettingsReady.load(std::memory_order_acquire) ||
+        !g_mobileShadowLevel || !g_mobileSettingsSet ||
+        !MobileShadowSettingsSafeToWrite()) {
+        return;
+    }
+    const int mode = CurrentShadowMode();
+    const int desired = DesiredMobileShadowLevel(mode);
+    const int observed = *g_mobileShadowLevel;
+    g_dynamicShadowDiagnostics.lastMobileLevel = observed;
+    if (observed != desired) {
+        g_mobileSettingsSet(kMobileShadowSettingIndex, desired);
+        ++g_dynamicShadowDiagnostics.levelOverrides;
+        g_dynamicShadowDiagnostics.lastMobileLevel = *g_mobileShadowLevel;
+        if (g_menuSaveSettings) {
+            // Menu_SaveSettings writes the regular gta_sa.set and tails into
+            // MobileSettings::SaveToFile (38 current int32 values).
+            g_menuSaveSettings();
+            ++g_dynamicShadowDiagnostics.gtaSetSaves;
+        }
+    }
+}
+
+void BeginDynamicShadowFrame() {
+    if (g_dynamicShadowDiagnostics.frames >= kShadowDiagnosticFrames) {
+        LOGI("[shadow.diag] frames=%u mode=%s mobile=%d settings=%d route=%d "
+             "vehicle_hook=%d overrides=%llu saves=%llu direct_eyes=%llu "
+             "vehicle=req:%llu accept:%llu simple:%llu player:%llu budget_drop:%llu "
+             "off_drop:%llu stored_max=%u budget=%u",
+             g_dynamicShadowDiagnostics.frames,
+             ShadowModeName(CurrentShadowMode()),
+             g_dynamicShadowDiagnostics.lastMobileLevel,
+             g_dynamicShadowSettingsReady.load(std::memory_order_acquire) ? 1 : 0,
+             g_dynamicShadowDirectRouteReady.load(std::memory_order_acquire) ? 1 : 0,
+             g_vehicleShadowBudgetHookReady.load(std::memory_order_acquire) ? 1 : 0,
+             g_dynamicShadowDiagnostics.levelOverrides,
+             g_dynamicShadowDiagnostics.gtaSetSaves,
+             g_dynamicShadowDiagnostics.directEyePasses,
+             g_dynamicShadowDiagnostics.vehicleRequests,
+             g_dynamicShadowDiagnostics.vehicleAccepted,
+             g_dynamicShadowDiagnostics.vehicleSimple,
+             g_dynamicShadowDiagnostics.playerVehicleAccepted,
+             g_dynamicShadowDiagnostics.vehicleBudgetDrops,
+             g_dynamicShadowDiagnostics.vehicleDisabledDrops,
+             g_dynamicShadowDiagnostics.maxStoredShadows,
+             kVehicleShadowBudgetPerFrame);
+        g_dynamicShadowDiagnostics = {};
+        g_dynamicShadowDiagnostics.lastMobileLevel = ReadMobileShadowLevel();
+    }
+    ++g_dynamicShadowDiagnostics.frames;
+    if (MobileShadowSettingsInitialized()) {
+        if (g_mobileSettingsInitializedFrames < 4)
+            ++g_mobileSettingsInitializedFrames;
+    } else {
+        g_mobileSettingsInitializedFrames = 0;
+    }
+    g_ambientVehicleShadowsThisFrame = 0;
+    g_shadowPlayerVehicle = g.FindPlayerVehicle
+        ? g.FindPlayerVehicle(-1, false) : nullptr;
+    ApplyDynamicShadowPreference();
+}
+
+void OnStoreShadowForVehicle(void* vehicle, int shadowType) {
+    ++g_dynamicShadowDiagnostics.vehicleRequests;
+    const int mode = CurrentShadowMode();
+    if (mode == kShadowModeOff) {
+        ++g_dynamicShadowDiagnostics.vehicleDisabledDrops;
+        return;
+    }
+
+    // SIMPLE already keeps the global mobile setting at 1. HYBRID keeps level
+    // 2 for CJ/ped silhouettes, but makes only vehicle storage take the stock
+    // level-1 blob path. This avoids vehicle real-time-map churn/flicker and is
+    // substantially cheaper while preserving the visible player silhouette.
+    if (mode != kShadowModeFull) {
+        int savedLevel = -1;
+        const bool forceVehicleSimple = mode == kShadowModeHybrid &&
+            g_mobileShadowLevel && *g_mobileShadowLevel == kMobileShadowAdvanced;
+        if (forceVehicleSimple) {
+            savedLevel = *g_mobileShadowLevel;
+            *g_mobileShadowLevel = kMobileShadowDirect;
+        }
+        if (g_origStoreShadowForVehicle)
+            g_origStoreShadowForVehicle(vehicle, shadowType);
+        if (forceVehicleSimple && g_mobileShadowLevel)
+            *g_mobileShadowLevel = savedLevel;
+        ++g_dynamicShadowDiagnostics.vehicleAccepted;
+        ++g_dynamicShadowDiagnostics.vehicleSimple;
+        return;
+    }
+
+    // FULL mode: match the stock advanced range before spending one of the
+    // bounded real-time slots.
+    // Far vehicles still enter the original routine so its exact subtype and
+    // fallback behavior remain authoritative, but they cannot consume the cap.
+    V3 world{};
+    if (g.CRenderer_ms_vecCameraPosition &&
+        ReadEntityWorldPosition(vehicle, &world)) {
+        const float dx = world.x - g.CRenderer_ms_vecCameraPosition[0];
+        const float dy = world.y - g.CRenderer_ms_vecCameraPosition[1];
+        if (dx * dx + dy * dy > 32.0f * 32.0f) {
+            if (g_origStoreShadowForVehicle)
+                g_origStoreShadowForVehicle(vehicle, shadowType);
+            return;
+        }
+    }
+
+    const bool playerVehicle = vehicle && vehicle == g_shadowPlayerVehicle;
+    // Reserve one of the eight slots for the occupied player vehicle. The stock
+    // StoreShadowForVehicle distance/type filters still run after this cap, so
+    // this only bounds work; it does not widen the retail 32 m advanced range.
+    const unsigned int ambientBudget = g_shadowPlayerVehicle
+        ? kVehicleShadowBudgetPerFrame - 1 : kVehicleShadowBudgetPerFrame;
+    if (!playerVehicle && g_ambientVehicleShadowsThisFrame >= ambientBudget) {
+        ++g_dynamicShadowDiagnostics.vehicleBudgetDrops;
+        return;
+    }
+    if (playerVehicle) {
+        ++g_dynamicShadowDiagnostics.playerVehicleAccepted;
+    } else {
+        ++g_ambientVehicleShadowsThisFrame;
+    }
+    ++g_dynamicShadowDiagnostics.vehicleAccepted;
+    if (g_origStoreShadowForVehicle)
+        g_origStoreShadowForVehicle(vehicle, shadowType);
+}
+
+class ScopedStereoDynamicShadowRouting {
+public:
+    ScopedStereoDynamicShadowRouting() {
+        if (CurrentShadowMode() < kShadowModeHybrid ||
+            !g_dynamicShadowDirectRouteReady.load(std::memory_order_acquire) ||
+            !g_mobileShadowLevel ||
+            *g_mobileShadowLevel != kMobileShadowAdvanced) {
+            return;
+        }
+        savedLevel_ = *g_mobileShadowLevel;
+        // Generation already ran at level 2 in CRenderer::PreRender followed by
+        // CRealTimeShadowManager::Update. Only RenderScene is scoped to level 1:
+        // this skips emu_Bind/ResolveShadowTarget and records the generated true
+        // shadows directly into the current eye camera raster.
+        *g_mobileShadowLevel = kMobileShadowDirect;
+        active_ = true;
+        ++g_dynamicShadowDiagnostics.directEyePasses;
+    }
+
+    ~ScopedStereoDynamicShadowRouting() {
+        if (active_ && g_mobileShadowLevel)
+            *g_mobileShadowLevel = savedLevel_;
+    }
+
+    ScopedStereoDynamicShadowRouting(
+        const ScopedStereoDynamicShadowRouting&) = delete;
+    ScopedStereoDynamicShadowRouting& operator=(
+        const ScopedStereoDynamicShadowRouting&) = delete;
+
+private:
+    int savedLevel_{kMobileShadowAdvanced};
+    bool active_{};
+};
+
 // Opaque-weapon ordering and flat-sky suppression. The game's CClouds::Render
 // runs before world geometry with the depth test OFF. Hooking that exact point
 // lets the eye pass omit its incompatible screen sprites and then render the
@@ -4282,6 +5674,10 @@ bool  g_cloudsSpriteTailHooked = false;
 // to CPU-projected screen sprites.
 thread_local bool g_renderingStereoEye = false;
 thread_local int  g_renderingStereoEyeIndex = -1;
+thread_local CamBasis g_hiddenAreaMaskEye{};
+thread_local float g_hiddenAreaMaskTanX = 0.0f;
+thread_local float g_hiddenAreaMaskTanY = 0.0f;
+thread_local float g_hiddenAreaMaskDepth = 0.0f;
 
 class ScopedStereoEyePass {
 public:
@@ -5096,6 +6492,14 @@ thread_local bool g_aircraftOrdinaryHorizonContextOuterBand = false;
 thread_local bool g_aircraftOrdinaryHorizonContextOuterFarBand = false;
 thread_local bool g_aircraftOrdinaryHorizonRangePromoted = false;
 thread_local bool g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
+thread_local bool g_aircraftOrdinaryFirstPassPitchUnionContext = false;
+thread_local bool g_aircraftOrdinaryFirstPassPitchUnionAccepted = false;
+thread_local bool g_aircraftOrdinaryStockMaxContext = false;
+thread_local bool g_aircraftOrdinaryStockMaxRangePromoted = false;
+thread_local bool g_aircraftOrdinaryRaisedPitchUnionContext = false;
+thread_local bool g_aircraftOrdinaryManagedOuterObserveContext = false;
+thread_local bool g_aircraftOrdinaryRaisedPitchUnionAccepted = false;
+thread_local bool g_aircraftOrdinaryRaisedPitchUnionAlphaRetained = false;
 thread_local bool g_aircraftOrdinaryHorizonFrameActive = false;
 thread_local bool g_aircraftOrdinaryOuterScanActive = false;
 thread_local bool g_aircraftOrdinaryOuterSessionDisabled = false;
@@ -5124,6 +6528,7 @@ thread_local int g_aircraftCoarseLodHmdAccepts = 0;
 thread_local int g_aircraftCoarseLodRadialAccepts = 0;
 thread_local int g_aircraftCoarseLodStockVisible = 0;
 thread_local int g_aircraftCoarseLodRootCalls = 0;
+thread_local int g_aircraftCoarseLodRootRangeSkips = 0;
 thread_local int g_aircraftCoarseLodNonRootSkips = 0;
 thread_local int g_aircraftCoarseLodBigCalls = 0;
 thread_local int g_aircraftCoarseLodRootGuardRejects = 0;
@@ -5158,6 +6563,21 @@ struct AircraftOrdinaryHorizonCounters {
     int range{};
     int sphereTests{};
     int stockVisible{};
+    int firstPassTests{};
+    int firstPassOmniEligible{};
+    int firstPassAccepted{};
+    int firstPassStockCovered{};
+    int firstPassRescues{};
+    int firstPassStockPhase{};
+    int firstPassNearbyPhase{};
+    int firstPassGeometryRejects{};
+    int firstPassUnionLimit{};
+    int firstPassCapacityStops{};
+    int firstPassOcclusionTests{};
+    int firstPassOcclusionStockVisible{};
+    int firstPassOcclusionBypasses{};
+    int firstPassOcclusionUnconsumed{};
+    int firstPassRetentionMisses{};
     int forcedVisible{};
     int rangePromotionTests{};
     int rangePromotions{};
@@ -5199,6 +6619,43 @@ struct AircraftOrdinaryHorizonCounters {
 };
 thread_local AircraftOrdinaryHorizonCounters
     g_aircraftOrdinaryHorizon{};
+struct AircraftStockPitchMaxCounters {
+    int tests{};
+    int accepted{};
+    int stockVisible{};
+    int rescues{};
+    int unknownFailOpen{};
+    int nearRetail{};
+    int managedOuterRetail{};
+    int managedOuterStockVisible{};
+    int managedSlantFailOpen{};
+    int rescueLimit{};
+    int capacityStops{};
+    int occlusionTests{};
+    int occlusionStockVisible{};
+    int occlusionBypasses{};
+    int occlusionUnconsumed{};
+    int alphaOverflowCaptured{};
+    int alphaOverflowDropped{};
+};
+thread_local AircraftStockPitchMaxCounters g_aircraftStockPitchMax{};
+struct AircraftOrdinaryStockMaxCounters {
+    int rosterPrevious{};
+    int rosterPrepared{};
+    int rosterMatches{};
+    int rosterKept{};
+    int tests{};
+    int promotions{};
+    int filtered{};
+    int stockCovered{};
+    int rescues{};
+    int retentionMisses{};
+    int capacityStops{};
+    int fadeQueued{};
+    int fadeCapped{};
+};
+thread_local AircraftOrdinaryStockMaxCounters
+    g_aircraftOrdinaryStockMax{};
 struct AircraftOrdinaryOuterCounters {
     bool active{};
     float radiusM{};
@@ -5271,6 +6728,8 @@ struct AircraftOrdinaryOuterCounters {
     int radialAlphaRetained{};
     int radialFadeSafeQueued{};
     int radialFadeSafeCapped{};
+    int radialAlphaOverflowCaptured{};
+    int radialAlphaOverflowDropped{};
     int rosterPrevious{};
     int rosterPrepared{};
     int rosterMatches{};
@@ -5311,6 +6770,10 @@ struct AircraftOrdinaryRadialCandidate {
     bool wasPersistent{};
     bool wasPersistentProven{};
     bool rosterSelected{};
+    bool wasStockMaxRoster{};
+    bool stockMaxCarryEligible{};
+    std::uint8_t stockMaxCoveredStreak{};
+    bool stockMaxRosterSelected{};
     bool selected{};
     bool replayRequested{};
     bool replayVisited{};
@@ -5489,6 +6952,24 @@ thread_local float g_aircraftOrdinaryPersistentAnchorX = 0.0f;
 thread_local float g_aircraftOrdinaryPersistentAnchorY = 0.0f;
 thread_local bool g_aircraftOrdinaryPersistentAnchorValid = false;
 thread_local bool g_aircraftOrdinaryPersistentContext = false;
+struct AircraftOrdinaryStockMaxEntry {
+    void* entity{};
+    float worldX{};
+    float worldY{};
+    float worldZ{};
+    std::int16_t modelId{-1};
+    bool matchedThisFrame{};
+    bool promotionAcceptedThisFrame{};
+    std::uint8_t stockCoveredStreak{};
+    bool proven{};
+};
+thread_local std::array<AircraftOrdinaryStockMaxEntry,
+                        kAircraftOrdinaryStockMaxLimit>
+    g_aircraftOrdinaryStockMaxRoster{};
+thread_local int g_aircraftOrdinaryStockMaxRosterCount = 0;
+thread_local float g_aircraftOrdinaryStockMaxAnchorX = 0.0f;
+thread_local float g_aircraftOrdinaryStockMaxAnchorY = 0.0f;
+thread_local bool g_aircraftOrdinaryStockMaxAnchorValid = false;
 struct AircraftOrdinarySectorStampSnapshot {
     void* entity{};
     std::uint16_t scanCode{};
@@ -5531,6 +7012,176 @@ thread_local std::array<void*, kAircraftLodRootUnionCaptureLimit>
     g_aircraftCoarseLodRootUnion{};
 thread_local int g_aircraftCoarseLodRootUnionCount = 0;
 thread_local bool g_aircraftCoarseLodRootUnionOverflow = false;
+struct AircraftMegaMeshVertex {
+    V3 position{};
+    V3 normal{};
+    std::uint32_t color{};
+    float u{};
+    float v{};
+};
+static_assert(sizeof(AircraftMegaMeshVertex) == 36,
+              "RxObjSpace3DVertex layout changed");
+struct AircraftMegaMeshBatch {
+    std::vector<AircraftMegaMeshVertex> vertices;
+    std::vector<unsigned short> indices;
+};
+
+bool HiddenAreaMaskEnabled() {
+    static const bool enabled = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = kDefaultHiddenAreaMaskEnabled;
+        if (__system_property_get(kHiddenAreaMaskProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[stereo.mask] ignoring invalid %s=%s (valid 0 or 1)",
+                      kHiddenAreaMaskProperty, text);
+        }
+        LOGI("[stereo.mask] depth prepass enabled=%d property=%s",
+             value ? 1 : 0, kHiddenAreaMaskProperty);
+        return value;
+    }();
+    return enabled;
+}
+
+struct HiddenAreaMaskDrawProfile {
+    unsigned int pairs{};
+    unsigned int attempted{};
+    unsigned int drawn{};
+    unsigned int failures{};
+    unsigned int vertices{};
+    unsigned int triangles{};
+    double wallMs{};
+    double cpuMs{};
+};
+
+// Draw the runtime's hidden-area mesh at the near plane. The eye target has a
+// depth buffer but no stencil attachment, so the usual stencil mask is encoded
+// as near depth instead. The mask pixels are physically invisible; visible
+// pixels and all game colour remain untouched. RenderScene restores its world
+// states immediately after the hooked CClouds call.
+bool RenderHiddenAreaDepthMask() {
+    if (!g_renderingStereoEye || g_renderingStereoEyeIndex < 0 ||
+        g_renderingStereoEyeIndex > 1 || !HiddenAreaMaskEnabled() ||
+        !Finite(g_hiddenAreaMaskEye.pos) ||
+        !Finite(g_hiddenAreaMaskEye.right) ||
+        !Finite(g_hiddenAreaMaskEye.forward) ||
+        !Finite(g_hiddenAreaMaskEye.up) ||
+        !std::isfinite(g_hiddenAreaMaskTanX) ||
+        !std::isfinite(g_hiddenAreaMaskTanY) ||
+        !std::isfinite(g_hiddenAreaMaskDepth) ||
+        g_hiddenAreaMaskTanX <= 0.0f || g_hiddenAreaMaskTanY <= 0.0f ||
+        g_hiddenAreaMaskDepth <= 0.0f || !g.RwRenderStateSet ||
+        !g.RwIm3DTransform || !g.RwIm3DRenderIndexedPrimitive ||
+        !g.RwIm3DEnd) {
+        return false;
+    }
+
+    xr::HiddenAreaMaskView mask{};
+    if (!xr::GetHiddenAreaMask(g_renderingStereoEyeIndex, mask) ||
+        !mask.verticesXY || !mask.indices || mask.vertexCount <= 0 ||
+        mask.indexCount <= 0 || (mask.indexCount % 3) != 0 ||
+        mask.vertexCount > 65535) {
+        return false;
+    }
+
+    const double wallStart = NowMs();
+    const double cpuStart = perf::ThreadCpuMs();
+    thread_local std::vector<AircraftMegaMeshVertex> vertices;
+    vertices.resize(static_cast<std::size_t>(mask.vertexCount));
+    const CamBasis& eye = g_hiddenAreaMaskEye;
+    const V3 centre = eye.pos + eye.forward * g_hiddenAreaMaskDepth;
+    for (int i = 0; i < mask.vertexCount; ++i) {
+        const float x = mask.verticesXY[static_cast<std::size_t>(i) * 2u];
+        const float y = mask.verticesXY[static_cast<std::size_t>(i) * 2u + 1u];
+        if (!std::isfinite(x) || !std::isfinite(y)) return false;
+        // RenderWare stores camera LEFT in CamBasis::right, hence the minus.
+        const V3 position = centre -
+            eye.right * (x * g_hiddenAreaMaskTanX * g_hiddenAreaMaskDepth) +
+            eye.up * (y * g_hiddenAreaMaskTanY * g_hiddenAreaMaskDepth);
+        if (!Finite(position)) return false;
+        vertices[static_cast<std::size_t>(i)] = {
+            position, {}, 0xff000000u, 0.0f, 0.0f};
+    }
+
+    // GL only writes depth while the depth test is enabled. The target was
+    // just cleared to far depth, so an ordinary near-plane LEQUAL draw stamps
+    // every hidden triangle without relying on backend-specific depth funcs.
+    g.RwRenderStateSet(1, nullptr);                         // no texture
+    g.RwRenderStateSet(6, reinterpret_cast<void*>(1));     // ZTEST on
+    g.RwRenderStateSet(8, reinterpret_cast<void*>(1));     // ZWRITE on
+    g.RwRenderStateSet(12, reinterpret_cast<void*>(0));    // opaque/no blend
+    g.RwRenderStateSet(14, reinterpret_cast<void*>(0));    // fog off
+    g.RwRenderStateSet(20, reinterpret_cast<void*>(1));    // cull none
+
+    constexpr unsigned int kIm3DFlags = 1u | 8u | 16u;
+    constexpr int kTriangleList = 3;
+    const bool transformed = g.RwIm3DTransform(
+        vertices.data(), static_cast<unsigned int>(vertices.size()), nullptr,
+        kIm3DFlags) != nullptr;
+    if (transformed) {
+        g.RwIm3DRenderIndexedPrimitive(
+            kTriangleList, const_cast<unsigned short*>(mask.indices),
+            mask.indexCount);
+        g.RwIm3DEnd();
+    }
+
+    thread_local HiddenAreaMaskDrawProfile profile{};
+    ++profile.attempted;
+    if (transformed) {
+        ++profile.drawn;
+        profile.vertices += static_cast<unsigned int>(mask.vertexCount);
+        profile.triangles += static_cast<unsigned int>(mask.indexCount / 3);
+    } else {
+        ++profile.failures;
+    }
+    profile.wallMs += std::max(0.0, NowMs() - wallStart);
+    profile.cpuMs += std::max(0.0, perf::ThreadCpuMs() - cpuStart);
+    if (g_renderingStereoEyeIndex == 1 && ++profile.pairs >= 144u) {
+        LOGI("[stereo.mask.draw] pairs=%u attempted=%u drawn=%u fail=%u "
+             "vertices=%u triangles=%u wall=%.3fms cpu=%.3fms",
+             profile.pairs, profile.attempted, profile.drawn,
+             profile.failures, profile.vertices, profile.triangles,
+             profile.wallMs / static_cast<double>(profile.pairs),
+             profile.cpuMs / static_cast<double>(profile.pairs));
+        profile = {};
+    }
+    return transformed;
+}
+
+struct AircraftMegaMeshStats {
+    bool active{};
+    bool rebuilt{};
+    bool overflow{};
+    int roots{};
+    int sources{};
+    int collisionSources{};
+    int collisionTriangles{};
+    int collisionRejected{};
+    int boundsFallback{};
+    int flatBoundsFallback{};
+    int modelMissing{};
+    int geometryRejected{};
+    int rangeRejected{};
+    int batches{};
+    int vertices{};
+    int triangles{};
+    int prunedLods{};
+    int drawCalls{};
+    int drawFailures{};
+};
+thread_local std::array<AircraftMegaMeshBatch,
+                        kAircraftMegaMeshBatchLimit>
+    g_aircraftMegaMeshBatches{};
+thread_local std::array<void*, kAircraftLodRootUnionCaptureLimit>
+    g_aircraftMegaMeshEntities{};
+thread_local int g_aircraftMegaMeshEntityCount = 0;
+thread_local int g_aircraftMegaMeshAgeFrames =
+    kAircraftMegaMeshRebuildFrames;
+thread_local float g_aircraftMegaMeshAnchorX = 0.0f;
+thread_local float g_aircraftMegaMeshAnchorY = 0.0f;
+thread_local bool g_aircraftMegaMeshAnchorValid = false;
+thread_local bool g_aircraftMegaMeshActive = false;
+thread_local AircraftMegaMeshStats g_aircraftMegaMeshStats{};
 struct AircraftOpaqueChildCandidate {
     void* child{};
     void* parent{};
@@ -5755,6 +7406,42 @@ void PublishAircraftOrdinaryRenderWitnessAndFadeQueue(
     for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
         const AircraftOrdinaryRadialCandidate& candidate =
             g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        // Stock-max promotion is proven in two steps: the exact SetupMap
+        // transaction records promotionAcceptedThisFrame, then the complete
+        // post-scan disk resolves result-0 alpha membership into retained.
+        // Queue its stereo fade override here, after that exact join.  Keeping
+        // this separate from `selected` avoids charging the extra 48-slot layer
+        // to the established 48/80 render-witness array.
+        const bool exactStockMaxPromotion = candidate.wasStockMaxRoster &&
+            candidate.stockMaxCarryEligible &&
+            candidate.stockMaxCoveredStreak == 0u && candidate.retained;
+        if (exactStockMaxPromotion && g.CModelInfo_ms_modelInfoPtrs &&
+            candidate.modelId >= 0 && candidate.modelId < 20000) {
+            void* const stockMaxModelInfo =
+                g.CModelInfo_ms_modelInfoPtrs[candidate.modelId];
+            if (stockMaxModelInfo) {
+                float* const stockMaxDrawDistanceAddress =
+                    reinterpret_cast<float*>(
+                        static_cast<std::uint8_t*>(stockMaxModelInfo) + 0x38);
+                const float stockMaxObservedRaw =
+                    *stockMaxDrawDistanceAddress;
+                bool stockMaxFadeCapped = false;
+                const float stockMaxFadeSafeRaw =
+                    AircraftOrdinaryFadeSafeRawDrawDistance(
+                        stockMaxObservedRaw, candidate.slantDistanceM,
+                        cameraLod, candidate.boundRadiusM, farClipM,
+                        &stockMaxFadeCapped);
+                if (std::isfinite(stockMaxFadeSafeRaw) &&
+                    stockMaxFadeSafeRaw > stockMaxObservedRaw) {
+                    QueueStereoModelDrawDistance(
+                        stockMaxDrawDistanceAddress, stockMaxObservedRaw,
+                        stockMaxFadeSafeRaw);
+                    ++g_aircraftOrdinaryStockMax.fadeQueued;
+                    if (stockMaxFadeCapped)
+                        ++g_aircraftOrdinaryStockMax.fadeCapped;
+                }
+            }
+        }
         if (!candidate.selected) continue;
         const std::uint64_t identity =
             AircraftOrdinaryStableIdentityHash(candidate);
@@ -6059,6 +7746,23 @@ AtomicDefaultRenderFn g_origAtomicDefaultRender = nullptr;
 GetIsOnScreenFn g_origGetIsOnScreen = nullptr;
 thread_local void* g_visibilityCurrentRenderEntity = nullptr;
 thread_local const char* g_visibilityCurrentRenderPath = nullptr;
+// The broad visibility hooks above deliberately keep nearby entities resident
+// and present in the shared stereo render list.  At dispatch time each eye can
+// still use retail's exact frustum without feeding that decision back into
+// population, streaming or list ownership.  The scoped flag makes the
+// GetIsOnScreen trampoline bypass only our widening inside this one pure draw
+// admission query.
+thread_local bool g_stereoDispatchExactFrustumContext = false;
+
+struct StereoDispatchCullWindow {
+    std::uint64_t probes[2]{};
+    std::uint64_t visible[2]{};
+    std::uint64_t culled[2]{};
+    std::uint64_t failOpen{};
+    double startMs{};
+};
+
+thread_local StereoDispatchCullWindow g_stereoDispatchCullWindow{};
 struct TrafficAtomicRenderScope {
     traffic_census::AtomicRenderProbe probe{};
     bool submitted{};
@@ -6369,6 +8073,11 @@ struct NeonOverflowEntry {
     float distance{};
 };
 
+struct AircraftOrdinaryAlphaOverflowEntry {
+    void* entity{};
+    float distance{};
+};
+
 constexpr int kNeonOverflowCapacity = 32;
 thread_local std::array<NeonOverflowEntry, kNeonOverflowCapacity>
     g_neonOverflowEntries{};
@@ -6377,6 +8086,12 @@ std::atomic<bool> g_neonOverflowHooksActive{false};
 std::atomic<std::uint64_t> g_neonOverflowCaptured{0};
 std::atomic<std::uint64_t> g_neonOverflowDraws{0};
 std::atomic<std::uint64_t> g_neonOverflowDrops{0};
+constexpr int kAircraftOrdinaryAlphaOverflowCapacity = 32;
+thread_local std::array<AircraftOrdinaryAlphaOverflowEntry,
+                        kAircraftOrdinaryAlphaOverflowCapacity>
+    g_aircraftOrdinaryAlphaOverflowEntries{};
+thread_local int g_aircraftOrdinaryAlphaOverflowCount = 0;
+std::atomic<std::uint64_t> g_aircraftOrdinaryAlphaOverflowDraws{0};
 
 bool NeonOverflowContains(void* entity) {
     for (int i = 0; i < g_neonOverflowCount; ++i) {
@@ -6402,29 +8117,91 @@ bool CaptureNeonOverflow(void* entity, float distance) {
     return true;
 }
 
+bool AircraftOrdinaryAlphaOverflowContains(const void* entity) {
+    if (!entity) return false;
+    for (int i = 0; i < g_aircraftOrdinaryAlphaOverflowCount; ++i) {
+        if (g_aircraftOrdinaryAlphaOverflowEntries[
+                static_cast<std::size_t>(i)].entity == entity) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CaptureAircraftOrdinaryAlphaOverflow(void* entity, float distance) {
+    const bool raisedPitchEntry =
+        g_aircraftOrdinaryRaisedPitchUnionAccepted;
+    const bool deterministicAircraftEntry =
+        g_aircraftOrdinaryHorizonScanActive &&
+        g_aircraftOrdinaryHorizonContextEntity == entity &&
+        (g_aircraftOrdinaryPersistentContext ||
+         g_aircraftOrdinaryStockMaxContext ||
+         raisedPitchEntry ||
+         (g_aircraftOrdinaryRadialAdmissionActive &&
+          g_visibilityScanPhase == 6));
+    if (!deterministicAircraftEntry || !entity || !std::isfinite(distance) ||
+        !g_stereoActive.load(std::memory_order_relaxed) ||
+        !g_neonOverflowHooksActive.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if (AircraftOrdinaryAlphaOverflowContains(entity)) return true;
+    if (g_aircraftOrdinaryAlphaOverflowCount >=
+        kAircraftOrdinaryAlphaOverflowCapacity) {
+        ++g_aircraftOrdinaryOuter.radialAlphaOverflowDropped;
+        if (raisedPitchEntry)
+            ++g_aircraftStockPitchMax.alphaOverflowDropped;
+        return false;
+    }
+    g_aircraftOrdinaryAlphaOverflowEntries[
+        static_cast<std::size_t>(g_aircraftOrdinaryAlphaOverflowCount++)] = {
+            entity, distance};
+    ++g_aircraftOrdinaryOuter.radialAlphaOverflowCaptured;
+    if (raisedPitchEntry)
+        ++g_aircraftStockPitchMax.alphaOverflowCaptured;
+    return true;
+}
+
 void OnInitAlphaEntityList() {
     g_neonOverflowCount = 0;
+    g_aircraftOrdinaryAlphaOverflowCount = 0;
     if (g_origInitAlphaEntityList) g_origInitAlphaEntityList();
 }
 
 void OnRenderFadingEntities() {
     if (g_origRenderFadingEntities) g_origRenderFadingEntities();
     if (!g_neonOverflowHooksActive.load(std::memory_order_relaxed) ||
-        !g_neonSignsEnabled.load(std::memory_order_relaxed) ||
         (g_renderingStereoEyeIndex != 0 && g_renderingStereoEyeIndex != 1) ||
         !g.CVisibilityPlugins_RenderEntity) {
         return;
     }
-    std::sort(g_neonOverflowEntries.begin(),
-              g_neonOverflowEntries.begin() + g_neonOverflowCount,
-              [](const NeonOverflowEntry& a, const NeonOverflowEntry& b) {
+    if (g_neonSignsEnabled.load(std::memory_order_relaxed)) {
+        std::sort(g_neonOverflowEntries.begin(),
+                  g_neonOverflowEntries.begin() + g_neonOverflowCount,
+                  [](const NeonOverflowEntry& a,
+                     const NeonOverflowEntry& b) {
+                      return a.distance > b.distance;
+                  });
+        for (int i = 0; i < g_neonOverflowCount; ++i) {
+            const NeonOverflowEntry& entry = g_neonOverflowEntries[i];
+            if (!entry.entity) continue;
+            g.CVisibilityPlugins_RenderEntity(entry.entity, entry.distance);
+            g_neonOverflowDraws.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    std::sort(g_aircraftOrdinaryAlphaOverflowEntries.begin(),
+              g_aircraftOrdinaryAlphaOverflowEntries.begin() +
+                  g_aircraftOrdinaryAlphaOverflowCount,
+              [](const AircraftOrdinaryAlphaOverflowEntry& a,
+                 const AircraftOrdinaryAlphaOverflowEntry& b) {
                   return a.distance > b.distance;
               });
-    for (int i = 0; i < g_neonOverflowCount; ++i) {
-        const NeonOverflowEntry& entry = g_neonOverflowEntries[i];
+    for (int i = 0; i < g_aircraftOrdinaryAlphaOverflowCount; ++i) {
+        const AircraftOrdinaryAlphaOverflowEntry& entry =
+            g_aircraftOrdinaryAlphaOverflowEntries[static_cast<std::size_t>(i)];
         if (!entry.entity) continue;
         g.CVisibilityPlugins_RenderEntity(entry.entity, entry.distance);
-        g_neonOverflowDraws.fetch_add(1, std::memory_order_relaxed);
+        g_aircraftOrdinaryAlphaOverflowDraws.fetch_add(
+            1, std::memory_order_relaxed);
     }
 }
 
@@ -6514,6 +8291,14 @@ int CountTrackedAlphaNodes() {
 
 bool OnInsertEntityIntoSortedList(void* entity, float distance) {
     if (!g_origInsertEntityIntoSortedList) return false;
+    const bool raisedPitchEntry =
+        g_aircraftOrdinaryHorizonContextEntity == entity &&
+        g_aircraftOrdinaryRaisedPitchUnionAccepted;
+    const auto retainRaisedPitchAlpha = [raisedPitchEntry](bool retained) {
+        if (raisedPitchEntry && retained)
+            g_aircraftOrdinaryRaisedPitchUnionAlphaRetained = true;
+        return retained;
+    };
     const auto* const bytes = entity
         ? static_cast<const std::uint8_t*>(entity) : nullptr;
     const int modelId = bytes ? static_cast<int>(
@@ -6532,18 +8317,24 @@ bool OnInsertEntityIntoSortedList(void* entity, float distance) {
         // contract, so OFF cannot accidentally send this transparent overlay
         // through the opaque world path.  ON stays on retail's existing alpha
         // list, which is already retained and deduplicated across both eyes.
-        if (!g_neonSignsEnabled.load(std::memory_order_relaxed)) return true;
-        if (NeonOverflowContains(entity)) return true;
+        if (!g_neonSignsEnabled.load(std::memory_order_relaxed))
+            return retainRaisedPitchAlpha(true);
+        if (NeonOverflowContains(entity))
+            return retainRaisedPitchAlpha(true);
     }
     if (g_renderingStereoEyeIndex != 1 ||
         !g_alphaDedupeHookActive.load(std::memory_order_relaxed)) {
         const bool inserted =
             g_origInsertEntityIntoSortedList(entity, distance);
+        if (!inserted &&
+            CaptureAircraftOrdinaryAlphaOverflow(entity, distance)) {
+            return retainRaisedPitchAlpha(true);
+        }
         if (!inserted && neonBit >= 0 &&
             CaptureNeonOverflow(entity, distance)) {
-            return true;
+            return retainRaisedPitchAlpha(true);
         }
-        return inserted;
+        return retainRaisedPitchAlpha(inserted);
     }
 
     ++g_stereoReuseCounters.alphaDedupeChecks;
@@ -6551,23 +8342,27 @@ bool OnInsertEntityIntoSortedList(void* entity, float distance) {
         g.CVisibilityPlugins_m_alphaEntityList, 200, entity);
     if (regular == AlphaLookupResult::Found) {
         ++g_stereoReuseCounters.alphaDedupeHits;
-        return true;
+        return retainRaisedPitchAlpha(true);
     }
     const AlphaLookupResult underwater = AlphaListContains(
         g.CVisibilityPlugins_m_alphaUnderwaterEntityList, 100, entity);
     if (underwater == AlphaLookupResult::Found) {
         ++g_stereoReuseCounters.alphaDedupeHits;
-        return true;
+        return retainRaisedPitchAlpha(true);
     }
     if (regular == AlphaLookupResult::Invalid ||
         underwater == AlphaLookupResult::Invalid) {
         ++g_stereoReuseCounters.alphaDedupeFaults;
     }
     const bool inserted = g_origInsertEntityIntoSortedList(entity, distance);
-    if (!inserted && neonBit >= 0 && CaptureNeonOverflow(entity, distance)) {
-        return true;
+    if (!inserted &&
+        CaptureAircraftOrdinaryAlphaOverflow(entity, distance)) {
+        return retainRaisedPitchAlpha(true);
     }
-    return inserted;
+    if (!inserted && neonBit >= 0 && CaptureNeonOverflow(entity, distance)) {
+        return retainRaisedPitchAlpha(true);
+    }
+    return retainRaisedPitchAlpha(inserted);
 }
 
 void OnUpdateStaticShadows() {
@@ -6587,7 +8382,7 @@ void OnRenderEffects() {
     // In stereo gameplay the flat Android surface is not submitted. Skip its
     // duplicate late pass after GraphicsEffects records the curated subset into
     // both eye textures. Frontend/cutscene rendering keeps the retail function.
-    if (graphicsfx::Profile() > 0 &&
+    if (graphicsfx::Enabled() &&
         g_stereoActive.load(std::memory_order_relaxed)) {
         return;
     }
@@ -6599,7 +8394,7 @@ void OnFxRender(void* fx, void* camera, unsigned char heatHaze) {
     // eye. Suppress only its later flat-surface PLT call, leaving the rest of
     // RenderEffects untouched when another module owns that broader GOT slot.
     if (g_fireFlatSkipActive.load(std::memory_order_relaxed) &&
-        graphicsfx::Profile() == 1 &&
+        graphicsfx::Enabled() && graphicsfx::Profile() == 1 &&
         g_stereoActive.load(std::memory_order_relaxed)) {
         return;
     }
@@ -6970,7 +8765,10 @@ void* OnRenderVehicleHiDetail(void* atomic) {
 // scanning is 2D"). These helpers flatten/restore the frame matrix around the
 // retail ScanWorld call inside OnScanWorld below. Disasm: scan matrix =
 // frame(+0x8 of the RwCamera at TheCamera+0x930) + 0x20; rows right/up/at.
-float* FlattenScanFrameMatrix(float saved[9]) {
+float* FlattenScanFrameMatrix(float saved[9],
+                              bool preferredForwardValid,
+                              float preferredForwardX,
+                              float preferredForwardY) {
     if (!g.TheCamera) return nullptr;
     auto* cameraBytes = static_cast<std::uint8_t*>(g.TheCamera);
     void* rwCamera = *reinterpret_cast<void**>(cameraBytes + 0x930);
@@ -6979,7 +8777,15 @@ float* FlattenScanFrameMatrix(float saved[9]) {
     if (!frame) return nullptr;
     float* m = reinterpret_cast<float*>(
         static_cast<std::uint8_t*>(frame) + 0x20);
-    float fx = m[8], fy = m[9];
+    // ScanWorld consumes both ms_fCameraHeading and the RwCamera frame.  In the
+    // immersive aircraft camera those can describe different yaw directions:
+    // the heading is the current HMD gaze while the restored monitor-camera
+    // frame can still point along the old/rear view.  Feeding that mixed pair
+    // made the streamed detail wedge live behind the aircraft.  When the caller
+    // has an audited aircraft heading, flatten the frame from the same vector so
+    // both inputs select the same forward sectors.
+    float fx = preferredForwardValid ? preferredForwardX : m[8];
+    float fy = preferredForwardValid ? preferredForwardY : m[9];
     float len = std::sqrt(fx * fx + fy * fy);
     if (len < 0.05f && g_vrBaseValid) {
         // Near-vertical view: the base yaw is never fully vertical.
@@ -7103,17 +8909,18 @@ bool ReadAircraftHorizontalForward(float* forwardXOut, float* forwardYOut) {
     float forwardX = 0.0f;
     float forwardY = 0.0f;
     float forwardLength = 0.0f;
-    if (g_staticCullCone.valid) {
-        forwardX = g_staticCullCone.forward.x;
-        forwardY = g_staticCullCone.forward.y;
-        forwardLength = std::hypot(forwardX, forwardY);
-    }
-    // Looking almost straight up/down must keep the same horizontal coverage
-    // as a level gaze. Fall back to the yaw-only aircraft/body basis.
-    if ((!std::isfinite(forwardLength) || forwardLength < 0.25f) &&
-        g_vrBaseValid) {
+    // The scan heading is a vehicle-space invariant, not a gaze direction.
+    // Prefer the shared body basis even if a live HMD cone is available.
+    if (g_vrBaseValid) {
         forwardX = g_vrBase.forward.x;
         forwardY = g_vrBase.forward.y;
+        forwardLength = std::hypot(forwardX, forwardY);
+    }
+    // Fail open to the cached cone only when the body basis is unavailable.
+    if ((!std::isfinite(forwardLength) || forwardLength < 0.25f) &&
+        g_staticCullCone.valid) {
+        forwardX = g_staticCullCone.forward.x;
+        forwardY = g_staticCullCone.forward.y;
         forwardLength = std::hypot(forwardX, forwardY);
     }
     if (!std::isfinite(forwardLength) || forwardLength < 0.05f) return false;
@@ -7540,6 +9347,12 @@ void ClearAircraftOrdinaryPersistentRoster() {
     g_aircraftOrdinaryPersistentAnchorY = 0.0f;
     g_aircraftOrdinaryPersistentAnchorValid = false;
     g_aircraftOrdinaryPersistentContext = false;
+    g_aircraftOrdinaryStockMaxRosterCount = 0;
+    g_aircraftOrdinaryStockMaxAnchorX = 0.0f;
+    g_aircraftOrdinaryStockMaxAnchorY = 0.0f;
+    g_aircraftOrdinaryStockMaxAnchorValid = false;
+    g_aircraftOrdinaryStockMaxContext = false;
+    g_aircraftOrdinaryStockMaxRangePromoted = false;
 }
 
 void BeginAircraftOrdinaryPersistentFrame(bool keepRoster,
@@ -7565,6 +9378,25 @@ void BeginAircraftOrdinaryPersistentFrame(bool keepRoster,
     }
     g_aircraftOrdinaryOuter.rosterPrevious =
         g_aircraftOrdinaryPersistentRosterCount;
+    const float stockMaxAnchorDistance =
+        finiteCamera && g_aircraftOrdinaryStockMaxAnchorValid
+            ? std::hypot(cameraX - g_aircraftOrdinaryStockMaxAnchorX,
+                         cameraY - g_aircraftOrdinaryStockMaxAnchorY)
+            : 0.0f;
+    if (g_aircraftOrdinaryStockMaxAnchorValid &&
+        (!std::isfinite(stockMaxAnchorDistance) ||
+         stockMaxAnchorDistance > kAircraftOrdinaryRosterTeleportResetM)) {
+        g_aircraftOrdinaryStockMaxRosterCount = 0;
+        g_aircraftOrdinaryStockMaxAnchorValid = false;
+    }
+    for (int i = 0; i < g_aircraftOrdinaryStockMaxRosterCount; ++i) {
+        AircraftOrdinaryStockMaxEntry& entry =
+            g_aircraftOrdinaryStockMaxRoster[static_cast<std::size_t>(i)];
+        entry.matchedThisFrame = false;
+        entry.promotionAcceptedThisFrame = false;
+    }
+    g_aircraftOrdinaryStockMax.rosterPrevious =
+        g_aircraftOrdinaryStockMaxRosterCount;
 }
 
 bool AircraftOrdinaryPersistentIdentityMatches(
@@ -7618,6 +9450,70 @@ AircraftOrdinaryPersistentEntry* MatchAircraftOrdinaryPersistentRoster(
     if (!entry->matchedThisFrame) {
         entry->matchedThisFrame = true;
         ++g_aircraftOrdinaryOuter.rosterMatches;
+    }
+    *currentInfoOut = info;
+    return entry;
+}
+
+const AircraftOrdinaryStockMaxEntry* FindAircraftOrdinaryStockMaxRoster(
+        const void* entity) {
+    if (!entity) return nullptr;
+    for (int i = 0; i < g_aircraftOrdinaryStockMaxRosterCount; ++i) {
+        const AircraftOrdinaryStockMaxEntry& entry =
+            g_aircraftOrdinaryStockMaxRoster[static_cast<std::size_t>(i)];
+        if (entry.entity == entity) return &entry;
+    }
+    return nullptr;
+}
+
+bool AircraftOrdinaryStockMaxIdentityMatches(
+        const AircraftOrdinaryStockMaxEntry& entry,
+        int modelId, float worldX, float worldY, float worldZ) {
+    return modelId == entry.modelId &&
+        std::fabs(worldX - entry.worldX) <=
+            kAircraftOrdinaryRosterIdentityToleranceM &&
+        std::fabs(worldY - entry.worldY) <=
+            kAircraftOrdinaryRosterIdentityToleranceM &&
+        std::fabs(worldZ - entry.worldZ) <=
+            kAircraftOrdinaryRosterIdentityToleranceM;
+}
+
+AircraftOrdinaryStockMaxEntry* MatchAircraftOrdinaryStockMaxRoster(
+        void* entity, void* modelInfo, bool timeInRange,
+        AircraftOrdinaryRadialCandidateInfo* currentInfoOut) {
+    if (!entity || !modelInfo || !currentInfoOut ||
+        !g_aircraftOrdinaryRadialSelectionActive ||
+        g_aircraftOrdinaryRadialAdmissionActive ||
+        (g_visibilityScanPhase != 1 && g_visibilityScanPhase != 2)) {
+        return nullptr;
+    }
+
+    AircraftOrdinaryStockMaxEntry* entry = nullptr;
+    for (int i = 0; i < g_aircraftOrdinaryStockMaxRosterCount; ++i) {
+        AircraftOrdinaryStockMaxEntry& candidate =
+            g_aircraftOrdinaryStockMaxRoster[static_cast<std::size_t>(i)];
+        if (candidate.entity == entity) {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (!entry) return nullptr;
+
+    AircraftOrdinaryRadialCandidateInfo info{};
+    const bool described = DescribeAircraftOrdinaryRadialCandidate(
+        entity, modelInfo, timeInRange, &info);
+    const bool identityMatches = described && info.rootless &&
+        !info.outerBand && info.promotionEligible && !info.fallbackEligible &&
+        (info.entityType == 1u || info.entityType == 5u) &&
+        AircraftOrdinaryStockMaxIdentityMatches(
+            *entry, info.modelId, info.worldX, info.worldY, info.worldZ);
+    if (!identityMatches) {
+        ++g_aircraftOrdinaryStockMax.filtered;
+        return nullptr;
+    }
+    if (!entry->matchedThisFrame) {
+        entry->matchedThisFrame = true;
+        ++g_aircraftOrdinaryStockMax.rosterMatches;
     }
     *currentInfoOut = info;
     return entry;
@@ -8293,6 +10189,698 @@ AircraftLodRootUnionStats ApplyAircraftRootUnion(bool enabled) {
     return stats;
 }
 
+bool AircraftMegaMeshContainsEntity(const void* entity) {
+    if (!entity) return false;
+    for (int i = 0; i < g_aircraftMegaMeshEntityCount; ++i) {
+        if (g_aircraftMegaMeshEntities[static_cast<std::size_t>(i)] ==
+                entity) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AppendAircraftMegaMeshEntity(void* entity,
+                                  const float cameraPosition[3],
+                                  AircraftMegaMeshStats& stats) {
+    if (!entity || !cameraPosition ||
+        AircraftMegaMeshContainsEntity(entity)) {
+        return false;
+    }
+    const auto* const entityBytes = static_cast<const std::uint8_t*>(entity);
+    if ((entityBytes[0x5a] & 0x7) != 1 ||
+        !IsAircraftAuthoredLodRoot(entity)) {
+        ++stats.geometryRejected;
+        return false;
+    }
+    V3 entityPosition{};
+    if (!ReadEntityWorldPosition(entity, &entityPosition)) {
+        ++stats.geometryRejected;
+        return false;
+    }
+    const float dx = entityPosition.x - cameraPosition[0];
+    const float dy = entityPosition.y - cameraPosition[1];
+    const float groundDistance = std::hypot(dx, dy);
+    if (!std::isfinite(groundDistance) ||
+        groundDistance < kAircraftMegaMeshMinGroundDistanceM) {
+        ++stats.rangeRejected;
+        return false;
+    }
+
+    const int modelId = static_cast<int>(
+        *reinterpret_cast<const std::int16_t*>(entityBytes + 0x32));
+    if (modelId < 0 || modelId >= 20000 ||
+        !g.CModelInfo_ms_modelInfoPtrs ||
+        !g.CModelInfo_ms_modelInfoPtrs[modelId]) {
+        ++stats.modelMissing;
+        return false;
+    }
+    const auto* const modelBytes = static_cast<const std::uint8_t*>(
+        g.CModelInfo_ms_modelInfoPtrs[modelId]);
+    V3 right{1.0f, 0.0f, 0.0f};
+    V3 forward{0.0f, 1.0f, 0.0f};
+    V3 up{0.0f, 0.0f, 1.0f};
+    V3 position = entityPosition;
+    const auto* const matrix = static_cast<const std::uint8_t*>(
+        *reinterpret_cast<void* const*>(entityBytes + 0x18));
+    if (matrix) {
+        std::memcpy(&right, matrix + 0x00, sizeof(right));
+        std::memcpy(&forward, matrix + 0x10, sizeof(forward));
+        std::memcpy(&up, matrix + 0x20, sizeof(up));
+        std::memcpy(&position, matrix + 0x30, sizeof(position));
+    }
+    if (!Finite(right) || !Finite(forward) || !Finite(up) ||
+        !Finite(position)) {
+        ++stats.geometryRejected;
+        return false;
+    }
+    if (g_aircraftMegaMeshEntityCount >=
+            kAircraftLodRootUnionCaptureLimit) {
+        stats.overflow = true;
+        return false;
+    }
+
+    const int shade = 78 + ((modelId * 37) & 31);
+    const std::uint32_t red = static_cast<std::uint32_t>(shade);
+    const std::uint32_t green = static_cast<std::uint32_t>(
+        std::max(0, shade - 4));
+    const std::uint32_t blue = static_cast<std::uint32_t>(
+        std::max(0, shade - 8));
+    const std::uint32_t color = 0xff000000u |
+        (blue << 16) | (green << 8) | red;
+
+    const auto worldFromLocal = [&](const V3& local) {
+        return V3{
+            position.x + right.x * local.x + forward.x * local.y +
+                up.x * local.z,
+            position.y + right.y * local.x + forward.y * local.y +
+                up.y * local.z,
+            position.z + right.z * local.x + forward.z * local.y +
+                up.z * local.z,
+        };
+    };
+    const auto findBatch = [](int vertices, int indices) {
+        for (int i = 0; i < kAircraftMegaMeshBatchLimit; ++i) {
+            const auto& batch = g_aircraftMegaMeshBatches[
+                static_cast<std::size_t>(i)];
+            if (static_cast<int>(batch.vertices.size()) + vertices <=
+                    kAircraftMegaMeshVerticesPerBatch &&
+                static_cast<int>(batch.indices.size()) + indices <=
+                    kAircraftMegaMeshIndicesPerBatch) {
+                return i;
+            }
+        }
+        return -1;
+    };
+    const auto recordSource = [&] {
+        g_aircraftMegaMeshEntities[static_cast<std::size_t>(
+            g_aircraftMegaMeshEntityCount++)] = entity;
+        ++stats.sources;
+    };
+
+    // The Android port keeps collision meshes resident after RenderWare has
+    // discarded the CPU copy of an instanced visual mesh.  The retail ARM64
+    // layout was verified from CCollisionData::GetNoVectors/GetTrianglePoint:
+    // signed 16-bit triangle count at +0x04, float3 vertices at +0x20 and
+    // 16-byte triangle records (three signed 32-bit indices) at +0x28.
+    // Reusing those triangles gives us a recognisable, pitch-independent city
+    // silhouette -- including thin road/ground slabs -- without requesting
+    // any additional streamed visual models.
+    const auto* const colModel = static_cast<const std::uint8_t*>(
+        *reinterpret_cast<void* const*>(modelBytes + 0x30));
+    V3 collisionMinimum{};
+    V3 collisionMaximum{};
+    bool collisionBoundsValid = false;
+    if (colModel) {
+        std::memcpy(&collisionMinimum, colModel + 0x00,
+                    sizeof(collisionMinimum));
+        std::memcpy(&collisionMaximum, colModel + 0x0c,
+                    sizeof(collisionMaximum));
+        collisionBoundsValid = Finite(collisionMinimum) &&
+            Finite(collisionMaximum) &&
+            collisionMaximum.x > collisionMinimum.x &&
+            collisionMaximum.y > collisionMinimum.y &&
+            collisionMaximum.z >= collisionMinimum.z;
+    }
+    const auto appendCollision = [&]() -> bool {
+        if (!colModel || !collisionBoundsValid) {
+            ++stats.collisionRejected;
+            return false;
+        }
+        const auto* const colData = static_cast<const std::uint8_t*>(
+            *reinterpret_cast<void* const*>(colModel + 0x30));
+        if (!colData) {
+            ++stats.collisionRejected;
+            return false;
+        }
+        const int numTriangles = static_cast<int>(
+            *reinterpret_cast<const std::int16_t*>(colData + 0x04));
+        const auto* const positions = static_cast<const std::uint8_t*>(
+            *reinterpret_cast<void* const*>(colData + 0x20));
+        const auto* const triangles = static_cast<const std::uint8_t*>(
+            *reinterpret_cast<void* const*>(colData + 0x28));
+        if (numTriangles <= 0 ||
+            numTriangles > kAircraftMegaMeshIndicesPerBatch / 3 ||
+            !positions || !triangles) {
+            ++stats.collisionRejected;
+            return false;
+        }
+
+        int maximumIndex = -1;
+        for (int i = 0; i < numTriangles; ++i) {
+            const auto* const triangle = triangles +
+                static_cast<std::size_t>(i) * 16u;
+            const std::int32_t a = *reinterpret_cast<const std::int32_t*>(
+                triangle + 0);
+            const std::int32_t b = *reinterpret_cast<const std::int32_t*>(
+                triangle + 4);
+            const std::int32_t c = *reinterpret_cast<const std::int32_t*>(
+                triangle + 8);
+            if (a < 0 || b < 0 || c < 0) {
+                ++stats.collisionRejected;
+                return false;
+            }
+            maximumIndex = std::max(maximumIndex,
+                                    std::max(a, std::max(b, c)));
+        }
+        const int numVertices = maximumIndex + 1;
+        if (numVertices <= 0 ||
+            numVertices > kAircraftMegaMeshVerticesPerBatch) {
+            ++stats.collisionRejected;
+            return false;
+        }
+        const int batchIndex = findBatch(numVertices, numTriangles * 3);
+        if (batchIndex < 0) {
+            stats.overflow = true;
+            ++stats.collisionRejected;
+            return false;
+        }
+
+        AircraftMegaMeshBatch& batch = g_aircraftMegaMeshBatches[
+            static_cast<std::size_t>(batchIndex)];
+        const std::size_t vertexStart = batch.vertices.size();
+        const std::size_t indexStart = batch.indices.size();
+        const unsigned short baseVertex = static_cast<unsigned short>(
+            vertexStart);
+        batch.vertices.reserve(std::min(
+            kAircraftMegaMeshVerticesPerBatch,
+            static_cast<int>(batch.vertices.size()) + numVertices + 4096));
+        batch.indices.reserve(std::min(
+            kAircraftMegaMeshIndicesPerBatch,
+            static_cast<int>(batch.indices.size()) + numTriangles * 3 +
+                12288));
+
+        const float extentX = collisionMaximum.x - collisionMinimum.x;
+        const float extentY = collisionMaximum.y - collisionMinimum.y;
+        const float extentZ = collisionMaximum.z - collisionMinimum.z;
+        const float tolerance = std::max(
+            5.0f, std::max(extentX, std::max(extentY, extentZ)) * 0.1f);
+        for (int i = 0; i < numVertices; ++i) {
+            V3 local{};
+            std::memcpy(&local,
+                        positions + static_cast<std::size_t>(i) * 12u,
+                        sizeof(local));
+            if (!Finite(local) ||
+                local.x < collisionMinimum.x - tolerance ||
+                local.y < collisionMinimum.y - tolerance ||
+                local.z < collisionMinimum.z - tolerance ||
+                local.x > collisionMaximum.x + tolerance ||
+                local.y > collisionMaximum.y + tolerance ||
+                local.z > collisionMaximum.z + tolerance) {
+                batch.vertices.resize(vertexStart);
+                batch.indices.resize(indexStart);
+                ++stats.collisionRejected;
+                return false;
+            }
+            const V3 world = worldFromLocal(local);
+            if (!Finite(world)) {
+                batch.vertices.resize(vertexStart);
+                batch.indices.resize(indexStart);
+                ++stats.collisionRejected;
+                return false;
+            }
+            batch.vertices.push_back({world, {}, color, 0.0f, 0.0f});
+        }
+        for (int i = 0; i < numTriangles; ++i) {
+            const auto* const triangle = triangles +
+                static_cast<std::size_t>(i) * 16u;
+            const int a = *reinterpret_cast<const std::int32_t*>(triangle + 0);
+            const int b = *reinterpret_cast<const std::int32_t*>(triangle + 4);
+            const int c = *reinterpret_cast<const std::int32_t*>(triangle + 8);
+            batch.indices.push_back(static_cast<unsigned short>(baseVertex + a));
+            batch.indices.push_back(static_cast<unsigned short>(baseVertex + b));
+            batch.indices.push_back(static_cast<unsigned short>(baseVertex + c));
+        }
+        ++stats.collisionSources;
+        stats.collisionTriangles += numTriangles;
+        recordSource();
+        return true;
+    };
+
+    // Mobile RenderWare normally discards the CPU morph-target positions once
+    // an atomic is instanced.  Collision bounds remain resident and provide a
+    // deterministic low-cost silhouette fallback. Shrink them inward so stock
+    // LOD geometry, rendered afterwards, wins cleanly instead of z-fighting.
+    const auto appendBounds = [&]() -> bool {
+        if (!colModel) {
+            ++stats.modelMissing;
+            return false;
+        }
+        if (!collisionBoundsValid) {
+            ++stats.geometryRejected;
+            return false;
+        }
+        const V3 centre{
+            (collisionMinimum.x + collisionMaximum.x) * 0.5f,
+            (collisionMinimum.y + collisionMaximum.y) * 0.5f,
+            (collisionMinimum.z + collisionMaximum.z) * 0.5f,
+        };
+        V3 half{
+            (collisionMaximum.x - collisionMinimum.x) * 0.44f,
+            (collisionMaximum.y - collisionMinimum.y) * 0.44f,
+            (collisionMaximum.z - collisionMinimum.z) * 0.48f,
+        };
+        if (!Finite(centre) || !Finite(half) ||
+            half.x < 1.0f || half.y < 1.0f || half.z < 0.0f ||
+            half.x > 300.0f || half.y > 300.0f || half.z > 300.0f) {
+            ++stats.geometryRejected;
+            return false;
+        }
+        // Very thin collision bounds are predominantly road, plaza and terrain
+        // slabs.  The old box fallback rejected them entirely, leaving the blue
+        // holes reported from the aircraft.  Preserve just their top rectangle:
+        // two triangles, no walls/bottom and therefore negligible extra cost.
+        const bool flatSurface = half.z < 1.5f;
+        const int vertexCount = flatSurface ? 4 : 8;
+        const int indexCount = flatSurface ? 6 : 30;
+        const int batchIndex = findBatch(vertexCount, indexCount);
+        if (batchIndex < 0) {
+            stats.overflow = true;
+            return false;
+        }
+        AircraftMegaMeshBatch& batch = g_aircraftMegaMeshBatches[
+            static_cast<std::size_t>(batchIndex)];
+        const std::size_t vertexStart = batch.vertices.size();
+        const std::size_t indexStart = batch.indices.size();
+        const unsigned short base = static_cast<unsigned short>(
+            vertexStart);
+        for (int corner = 0; corner < vertexCount; ++corner) {
+            const V3 local{
+                centre.x + ((corner & 1) ? half.x : -half.x),
+                centre.y + ((corner & 2) ? half.y : -half.y),
+                flatSurface
+                    ? centre.z + half.z
+                    : centre.z + ((corner & 4) ? half.z : -half.z),
+            };
+            const V3 world = worldFromLocal(local);
+            if (!Finite(world)) {
+                batch.vertices.resize(vertexStart);
+                batch.indices.resize(indexStart);
+                ++stats.geometryRejected;
+                return false;
+            }
+            batch.vertices.push_back({world, {}, color, 0.0f, 0.0f});
+        }
+        // Four walls plus the roof. The bottom is never visible from an
+        // aircraft and omitting it saves two triangles per building.
+        static constexpr unsigned short volumeFaces[30] = {
+            4, 6, 5, 5, 6, 7,
+            0, 2, 4, 4, 2, 6,
+            1, 5, 3, 3, 5, 7,
+            0, 4, 1, 1, 4, 5,
+            2, 3, 6, 6, 3, 7,
+        };
+        static constexpr unsigned short flatFaces[6] = {
+            0, 2, 1, 1, 2, 3,
+        };
+        if (flatSurface) {
+            for (const unsigned short index : flatFaces) {
+                batch.indices.push_back(
+                    static_cast<unsigned short>(base + index));
+            }
+            ++stats.flatBoundsFallback;
+        } else {
+            for (const unsigned short index : volumeFaces) {
+                batch.indices.push_back(
+                    static_cast<unsigned short>(base + index));
+            }
+        }
+        ++stats.boundsFallback;
+        recordSource();
+        return true;
+    };
+
+    if (appendCollision()) return true;
+
+    void* atomic = *reinterpret_cast<void* const*>(entityBytes + 0x20);
+    if (!atomic)
+        atomic = *reinterpret_cast<void* const*>(modelBytes + 0x40);
+    if (!atomic || *static_cast<const std::uint8_t*>(atomic) != 1u) {
+        ++stats.geometryRejected;
+        return appendBounds();
+    }
+    void* const geometry = *reinterpret_cast<void* const*>(
+        static_cast<const std::uint8_t*>(atomic) + 0x30);
+    if (!geometry) {
+        ++stats.geometryRejected;
+        return appendBounds();
+    }
+    const auto* const geometryBytes =
+        static_cast<const std::uint8_t*>(geometry);
+    const int numTriangles = *reinterpret_cast<const std::int32_t*>(
+        geometryBytes + 0x18);
+    const int numVertices = *reinterpret_cast<const std::int32_t*>(
+        geometryBytes + 0x1c);
+    void* const triangles = *reinterpret_cast<void* const*>(
+        geometryBytes + 0x38);
+    void* const morph = *reinterpret_cast<void* const*>(
+        geometryBytes + 0xa0);
+    void* const morphParent = morph
+        ? *reinterpret_cast<void* const*>(morph) : nullptr;
+    void* const positions = morph
+        ? *reinterpret_cast<void* const*>(
+              static_cast<const std::uint8_t*>(morph) + 0x18)
+        : nullptr;
+    if (numVertices <= 0 || numTriangles <= 0 ||
+        numVertices > kAircraftMegaMeshVerticesPerBatch ||
+        numTriangles > kAircraftMegaMeshIndicesPerBatch / 3 ||
+        !triangles || !positions || morphParent != geometry) {
+        ++stats.geometryRejected;
+        return appendBounds();
+    }
+    const int batchIndex = findBatch(numVertices, numTriangles * 3);
+    if (batchIndex < 0) {
+        stats.overflow = true;
+        return appendBounds();
+    }
+    AircraftMegaMeshBatch& batch = g_aircraftMegaMeshBatches[
+        static_cast<std::size_t>(batchIndex)];
+    const std::size_t vertexStart = batch.vertices.size();
+    const std::size_t indexStart = batch.indices.size();
+    const unsigned short baseVertex = static_cast<unsigned short>(
+        vertexStart);
+    batch.vertices.reserve(std::min(
+        kAircraftMegaMeshVerticesPerBatch,
+        static_cast<int>(batch.vertices.size()) + numVertices + 4096));
+    batch.indices.reserve(std::min(
+        kAircraftMegaMeshIndicesPerBatch,
+        static_cast<int>(batch.indices.size()) + numTriangles * 3 + 12288));
+    for (int i = 0; i < numVertices; ++i) {
+        V3 local{};
+        std::memcpy(&local,
+                    static_cast<const std::uint8_t*>(positions) +
+                        static_cast<std::size_t>(i) * 12u,
+                    sizeof(local));
+        if (!Finite(local)) {
+            batch.vertices.resize(vertexStart);
+            batch.indices.resize(indexStart);
+            ++stats.geometryRejected;
+            return appendBounds();
+        }
+        const V3 world = worldFromLocal(local);
+        if (!Finite(world)) {
+            batch.vertices.resize(vertexStart);
+            batch.indices.resize(indexStart);
+            ++stats.geometryRejected;
+            return appendBounds();
+        }
+        batch.vertices.push_back({world, {}, color, 0.0f, 0.0f});
+    }
+    for (int i = 0; i < numTriangles; ++i) {
+        const auto* const triangle =
+            static_cast<const std::uint8_t*>(triangles) +
+            static_cast<std::size_t>(i) * 8u;
+        const unsigned short a = *reinterpret_cast<const unsigned short*>(
+            triangle + 0);
+        const unsigned short b = *reinterpret_cast<const unsigned short*>(
+            triangle + 2);
+        const unsigned short c = *reinterpret_cast<const unsigned short*>(
+            triangle + 4);
+        if (a >= numVertices || b >= numVertices || c >= numVertices)
+            continue;
+        batch.indices.push_back(
+            static_cast<unsigned short>(baseVertex + a));
+        batch.indices.push_back(
+            static_cast<unsigned short>(baseVertex + b));
+        batch.indices.push_back(
+            static_cast<unsigned short>(baseVertex + c));
+    }
+    if (batch.indices.size() == indexStart) {
+        batch.vertices.resize(vertexStart);
+        ++stats.geometryRejected;
+        return appendBounds();
+    }
+    recordSource();
+    return true;
+}
+
+AircraftMegaMeshStats BuildAndPruneAircraftMegaMesh(bool enabled) {
+    AircraftMegaMeshStats stats = g_aircraftMegaMeshStats;
+    stats.rebuilt = false;
+    stats.prunedLods = 0;
+    if (!enabled || !g.CRenderer_ms_vecCameraPosition ||
+        !g.RwRenderStateSet || !g.RwIm3DTransform ||
+        !g.RwIm3DRenderIndexedPrimitive || !g.RwIm3DEnd) {
+        g_aircraftMegaMeshActive = false;
+        stats.active = false;
+        g_aircraftMegaMeshStats = stats;
+        return stats;
+    }
+    const float* const camera = g.CRenderer_ms_vecCameraPosition;
+    if (!std::isfinite(camera[0]) || !std::isfinite(camera[1]) ||
+        !std::isfinite(camera[2])) {
+        g_aircraftMegaMeshActive = false;
+        stats.active = false;
+        g_aircraftMegaMeshStats = stats;
+        return stats;
+    }
+    const float anchorDx = camera[0] - g_aircraftMegaMeshAnchorX;
+    const float anchorDy = camera[1] - g_aircraftMegaMeshAnchorY;
+    const bool rebuild = !g_aircraftMegaMeshActive ||
+        !g_aircraftMegaMeshAnchorValid ||
+        g_aircraftMegaMeshAgeFrames >= kAircraftMegaMeshRebuildFrames ||
+        std::hypot(anchorDx, anchorDy) >=
+            kAircraftMegaMeshRebuildDistanceM;
+    if (rebuild) {
+        stats = {};
+        stats.rebuilt = true;
+        stats.roots = g_aircraftCoarseLodRootUnionCount;
+        for (auto& batch : g_aircraftMegaMeshBatches) {
+            batch.vertices.clear();
+            batch.indices.clear();
+        }
+        g_aircraftMegaMeshEntities.fill(nullptr);
+        g_aircraftMegaMeshEntityCount = 0;
+        for (int i = 0; i < g_aircraftCoarseLodRootUnionCount; ++i) {
+            AppendAircraftMegaMeshEntity(
+                g_aircraftCoarseLodRootUnion[static_cast<std::size_t>(i)],
+                camera, stats);
+        }
+        for (const auto& batch : g_aircraftMegaMeshBatches) {
+            if (batch.vertices.empty() || batch.indices.empty()) continue;
+            ++stats.batches;
+            stats.vertices += static_cast<int>(batch.vertices.size());
+            stats.triangles += static_cast<int>(batch.indices.size() / 3u);
+        }
+        g_aircraftMegaMeshActive = stats.sources > 0 && stats.batches > 0;
+        g_aircraftMegaMeshAnchorX = camera[0];
+        g_aircraftMegaMeshAnchorY = camera[1];
+        g_aircraftMegaMeshAnchorValid = true;
+        g_aircraftMegaMeshAgeFrames = 0;
+    } else {
+        ++g_aircraftMegaMeshAgeFrames;
+    }
+    stats.active = g_aircraftMegaMeshActive;
+    if (!stats.active || !g.LoadBase ||
+        !g.CRenderer_ms_nNoOfVisibleLods ||
+        reinterpret_cast<std::uintptr_t>(g.CRenderer_ms_nNoOfVisibleLods) !=
+            g.LoadBase + kRetailVisibleLodCountOffset) {
+        g_aircraftMegaMeshStats = stats;
+        return stats;
+    }
+
+    int& visibleLodCount = *g.CRenderer_ms_nNoOfVisibleLods;
+    if (visibleLodCount < 0 ||
+        visibleLodCount > kRetailVisiblePointerCapacity) {
+        g_aircraftMegaMeshActive = false;
+        stats.active = false;
+        ++stats.drawFailures;
+        g_aircraftMegaMeshStats = stats;
+        return stats;
+    }
+    auto** const visibleLods = reinterpret_cast<void**>(
+        g.LoadBase + kRetailVisibleLodPtrsOffset);
+    int writeIndex = 0;
+    for (int readIndex = 0; readIndex < visibleLodCount; ++readIndex) {
+        void* const entity = visibleLods[readIndex];
+        if (!entity) {
+            g_aircraftMegaMeshActive = false;
+            stats.active = false;
+            ++stats.drawFailures;
+            g_aircraftMegaMeshStats = stats;
+            return stats;
+        }
+        if (AircraftMegaMeshContainsEntity(entity)) {
+            ++stats.prunedLods;
+        } else {
+            visibleLods[writeIndex++] = entity;
+        }
+    }
+    for (int i = writeIndex; i < visibleLodCount; ++i)
+        visibleLods[i] = nullptr;
+    visibleLodCount = writeIndex;
+    g_aircraftMegaMeshStats = stats;
+    return stats;
+}
+
+void RenderAircraftMegaMesh() {
+    if (!g_aircraftMegaMeshActive ||
+        !g_aircraftMegaMeshStats.active || !g.RwRenderStateSet ||
+        !g.RwIm3DTransform || !g.RwIm3DRenderIndexedPrimitive ||
+        !g.RwIm3DEnd) {
+        return;
+    }
+    // Draw first and write depth. The regular opaque world follows and wins at
+    // equal/nearer depth, leaving this flat, fogged geometry only in holes.
+    g.RwRenderStateSet(1, nullptr);  // no texture: cheapest silhouette
+    g.RwRenderStateSet(6, reinterpret_cast<void*>(1));
+    g.RwRenderStateSet(8, reinterpret_cast<void*>(1));
+    g.RwRenderStateSet(12, reinterpret_cast<void*>(1));
+    g.RwRenderStateSet(14, reinterpret_cast<void*>(1));
+    g.RwRenderStateSet(20, reinterpret_cast<void*>(1)); // cull none
+    constexpr unsigned int kIm3DFlags = 1u | 8u | 16u;
+    constexpr int kTriangleList = 3;
+    for (const auto& batch : g_aircraftMegaMeshBatches) {
+        if (batch.vertices.empty() || batch.indices.empty()) continue;
+        if (g.RwIm3DTransform(
+                const_cast<AircraftMegaMeshVertex*>(batch.vertices.data()),
+                static_cast<unsigned int>(batch.vertices.size()), nullptr,
+                kIm3DFlags)) {
+            g.RwIm3DRenderIndexedPrimitive(
+                kTriangleList,
+                const_cast<unsigned short*>(batch.indices.data()),
+                static_cast<int>(batch.indices.size()));
+            g.RwIm3DEnd();
+            ++g_aircraftMegaMeshStats.drawCalls;
+        } else {
+            ++g_aircraftMegaMeshStats.drawFailures;
+        }
+    }
+}
+
+// RenderWare's distance fog is a plane perpendicular to the camera forward
+// vector.  No scalar fogPlane compensation can keep that plane fixed when the
+// HMD yaws or pitches.  In stereo gameplay, replace only the visible fade with
+// a cheap world-Z cylinder centred on the shared body/player position.  The
+// depth buffer leaves nearer world geometry untouched; progressively more
+// shells cover geometry as its horizontal distance approaches outerRadius.
+// Both eyes receive byte-identical world geometry, so head rotation changes
+// only the view through the volume, never the volume itself.
+bool RenderAircraftRadialFog(const CamBasis& sharedCamera,
+                             const MobileDistanceFogSnapshot& fog,
+                             float innerRadius, float outerRadius,
+                             float altitudeM) {
+    constexpr int kSegments = 32;
+    constexpr int kLayers = 12;
+    constexpr int kVerticesPerLayer = (kSegments + 1) * 2;
+    constexpr int kIndicesPerLayer = kSegments * 6;
+    constexpr int kVertexCount = kLayers * kVerticesPerLayer;
+    constexpr int kIndexCount = kLayers * kIndicesPerLayer;
+    static_assert(kVertexCount <= 1024,
+                  "aircraft fog exceeds safe mobile Im3D vertex batch");
+    static_assert(kIndexCount <= 3072,
+                  "aircraft fog exceeds safe mobile Im3D index batch");
+
+    if (!fog.valid || !Finite(sharedCamera.pos) ||
+        !std::isfinite(innerRadius) || !std::isfinite(outerRadius) ||
+        !std::isfinite(altitudeM) || innerRadius < 1.0f ||
+        outerRadius <= innerRadius + 10.0f || !g.RwRenderStateSet ||
+        !g.RwIm3DTransform || !g.RwIm3DRenderIndexedPrimitive ||
+        !g.RwIm3DEnd) {
+        return false;
+    }
+
+    const auto channel = [](float value) -> std::uint32_t {
+        // Mobile fog exports are normally 0..1 floats.  Keep a fail-soft path
+        // for builds exposing byte-range floats without changing the colour.
+        const float scaled = value <= 1.5f ? value * 255.0f : value;
+        return static_cast<std::uint32_t>(std::clamp(
+            static_cast<int>(std::lround(scaled)), 0, 255));
+    };
+    const std::uint32_t red = channel(fog.color[0]);
+    const std::uint32_t green = channel(fog.color[1]);
+    const std::uint32_t blue = channel(fog.color[2]);
+
+    // Cover every practical world ray while leaving the sky uncapped.  The
+    // cylinder extends well below the terrain visible from aircraft; its open
+    // top/bottom avoid painting a camera-attached ceiling or floor.
+    const float halfHeight = std::max(
+        2048.0f, outerRadius * 2.0f + std::max(0.0f, altitudeM));
+    const float zLow = sharedCamera.pos.z - halfHeight;
+    const float zHigh = sharedCamera.pos.z + halfHeight;
+    if (!std::isfinite(zLow) || !std::isfinite(zHigh)) return false;
+
+    thread_local std::array<AircraftMegaMeshVertex, kVertexCount> vertices{};
+    thread_local std::array<unsigned short, kIndexCount> indices{};
+    int vertexCount = 0;
+    int indexCount = 0;
+    constexpr float kTwoPi = 6.28318530717958647692f;
+    for (int layer = 0; layer < kLayers; ++layer) {
+        const float t = static_cast<float>(layer + 1) /
+            static_cast<float>(kLayers);
+        const float radius = innerRadius + (outerRadius - innerRadius) * t;
+        // Composited opacity grows linearly by one twelfth at every shell.
+        // alpha=1/(layers-layer) is the exact incremental alpha required after
+        // all nearer shells of the same colour have already been blended.
+        const std::uint32_t alpha = static_cast<std::uint32_t>(std::clamp(
+            static_cast<int>(std::lround(
+                255.0f / static_cast<float>(kLayers - layer))), 1, 255));
+        const std::uint32_t color = (alpha << 24) | (blue << 16) |
+            (green << 8) | red;
+        const int layerBase = vertexCount;
+        for (int segment = 0; segment <= kSegments; ++segment) {
+            const float angle = kTwoPi * static_cast<float>(segment) /
+                static_cast<float>(kSegments);
+            const float x = sharedCamera.pos.x + std::cos(angle) * radius;
+            const float y = sharedCamera.pos.y + std::sin(angle) * radius;
+            vertices[vertexCount++] = {{x, y, zLow}, {}, color, 0.0f, 0.0f};
+            vertices[vertexCount++] = {{x, y, zHigh}, {}, color, 0.0f, 0.0f};
+        }
+        for (int segment = 0; segment < kSegments; ++segment) {
+            const unsigned short a = static_cast<unsigned short>(
+                layerBase + segment * 2);
+            const unsigned short b = static_cast<unsigned short>(a + 1);
+            const unsigned short c = static_cast<unsigned short>(a + 2);
+            const unsigned short d = static_cast<unsigned short>(a + 3);
+            indices[indexCount++] = a;
+            indices[indexCount++] = c;
+            indices[indexCount++] = b;
+            indices[indexCount++] = b;
+            indices[indexCount++] = c;
+            indices[indexCount++] = d;
+        }
+    }
+
+    g.RwRenderStateSet(1, nullptr);  // untextured fog colour
+    g.RwRenderStateSet(6, reinterpret_cast<void*>(1));  // ZTEST on
+    g.RwRenderStateSet(8, reinterpret_cast<void*>(0));  // ZWRITE off
+    g.RwRenderStateSet(12, reinterpret_cast<void*>(1)); // vertex alpha on
+    g.RwRenderStateSet(14, reinterpret_cast<void*>(0)); // no camera-space fog
+    g.RwRenderStateSet(10, reinterpret_cast<void*>(5)); // SRCALPHA
+    g.RwRenderStateSet(11, reinterpret_cast<void*>(6)); // INVSRCALPHA
+    g.RwRenderStateSet(20, reinterpret_cast<void*>(1)); // CULL NONE
+    constexpr unsigned int kIm3DFlags = 1u | 8u | 16u;
+    constexpr int kTriangleList = 3;
+    if (!g.RwIm3DTransform(vertices.data(),
+                           static_cast<unsigned int>(vertexCount), nullptr,
+                           kIm3DFlags)) {
+        return false;
+    }
+    g.RwIm3DRenderIndexedPrimitive(kTriangleList, indices.data(), indexCount);
+    g.RwIm3DEnd();
+    return true;
+}
+
 struct AircraftOpaqueChildExclusiveStats {
     int probes{};
     int candidates{};
@@ -8305,6 +10893,10 @@ struct AircraftOpaqueChildExclusiveStats {
     int childMissing{};
     int duplicates{};
     int invalid{};
+    int finalListProbes{};
+    int finalListCandidates{};
+    int finalListEligible{};
+    int finalListPruned{};
     bool enabled{};
     bool overflow{};
 };
@@ -8450,11 +11042,169 @@ AircraftOpaqueChildExclusiveStats ApplyAircraftOpaqueChildExclusivity(
         ++stats.eligible;
     }
 
-    if (stats.eligible == 0) return stats;
+    // The transaction-time witness above is intentionally strict, but the
+    // flight trace showed that it sees almost none of the final opaque child
+    // list even while 500..650 already-retained authored parents are present.
+    // Resolve the same relationship from the completed retail arrays.  This is
+    // cheaper and stronger than forcing more geometry: beyond the configured
+    // detail cutover, keep the resident coarse parent and remove only an exact,
+    // opaque child duplicate.  A parent with a non-zero rendered-child count is
+    // never used here because ProcessLodRenderLists may still suppress it.
+    std::array<bool, kRetailVisiblePointerCapacity> finalListPrune{};
+    const float* const cameraPosition = g.CRenderer_ms_vecCameraPosition;
+    if (kAircraftFinalListChildPruneEnabled && cameraPosition &&
+        std::isfinite(cameraPosition[0]) &&
+        std::isfinite(cameraPosition[1]) &&
+        std::isfinite(cameraPosition[2]) && g.CModelInfo_ms_modelInfoPtrs) {
+        for (int childIndex = 0; childIndex < visibleEntityCount;
+             ++childIndex) {
+            ++stats.finalListProbes;
+            void* const child = visibleEntities[childIndex];
+            const auto* const childBytes =
+                static_cast<const std::uint8_t*>(child);
+            if ((childBytes[0x5a] & 0x7) != 1 ||
+                childBytes[0x58] != 0u) {
+                continue;
+            }
+            void* const parent =
+                *reinterpret_cast<void* const*>(childBytes + 0x50);
+            if (!parent || !IsAircraftAuthoredLodRoot(parent)) continue;
+            ++stats.finalListCandidates;
+
+            const auto* const parentBytes =
+                static_cast<const std::uint8_t*>(parent);
+            const std::uint8_t authoredChildren = parentBytes[0x58];
+            if (authoredChildren == 0u || parentBytes[0x59] != 0u ||
+                (parentBytes[0x5a] & 0x7) != 1) {
+                continue;
+            }
+
+            int childMatches = 0;
+            for (int i = 0; i < visibleEntityCount; ++i) {
+                if (visibleEntities[i] == child) ++childMatches;
+            }
+            int parentMatches = 0;
+            for (int i = 0; i < visibleLodCount; ++i) {
+                if (visibleLods[i] == parent) ++parentMatches;
+            }
+            if (childMatches != 1 || parentMatches != 1) {
+                if (childMatches > 1 || parentMatches > 1)
+                    ++stats.duplicates;
+                else if (parentMatches == 0)
+                    ++stats.parentMissing;
+                else
+                    ++stats.childMissing;
+                continue;
+            }
+
+            const int childModelId = static_cast<int>(
+                *reinterpret_cast<const std::int16_t*>(childBytes + 0x32));
+            const int parentModelId = static_cast<int>(
+                *reinterpret_cast<const std::int16_t*>(parentBytes + 0x32));
+            if (childModelId < 0 || childModelId >= 20000 ||
+                parentModelId < 0 || parentModelId >= 20000) {
+                ++stats.invalid;
+                continue;
+            }
+            const auto* const childModel = static_cast<const std::uint8_t*>(
+                g.CModelInfo_ms_modelInfoPtrs[childModelId]);
+            const auto* const parentModel = static_cast<const std::uint8_t*>(
+                g.CModelInfo_ms_modelInfoPtrs[parentModelId]);
+            if (!childModel || !parentModel || childModel[0x26] != 255u ||
+                parentModel[0x26] != 255u) {
+                ++stats.fadeSkips;
+                continue;
+            }
+
+            std::uint32_t childFlags = 0u;
+            std::uint32_t parentFlags = 0u;
+            std::memcpy(&childFlags, childBytes + 0x28,
+                        sizeof(childFlags));
+            std::memcpy(&parentFlags, parentBytes + 0x28,
+                        sizeof(parentFlags));
+            constexpr std::uint32_t kVisibleFlag = 1u << 7;
+            constexpr std::uint32_t kDrawLastFlag = 1u << 14;
+            constexpr std::uint32_t kDistanceFadeFlag = 1u << 15;
+            const bool pairOpaque =
+                (childFlags & kVisibleFlag) != 0u &&
+                (parentFlags & kVisibleFlag) != 0u &&
+                (childFlags & (kDrawLastFlag | kDistanceFadeFlag)) == 0u &&
+                (parentFlags & (kDrawLastFlag | kDistanceFadeFlag)) == 0u &&
+                *reinterpret_cast<void* const*>(childBytes + 0x20) != nullptr &&
+                *reinterpret_cast<void* const*>(parentBytes + 0x20) != nullptr;
+            if (!pairOpaque) {
+                ++stats.fadeSkips;
+                continue;
+            }
+
+            V3 childWorld{};
+            V3 parentWorld{};
+            if (!ReadEntityWorldPosition(child, &childWorld) ||
+                !ReadEntityWorldPosition(parent, &parentWorld)) {
+                ++stats.invalid;
+                continue;
+            }
+            const auto groundDistance = [&](const V3& world) {
+                const float dx = world.x - cameraPosition[0];
+                const float dy = world.y - cameraPosition[1];
+                return std::hypot(dx, dy);
+            };
+            const auto conservativeExtent = [](const std::uint8_t* model) {
+                const void* const colModel =
+                    *reinterpret_cast<void* const*>(model + 0x30);
+                if (!colModel)
+                    return std::numeric_limits<float>::quiet_NaN();
+                V3 localCenter{};
+                std::memcpy(&localCenter,
+                            static_cast<const std::uint8_t*>(colModel) + 0x18,
+                            sizeof(localCenter));
+                const float radius = *reinterpret_cast<const float*>(
+                    static_cast<const std::uint8_t*>(colModel) + 0x24);
+                const float centerReach = std::sqrt(std::max(
+                    0.0f, localCenter.x * localCenter.x +
+                              localCenter.y * localCenter.y +
+                              localCenter.z * localCenter.z));
+                if (!std::isfinite(centerReach) || !std::isfinite(radius) ||
+                    radius < 0.0f) {
+                    return std::numeric_limits<float>::quiet_NaN();
+                }
+                return centerReach + radius;
+            };
+            const float childDistanceM = groundDistance(childWorld);
+            const float parentDistanceM = groundDistance(parentWorld);
+            const float childExtentM = conservativeExtent(childModel);
+            const float parentExtentM = conservativeExtent(parentModel);
+            if (!std::isfinite(childDistanceM) ||
+                !std::isfinite(parentDistanceM) ||
+                !std::isfinite(childExtentM) ||
+                !std::isfinite(parentExtentM)) {
+                ++stats.invalid;
+                continue;
+            }
+            // The cutover is a world-space ground disk, not 3D camera range or
+            // the model's often city-block-sized authored bound.  The previous
+            // conservative overlap test classified every measured child as
+            // near (eligible/pruned stayed 0/0), so head pitch still traded
+            // roughly 60..70 detailed children against their already-retained
+            // parents.  Bounds above remain a fail-open structural check; once
+            // both exact pivots are outside the fixed disk, keep the parent
+            // exclusively. Altitude and head orientation cannot change this.
+            if (childDistanceM <= g_aircraftOpaqueChildCutoverM ||
+                parentDistanceM <= g_aircraftOpaqueChildCutoverM) {
+                ++stats.nearSkips;
+                continue;
+            }
+
+            finalListPrune[static_cast<std::size_t>(childIndex)] = true;
+            ++stats.finalListEligible;
+        }
+    }
+
+    if (stats.eligible == 0 && stats.finalListEligible == 0) return stats;
     int writeIndex = 0;
     for (int readIndex = 0; readIndex < visibleEntityCount; ++readIndex) {
         void* const entity = visibleEntities[readIndex];
-        bool remove = false;
+        bool remove = finalListPrune[static_cast<std::size_t>(readIndex)];
         for (int i = 0; i < g_aircraftOpaqueChildCandidateCount; ++i) {
             if (prune[static_cast<std::size_t>(i)] &&
                 g_aircraftOpaqueChildCandidates[
@@ -8465,6 +11215,8 @@ AircraftOpaqueChildExclusiveStats ApplyAircraftOpaqueChildExclusivity(
         }
         if (remove) {
             ++stats.pruned;
+            if (finalListPrune[static_cast<std::size_t>(readIndex)])
+                ++stats.finalListPruned;
         } else {
             visibleEntities[writeIndex++] = entity;
         }
@@ -8713,6 +11465,57 @@ void CompactAircraftPendingLodRequests() {
     g_aircraftLodPendingModelCount = retainedCount;
 }
 
+bool AircraftTexturedRootOutsideCap(const void* entity) {
+    // Unknown identity/position/bounds must preserve retail.  Cull only when a
+    // complete conservative witness proves that even the nearest point of the
+    // authored root's bounding sphere lies beyond the textured-overlay cap.
+    if (!entity || !g.CRenderer_ms_vecCameraPosition ||
+        !g.CModelInfo_ms_modelInfoPtrs) {
+        return false;
+    }
+    V3 world{};
+    if (!ReadEntityWorldPosition(entity, &world)) return false;
+    const auto* const entityBytes =
+        static_cast<const std::uint8_t*>(entity);
+    const int modelId = static_cast<int>(
+        *reinterpret_cast<const std::int16_t*>(entityBytes + 0x32));
+    if (modelId < 0 || modelId >= 20000) return false;
+    const void* const modelInfo = g.CModelInfo_ms_modelInfoPtrs[modelId];
+    if (!modelInfo) return false;
+    const auto* const modelBytes =
+        static_cast<const std::uint8_t*>(modelInfo);
+    const void* const colModel = *reinterpret_cast<void* const*>(
+        modelBytes + 0x30);
+    if (!colModel) return false;
+    V3 localBoundCenter{};
+    std::memcpy(&localBoundCenter,
+                static_cast<const std::uint8_t*>(colModel) + 0x18,
+                sizeof(localBoundCenter));
+    const float boundRadius = *reinterpret_cast<const float*>(
+        static_cast<const std::uint8_t*>(colModel) + 0x24);
+    const float localCenterReach = std::hypot(
+        std::hypot(localBoundCenter.x, localBoundCenter.y),
+        localBoundCenter.z);
+    if (!std::isfinite(localCenterReach) ||
+        !std::isfinite(boundRadius) || boundRadius < 0.0f) {
+        return false;
+    }
+    const float cameraX = g.CRenderer_ms_vecCameraPosition[0];
+    const float cameraY = g.CRenderer_ms_vecCameraPosition[1];
+    if (!std::isfinite(cameraX) || !std::isfinite(cameraY)) return false;
+    const float dx = world.x - cameraX;
+    const float dy = world.y - cameraY;
+    const float distance = std::hypot(dx, dy);
+    // Static map transforms are rigid, so |local centre| bounds every possible
+    // horizontal offset after rotation.  Adding the sphere radius is more
+    // conservative than transforming the centre and cannot clip a large root
+    // whose geometry still intersects the 800 m textured disk.
+    const float conservativeExtent = localCenterReach + boundRadius;
+    return std::isfinite(distance) &&
+        std::isfinite(conservativeExtent) &&
+        distance - conservativeExtent > kAircraftLodSupplementalMaxRadiusM;
+}
+
 int OnSetupBigBuildingVisibility(void* entity, float* distanceOut) {
     if (!g_origSetupBigBuildingVisibility) return 0;
     const auto caller = reinterpret_cast<std::uintptr_t>(
@@ -8728,6 +11531,13 @@ int OnSetupBigBuildingVisibility(void* entity, float* distanceOut) {
     const bool supplementalRootPass =
         g_aircraftSupplementalLodScanActive;
     const bool aircraftAuthoredRoot = IsAircraftAuthoredLodRoot(entity);
+    // Apply the textured-overlay cap before capture, one-child mutation,
+    // retail SetupBig and request queuing.  This covers both the stock wedge
+    // and supplemental disk; the far HLOD mesh remains untouched.
+    if (aircraftAuthoredRoot && AircraftTexturedRootOutsideCap(entity)) {
+        ++g_aircraftCoarseLodRootRangeSkips;
+        return 0;
+    }
     if (aircraftAuthoredRoot) CaptureAircraftRootForUnion(entity);
     bool aircraftStandaloneHorizon = false;
     if (kAircraftStandaloneHorizonEnabled && !aircraftAuthoredRoot) {
@@ -9098,6 +11908,14 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             : nullptr;
     const bool aircraftOrdinaryPersistentRosterCall =
         persistentRosterEntry != nullptr;
+    AircraftOrdinaryRadialCandidateInfo stockMaxRosterInfo{};
+    AircraftOrdinaryStockMaxEntry* const stockMaxRosterEntry =
+        aircraftOrdinarySectorCall && !aircraftOrdinaryPersistentRosterCall
+            ? MatchAircraftOrdinaryStockMaxRoster(
+                  entity, modelInfo, timeInRange, &stockMaxRosterInfo)
+            : nullptr;
+    const bool aircraftOrdinaryStockMaxRosterCall =
+        stockMaxRosterEntry != nullptr;
     AircraftOrdinaryRadialCandidate* const radialReplayCandidate =
         g_aircraftOrdinaryRadialAdmissionActive &&
                 g_visibilityScanPhase == 6
@@ -9138,10 +11956,12 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
          aircraftOrdinaryOuterCall || aircraftOrdinaryRadialReplayCall)) {
         ++g_aircraftOrdinaryHorizon.probes;
         if (aircraftOrdinaryRadialReplayCall ||
-            aircraftOrdinaryPersistentRosterCall) {
+            aircraftOrdinaryPersistentRosterCall ||
+            aircraftOrdinaryStockMaxRosterCall) {
             AircraftOrdinaryRadialCandidateInfo replayInfo{};
             const AircraftOrdinaryRadialCandidateInfo* deterministicInfo =
-                &persistentRosterInfo;
+                aircraftOrdinaryStockMaxRosterCall
+                    ? &stockMaxRosterInfo : &persistentRosterInfo;
             if (aircraftOrdinaryRadialReplayCall) {
                 if (!DescribeAircraftOrdinaryRadialCandidate(
                         entity, modelInfo, timeInRange, &replayInfo) ||
@@ -9243,6 +12063,53 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         }
     }
 
+    AircraftOrdinaryRadialCandidateInfo aircraftOrdinaryFirstPassInfo{};
+    const bool aircraftOrdinaryFirstPassDescribed =
+        aircraftOrdinaryHorizon && aircraftOrdinarySectorCall &&
+        g_aircraftOrdinaryRadialSelectionActive &&
+        !g_aircraftOrdinaryRadialAdmissionActive &&
+        !aircraftOrdinaryPersistentRosterCall &&
+        !aircraftOrdinaryStockMaxRosterCall &&
+        (g_visibilityScanPhase == 1 || g_visibilityScanPhase == 2) &&
+        DescribeAircraftOrdinaryRadialCandidate(
+            entity, modelInfo, timeInRange,
+            &aircraftOrdinaryFirstPassInfo);
+    const bool aircraftOrdinaryStockRangeFirstPassPitchUnion =
+        aircraftOrdinaryFirstPassDescribed &&
+        !aircraftOrdinaryFirstPassInfo.outerBand &&
+        (aircraftOrdinaryFirstPassInfo.promotionEligible ||
+         aircraftOrdinaryFirstPassInfo.fallbackEligible);
+    // Phase 1 may contain stock-wedge objects outside the complete 300 m scan.
+    // Identify only the exact rootless/substantial outer class described by the
+    // radial selector so telemetry can quantify those stock extras. This safe
+    // candidate deliberately leaves them retail-authoritative: bounded phase-6
+    // selection cannot provide same-frame replacement for every member.
+    const bool aircraftOrdinaryManagedOuterObserve =
+        aircraftOrdinaryFirstPassDescribed &&
+        g_visibilityScanPhase == 1 &&
+        aircraftOrdinaryFirstPassInfo.outerBand &&
+        aircraftOrdinaryFirstPassInfo.rootless &&
+        aircraftOrdinaryFirstPassInfo.promotionEligible &&
+        aircraftOrdinaryFirstPassInfo.groundDistanceM <=
+            g_aircraftOrdinaryRadialMaxGroundM;
+    const bool aircraftOrdinaryFirstPassPitchUnion =
+        aircraftOrdinaryStockMaxRosterCall ||
+        aircraftOrdinaryStockRangeFirstPassPitchUnion;
+    // Some otherwise safe resident leaves do not satisfy the radial-shell
+    // promotion/fallback classifier, so the old first-pass union never owned
+    // their sphere test.  They remain stock-range-authoritative, but may use a
+    // second, fixed shallow-up visibility reference for this one transaction.
+    const bool aircraftOrdinaryRaisedPitchUnion =
+        aircraftOrdinaryHorizon && aircraftOrdinarySectorCall &&
+        g_aircraftOrdinaryRadialSelectionActive &&
+        !g_aircraftOrdinaryOuterSessionDisabled &&
+        !g_aircraftOrdinaryRadialAdmissionActive &&
+        !aircraftOrdinaryPersistentRosterCall &&
+        !aircraftOrdinaryStockMaxRosterCall &&
+        !aircraftOrdinaryFirstPassPitchUnion &&
+        (g_visibilityScanPhase == 1 || g_visibilityScanPhase == 2) &&
+        timeInRange;
+
     // Snapshot the exact one-child counter before retail SetupMap.  The
     // post-call capture below accepts only its opaque 0->1 transition; this is
     // independent of diagnostic sampling and remains active through the late
@@ -9278,6 +12145,8 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
     bool setupDrawDistanceOverride = false;
     bool aircraftOrdinaryRangePromotion = false;
     bool aircraftOrdinaryDrawDistanceOverride = false;
+    bool aircraftOrdinaryStockMaxRangePromotion = false;
+    bool aircraftOrdinaryStockMaxDrawDistanceOverride = false;
     const bool aircraftOrdinaryOuterBand = aircraftOrdinaryOuterPolicy;
     bool aircraftOrdinaryOuterFarBand = false;
     VisibilityOwnerSnapshot owner{};
@@ -9536,13 +12405,102 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         }
     }
 
+    // Stock-max entries were selected from the complete prior-frame disk, not
+    // from the order in which this scan happens to traverse entities.  Give
+    // only that exact, revalidated rootless entry enough per-call threshold to
+    // reach the pitch-independent sphere union below.  This is a separate 48
+    // entry allowance: it neither touches the normal range-promotion counter
+    // nor consumes the existing 48/80 replay quota.
+    if (aircraftOrdinaryStockMaxRosterCall) {
+        ++g_aircraftOrdinaryStockMax.tests;
+        const bool setupOverrideBeforeStockMax = setupDrawDistanceOverride;
+        const float drawDistanceBeforeStockMax = drawDistance;
+        auto* const modelBytes = static_cast<std::uint8_t*>(modelInfo);
+        const float rawDrawDistance = *reinterpret_cast<const float*>(
+            modelBytes + 0x38);
+        const float liveCameraLod = g.TheCamera
+            ? *reinterpret_cast<const float*>(
+                  static_cast<const std::uint8_t*>(g.TheCamera) +
+                      kOffLodMultiplier)
+            : 0.0f;
+        const float liveFar = g.CRenderer_ms_fFarClipPlane
+            ? *g.CRenderer_ms_fFarClipPlane : 0.0f;
+        const float boundRadius = stockMaxRosterInfo.boundRadiusM;
+        const bool promotionFingerprint =
+            g_setupMapDrawDistanceBridgeActive.load(
+                std::memory_order_acquire) &&
+            g.TheCamera && g.CRenderer_ms_fFarClipPlane;
+        const bool promotionGeometry = promotionFingerprint &&
+            std::isfinite(distance) && distance >= 0.0f &&
+            std::isfinite(liveCameraLod) && liveCameraLod > 0.01f &&
+            std::isfinite(liveFar) && liveFar > 0.0f &&
+            std::isfinite(rawDrawDistance) && rawDrawDistance > 0.0f &&
+            std::isfinite(boundRadius) && boundRadius > 0.0f &&
+            std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) &&
+            g_aircraftOrdinaryHorizonMaxSlantM > 0.0f &&
+            distance - boundRadius <=
+                g_aircraftOrdinaryHorizonMaxSlantM;
+        if (promotionGeometry) {
+            const float effectiveDrawDistance = setupDrawDistanceOverride
+                ? drawDistance : rawDrawDistance;
+            const float stockThreshold = std::min(
+                effectiveDrawDistance * liveCameraLod,
+                liveFar + boundRadius);
+            if (std::isfinite(stockThreshold) && distance > stockThreshold) {
+                const float promotedThreshold = std::min(
+                    g_aircraftOrdinaryHorizonMaxSlantM,
+                    distance + kAircraftOrdinaryPromotionThresholdEpsilonM);
+                const float promotedDrawDistance = std::max(
+                    effectiveDrawDistance,
+                    promotedThreshold / liveCameraLod);
+                const float promotedFar = std::max(
+                    liveFar, promotedThreshold - boundRadius);
+                if (promotedDrawDistance > effectiveDrawDistance) {
+                    if (!setupDrawDistanceOverride) {
+                        observedDrawDistance = rawDrawDistance;
+                        drawDistance = rawDrawDistance;
+                    }
+                    drawDistance = promotedDrawDistance;
+                    setupDrawDistanceOverride = true;
+                    aircraftOrdinaryStockMaxDrawDistanceOverride = true;
+                }
+                aircraftOrdinaryFarScope.TryApply(
+                    g.CRenderer_ms_fFarClipPlane, promotedFar);
+                const float scopedFar = *g.CRenderer_ms_fFarClipPlane;
+                const float promotedEffectiveThreshold = std::min(
+                    (setupDrawDistanceOverride ? drawDistance
+                                               : rawDrawDistance) *
+                        liveCameraLod,
+                    scopedFar + boundRadius);
+                aircraftOrdinaryStockMaxRangePromotion =
+                    std::isfinite(promotedEffectiveThreshold) &&
+                    promotedEffectiveThreshold > distance;
+                if (aircraftOrdinaryStockMaxRangePromotion) {
+                    ++g_aircraftOrdinaryStockMax.promotions;
+                } else {
+                    ++g_aircraftOrdinaryStockMax.filtered;
+                    aircraftOrdinaryFarScope.Restore();
+                    if (aircraftOrdinaryStockMaxDrawDistanceOverride) {
+                        setupDrawDistanceOverride =
+                            setupOverrideBeforeStockMax;
+                        drawDistance = drawDistanceBeforeStockMax;
+                        aircraftOrdinaryStockMaxDrawDistanceOverride = false;
+                    }
+                }
+            }
+        } else {
+            ++g_aircraftOrdinaryStockMax.filtered;
+        }
+    }
+
     // SetupMap applies its radial threshold before CEntity::GetIsOnScreen.
     // Without this exact per-transaction promotion, a ground object at 700 m
     // AGL can never reach the horizontal visibility union regardless of head
     // pitch. Keep the promotion restricted to already-resident, substantial
     // ordinary statics and the verified register bridge; no shared model value
     // or global far plane survives this one call.
-    if (aircraftOrdinaryHorizon) {
+    if (aircraftOrdinaryHorizon &&
+        !aircraftOrdinaryStockMaxRosterCall) {
         const bool setupOverrideBeforeAircraft =
             setupDrawDistanceOverride;
         const float drawDistanceBeforeAircraft = drawDistance;
@@ -9758,7 +12716,8 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
     }
 
     if (setupDrawDistanceOverride &&
-        !aircraftOrdinaryRangePromotion) {
+        !aircraftOrdinaryRangePromotion &&
+        !aircraftOrdinaryStockMaxRangePromotion) {
         QueueStereoModelDrawDistance(
             reinterpret_cast<float*>(
                 static_cast<std::uint8_t*>(modelInfo) + 0x38),
@@ -9793,6 +12752,22 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         g_aircraftOrdinaryHorizonRangePromoted;
     const bool savedOrdinaryHorizonRangePromotionAccepted =
         g_aircraftOrdinaryHorizonRangePromotionAccepted;
+    const bool savedOrdinaryFirstPassPitchUnionContext =
+        g_aircraftOrdinaryFirstPassPitchUnionContext;
+    const bool savedOrdinaryFirstPassPitchUnionAccepted =
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted;
+    const bool savedOrdinaryRaisedPitchUnionContext =
+        g_aircraftOrdinaryRaisedPitchUnionContext;
+    const bool savedOrdinaryManagedOuterObserveContext =
+        g_aircraftOrdinaryManagedOuterObserveContext;
+    const bool savedOrdinaryRaisedPitchUnionAccepted =
+        g_aircraftOrdinaryRaisedPitchUnionAccepted;
+    const bool savedOrdinaryRaisedPitchUnionAlphaRetained =
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained;
+    const bool savedOrdinaryStockMaxContext =
+        g_aircraftOrdinaryStockMaxContext;
+    const bool savedOrdinaryStockMaxRangePromoted =
+        g_aircraftOrdinaryStockMaxRangePromoted;
     const bool savedOrdinaryPersistentContext =
         g_aircraftOrdinaryPersistentContext;
     if (aircraftOrdinaryHorizon) {
@@ -9805,6 +12780,21 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         g_aircraftOrdinaryHorizonRangePromoted =
             aircraftOrdinaryRangePromotion;
         g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
+        g_aircraftOrdinaryFirstPassPitchUnionContext =
+            aircraftOrdinaryFirstPassPitchUnion &&
+            !aircraftOrdinaryRangePromotion;
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted = false;
+        g_aircraftOrdinaryRaisedPitchUnionContext =
+            aircraftOrdinaryRaisedPitchUnion;
+        g_aircraftOrdinaryManagedOuterObserveContext =
+            aircraftOrdinaryRaisedPitchUnion &&
+            aircraftOrdinaryManagedOuterObserve;
+        g_aircraftOrdinaryRaisedPitchUnionAccepted = false;
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained = false;
+        g_aircraftOrdinaryStockMaxContext =
+            aircraftOrdinaryStockMaxRosterCall;
+        g_aircraftOrdinaryStockMaxRangePromoted =
+            aircraftOrdinaryStockMaxRangePromotion;
         g_aircraftOrdinaryPersistentContext =
             aircraftOrdinaryPersistentRosterCall;
     }
@@ -9829,18 +12819,72 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
     }
     const AircraftLodCapacitySnapshot aircraftOrdinaryCapacityBefore =
         (aircraftOrdinaryRangePromotion ||
+         aircraftOrdinaryFirstPassPitchUnion ||
+         aircraftOrdinaryRaisedPitchUnion ||
          observeAircraftOrdinaryRadialRetention)
             ? ReadAircraftLodCapacity()
             : AircraftLodCapacitySnapshot{};
     std::uint64_t aircraftOrdinaryFlagsBefore = 0u;
-    if (aircraftOrdinaryRangePromotion) {
+    if (aircraftOrdinaryRangePromotion ||
+        aircraftOrdinaryFirstPassPitchUnion ||
+        aircraftOrdinaryRaisedPitchUnion) {
         std::memcpy(&aircraftOrdinaryFlagsBefore,
                     static_cast<const std::uint8_t*>(entity) + 0x28,
                     sizeof(aircraftOrdinaryFlagsBefore));
     }
+    // Complete the aircraft horizontal safety contract before retail's own
+    // draw-range gate.  Visibility already uses an 80 m ground footprint, but
+    // SetupMap still received the 3D camera distance; as AGL crossed a model's
+    // draw distance, every otherwise-resident detail directly below vanished
+    // before the horizontal sphere union could see it.  For already-loaded,
+    // time-valid static sector entities only, use the smaller horizontal
+    // distance inside that same bounded footprint.  No model is requested and
+    // invalid geometry falls through to retail unchanged.
+    float retailDistance = distance;
+    if (aircraftOrdinarySectorCall &&
+        g_aircraftOrdinaryHorizonScanActive &&
+        !g_aircraftOrdinaryRadialAdmissionActive &&
+        (g_visibilityScanPhase == 1 || g_visibilityScanPhase == 2) &&
+        entity && modelInfo && timeInRange && g.TheCamera &&
+        IsKnownCullOwnerThread() && std::isfinite(distance) &&
+        distance >= 0.0f &&
+        *reinterpret_cast<void* const*>(
+            static_cast<const std::uint8_t*>(modelInfo) + 0x40) != nullptr) {
+        const auto* const entityBytes =
+            static_cast<const std::uint8_t*>(entity);
+        const int entityType = entityBytes[0x5a] & 0x7;
+        if (entityType == 1 || entityType == 4 || entityType == 5) {
+            V3 entityWorld{};
+            if (ReadEntityWorldPosition(entity, &entityWorld)) {
+                const float* const cameraPosition =
+                    reinterpret_cast<const float*>(
+                        static_cast<const std::uint8_t*>(g.TheCamera) + kOffPos);
+                const float dx = entityWorld.x - cameraPosition[0];
+                const float dy = entityWorld.y - cameraPosition[1];
+                const float groundDistance = std::hypot(dx, dy);
+                const float safetyRadius = entityType == 4
+                    ? 80.0f : StaticVisibilitySafetyM();
+                if (std::isfinite(groundDistance) &&
+                    std::isfinite(safetyRadius) && safetyRadius > 45.0f &&
+                    groundDistance < safetyRadius &&
+                    groundDistance < retailDistance) {
+                    retailDistance = groundDistance;
+                    static std::atomic<bool> loggedHorizontalRange{false};
+                    if (!loggedHorizontalRange.exchange(
+                            true, std::memory_order_relaxed)) {
+                        LOGI("[lod.air.range] horizontal near-detail active "
+                             "type=%d slant=%.1f ground=%.1f radius=%.1f",
+                             entityType, static_cast<double>(distance),
+                             static_cast<double>(groundDistance),
+                             static_cast<double>(safetyRadius));
+                    }
+                }
+            }
+        }
+    }
     if (useDrawDistanceBridge) {
         result = SavrSetupMapEntityVisibilityWithDrawDistance(
-            entity, modelInfo, distance, timeInRange, drawDistance,
+            entity, modelInfo, retailDistance, timeInRange, drawDistance,
             g.TheCamera, g.CRenderer_ms_fFarClipPlane);
     } else {
         // Fail closed on an unknown retail binary: preserve the previous
@@ -9852,7 +12896,7 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
                 observedDrawDistance, drawDistance);
         }
         result = g_origSetupMapEntityVisibility(
-            entity, modelInfo, distance, timeInRange);
+            entity, modelInfo, retailDistance, timeInRange);
     }
     const bool aircraftOrdinaryScreenTested = screenProbeOwned &&
         g_aircraftOrdinaryRadialScreenProbeEntity == entity &&
@@ -9872,8 +12916,16 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
     if (aircraftOrdinaryHorizon) {
         const bool aircraftOrdinaryRangePromotionAccepted =
             g_aircraftOrdinaryHorizonRangePromotionAccepted;
+        const bool aircraftOrdinaryFirstPassPitchUnionAccepted =
+            g_aircraftOrdinaryFirstPassPitchUnionAccepted;
+        const bool aircraftOrdinaryRaisedPitchUnionAccepted =
+            g_aircraftOrdinaryRaisedPitchUnionAccepted;
+        const bool aircraftOrdinaryRaisedPitchUnionAlphaRetained =
+            g_aircraftOrdinaryRaisedPitchUnionAlphaRetained;
         const AircraftLodCapacitySnapshot aircraftOrdinaryCapacityAfter =
             (aircraftOrdinaryRangePromotion ||
+             aircraftOrdinaryFirstPassPitchUnion ||
+             aircraftOrdinaryRaisedPitchUnion ||
              observeAircraftOrdinaryRadialRetention)
                 ? ReadAircraftLodCapacity()
                 : AircraftLodCapacitySnapshot{};
@@ -9887,10 +12939,15 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         // returns 0, so the old visible/scratch-only capacity witness missed it.
         // The transition is an O(1) synchronous proof and avoids walking all
         // alpha lists up to 80 times per aircraft frame.
-        const bool aircraftOrdinaryRetainedInStereoAlpha =
-            aircraftOrdinaryRangePromotion && result == 0 &&
+        const bool aircraftOrdinaryDistanceFadeTransition = result == 0 &&
             (aircraftOrdinaryFlagsBefore & kDistanceFadeFlag) == 0u &&
             (aircraftOrdinaryFlagsAfter & kDistanceFadeFlag) != 0u;
+        const bool aircraftOrdinaryRetainedInStereoAlpha =
+            aircraftOrdinaryDistanceFadeTransition &&
+            (aircraftOrdinaryRangePromotion ||
+             aircraftOrdinaryFirstPassPitchUnionAccepted ||
+             (aircraftOrdinaryRaisedPitchUnionAccepted &&
+              aircraftOrdinaryRaisedPitchUnionAlphaRetained));
         // A rootless ordinary entity returns VISIBLE and is appended by its
         // caller. A linked child of a multi-child parent can instead be
         // appended to retail's LOD scratch list inside SetupMap and return 0.
@@ -9908,8 +12965,25 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
         const bool aircraftOrdinaryRetainedForStereo =
             aircraftOrdinaryRetainedInSetupMap ||
             aircraftOrdinaryRetainedInStereoAlpha;
-        if (aircraftOrdinaryRetainedInStereoAlpha)
+        if (aircraftOrdinaryRangePromotion &&
+            aircraftOrdinaryRetainedInStereoAlpha)
             ++g_aircraftOrdinaryOuter.radialAlphaRetained;
+        if (aircraftOrdinaryStockMaxRosterCall && stockMaxRosterEntry &&
+            aircraftOrdinaryStockMaxRangePromotion &&
+            aircraftOrdinaryFirstPassPitchUnionAccepted) {
+            // This is only the synchronous promotion/admission witness. Exact
+            // render-list membership is known after both scan phases and is
+            // joined with this bit by SelectAircraftOrdinaryStockMaxRoster.
+            // Keeping those two proofs separate avoids both an O(1) alpha-list
+            // false negative and an already-stock-covered entry living forever.
+            stockMaxRosterEntry->promotionAcceptedThisFrame = true;
+        }
+        if (aircraftOrdinaryFirstPassPitchUnionAccepted && result != 1 &&
+            !aircraftOrdinaryRetainedForStereo) {
+            ++g_aircraftOrdinaryHorizon.firstPassRetentionMisses;
+            if (aircraftOrdinaryStockMaxRosterCall)
+                ++g_aircraftOrdinaryStockMax.retentionMisses;
+        }
         if (aircraftOrdinaryPersistentRosterCall && persistentRosterEntry &&
             (result == 1 || aircraftOrdinaryRetainedForStereo) &&
             !persistentRosterEntry->retainedThisFrame) {
@@ -9921,6 +12995,11 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             // exact entity's occlusion test. Never let an unmatched witness leak
             // into the next SetupMap transaction.
             ++g_aircraftOrdinaryHorizon.occlusionUnconsumed;
+            if (aircraftOrdinaryFirstPassPitchUnionAccepted) {
+                ++g_aircraftOrdinaryHorizon.firstPassOcclusionUnconsumed;
+            }
+            if (aircraftOrdinaryRaisedPitchUnionAccepted)
+                ++g_aircraftStockPitchMax.occlusionUnconsumed;
         }
         g_aircraftOrdinaryHorizonContextEntity =
             savedOrdinaryHorizonContextEntity;
@@ -9934,6 +13013,22 @@ int OnSetupMapEntityVisibility(void* entity, void* modelInfo,
             savedOrdinaryHorizonRangePromoted;
         g_aircraftOrdinaryHorizonRangePromotionAccepted =
             savedOrdinaryHorizonRangePromotionAccepted;
+        g_aircraftOrdinaryFirstPassPitchUnionContext =
+            savedOrdinaryFirstPassPitchUnionContext;
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted =
+            savedOrdinaryFirstPassPitchUnionAccepted;
+        g_aircraftOrdinaryRaisedPitchUnionContext =
+            savedOrdinaryRaisedPitchUnionContext;
+        g_aircraftOrdinaryManagedOuterObserveContext =
+            savedOrdinaryManagedOuterObserveContext;
+        g_aircraftOrdinaryRaisedPitchUnionAccepted =
+            savedOrdinaryRaisedPitchUnionAccepted;
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained =
+            savedOrdinaryRaisedPitchUnionAlphaRetained;
+        g_aircraftOrdinaryStockMaxContext =
+            savedOrdinaryStockMaxContext;
+        g_aircraftOrdinaryStockMaxRangePromoted =
+            savedOrdinaryStockMaxRangePromoted;
         g_aircraftOrdinaryPersistentContext =
             savedOrdinaryPersistentContext;
         if (aircraftOrdinaryRangePromotion &&
@@ -10342,7 +13437,87 @@ void* OnAtomicDefaultRender(void* atomic) {
     return rendered;
 }
 
+constexpr char kStereoDispatchCullProperty[] =
+    "debug.savr.stereo_dispatch_cull";
+
+bool StereoDispatchCullRequested() {
+    // Default ON for the scoped A/B candidate.  A process-start property keeps
+    // a fail-safe escape hatch without adding a hot-path property lookup.
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool enabled = true;
+        if (__system_property_get(kStereoDispatchCullProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) enabled = false;
+            else if (std::strcmp(text, "1") != 0) {
+                LOGW("[stereo.dispatch] ignoring invalid %s=%s "
+                     "(valid 0 or 1)",
+                     kStereoDispatchCullProperty, text);
+            }
+        }
+        LOGI("[stereo.dispatch] requested=%d property=%s",
+             enabled ? 1 : 0, kStereoDispatchCullProperty);
+        return enabled;
+    }();
+    return requested;
+}
+
+bool StereoDispatchVisibleForCurrentEye(void* entity) {
+    const int eye = g_renderingStereoEyeIndex;
+    if (!StereoDispatchCullRequested() || !entity || eye < 0 || eye > 1 ||
+        !g_stereoActive.load(std::memory_order_relaxed) ||
+        !g_origGetIsOnScreen || !g_origIsSphereVisible || !g.TheCamera) {
+        if (eye >= 0 && eye <= 1)
+            ++g_stereoDispatchCullWindow.failOpen;
+        return true;
+    }
+
+    // g_origGetIsOnScreen is the retail trampoline.  Its internal BL reaches
+    // our IsSphereVisible hook, where this exact scope immediately delegates
+    // to retail instead of applying the broad residency/lifecycle widening.
+    const bool saved = g_stereoDispatchExactFrustumContext;
+    g_stereoDispatchExactFrustumContext = true;
+    const bool visible = g_origGetIsOnScreen(entity);
+    g_stereoDispatchExactFrustumContext = saved;
+
+    StereoDispatchCullWindow& window = g_stereoDispatchCullWindow;
+    ++window.probes[eye];
+    if (visible) ++window.visible[eye];
+    else ++window.culled[eye];
+    return visible;
+}
+
+void ReportStereoDispatchCullWindow() {
+    StereoDispatchCullWindow& window = g_stereoDispatchCullWindow;
+    const double nowMs = NowMs();
+    if (window.startMs <= 0.0) {
+        window.startMs = nowMs;
+        return;
+    }
+    const double elapsedMs = nowMs - window.startMs;
+    if (elapsedMs < 1000.0) return;
+
+    const std::uint64_t totalProbes = window.probes[0] + window.probes[1];
+    const std::uint64_t totalCulled = window.culled[0] + window.culled[1];
+    const double culledPercent = totalProbes != 0u
+        ? 100.0 * static_cast<double>(totalCulled) /
+              static_cast<double>(totalProbes)
+        : 0.0;
+    LOGI("[stereo.dispatch] eye0 p/v/c=%llu/%llu/%llu "
+         "eye1=%llu/%llu/%llu culled=%.1f%% fail_open=%llu",
+         static_cast<unsigned long long>(window.probes[0]),
+         static_cast<unsigned long long>(window.visible[0]),
+         static_cast<unsigned long long>(window.culled[0]),
+         static_cast<unsigned long long>(window.probes[1]),
+         static_cast<unsigned long long>(window.visible[1]),
+         static_cast<unsigned long long>(window.culled[1]),
+         culledPercent,
+         static_cast<unsigned long long>(window.failOpen));
+    window = {};
+    window.startMs = nowMs;
+}
+
 void OnRenderOneNonRoad(void* entity) {
+    if (!StereoDispatchVisibleForCurrentEye(entity)) return;
     MarkAircraftOrdinaryRenderDispatch(entity, false);
     const traffic_census::AtomicRenderProbe atomicProbe =
         MarkTrafficVehicleRendered(entity);
@@ -10376,6 +13551,7 @@ void OnRenderOneNonRoad(void* entity) {
 }
 
 void OnRenderAlphaEntity(void* entity, float distance) {
+    if (!StereoDispatchVisibleForCurrentEye(entity)) return;
     MarkAircraftOrdinaryRenderDispatch(entity, true);
     if (VisibilityWitnessEnabled()) TraceEntityRender(entity, "alpha");
     if (!g_origRenderAlphaEntity) return;
@@ -10384,6 +13560,63 @@ void OnRenderAlphaEntity(void* entity, float distance) {
         ? static_cast<const std::uint8_t*>(entity) : nullptr;
     const int modelId = bytes ? static_cast<int>(
         *reinterpret_cast<const std::int16_t*>(bytes + 0x32)) : -1;
+#if defined(SAVR_DEV)
+    // The NEW GAME-only drops are GPU-side while GameThread CPU work remains
+    // flat.  Capture an allocation-free heavy-hitter sketch of the actual
+    // transparent models submitted by eye 0; this distinguishes a stock
+    // mission/fade effect from a generic RenderQueue stall on the next run.
+    if (g_renderingStereoEyeIndex == 0 && modelId >= 0) {
+        struct AlphaModelSample {
+            int model{-1};
+            unsigned int count{};
+            float maxDistance{};
+        };
+        static AlphaModelSample samples[8]{};
+        static unsigned int total = 0;
+        static double windowStartMs = 0.0;
+        const double nowMs = NowMs();
+        if (windowStartMs <= 0.0) windowStartMs = nowMs;
+        if (nowMs - windowStartMs >= 1000.0) {
+            LOGI("[alpha.models] total=%u top="
+                 "%d:%u@%.0f,%d:%u@%.0f,%d:%u@%.0f,%d:%u@%.0f,"
+                 "%d:%u@%.0f,%d:%u@%.0f,%d:%u@%.0f,%d:%u@%.0f",
+                 total,
+                 samples[0].model, samples[0].count, samples[0].maxDistance,
+                 samples[1].model, samples[1].count, samples[1].maxDistance,
+                 samples[2].model, samples[2].count, samples[2].maxDistance,
+                 samples[3].model, samples[3].count, samples[3].maxDistance,
+                 samples[4].model, samples[4].count, samples[4].maxDistance,
+                 samples[5].model, samples[5].count, samples[5].maxDistance,
+                 samples[6].model, samples[6].count, samples[6].maxDistance,
+                 samples[7].model, samples[7].count, samples[7].maxDistance);
+            for (auto& sample : samples) sample = {};
+            total = 0;
+            windowStartMs = nowMs;
+        }
+        ++total;
+        int empty = -1;
+        bool counted = false;
+        for (int i = 0; i < 8; ++i) {
+            if (samples[i].count != 0 && samples[i].model == modelId) {
+                ++samples[i].count;
+                samples[i].maxDistance = std::max(samples[i].maxDistance,
+                                                   distance);
+                counted = true;
+                break;
+            }
+            if (samples[i].count == 0 && empty < 0) empty = i;
+        }
+        if (!counted && empty >= 0) {
+            samples[empty] = {modelId, 1u, distance};
+        } else if (!counted) {
+            // Misra-Gries bounded heavy-hitter reduction: frequent models
+            // survive; one-off debris cannot grow the table or allocate.
+            for (auto& sample : samples) {
+                if (sample.count > 0 && --sample.count == 0) sample = {};
+            }
+        }
+    }
+#endif
     const int entityType = bytes ? (bytes[0x5a] & 0x7) : 0;
     void* const linkedLod = bytes
         ? *reinterpret_cast<void* const*>(bytes + 0x50) : nullptr;
@@ -13914,10 +17147,11 @@ void InstallStereoReuseHooks() {
              ? 1 : 0,
          setupMapDrawBridgeFingerprint ? 1 : 0,
          reinterpret_cast<void*>(g_savrSetupMapEntityVisibilityContinue));
-    LOGI("[lod.air.root] active=%d setup_big=%p root_limit=%d",
+    LOGI("[lod.air.root] active=%d setup_big=%p root_limit=%d radius=%.0fm",
          aircraftRootBigActive ? 1 : 0,
          reinterpret_cast<void*>(g_origSetupBigBuildingVisibility),
-         kAircraftLodSupplementalRootLimit);
+         kAircraftLodSupplementalRootLimit,
+         static_cast<double>(kAircraftLodSupplementalMaxRadiusM));
     if (!g_origSetupMapEntityVisibility) {
         LOGW("[stereo.reuse] LOD handoff telemetry disabled: symbol missing");
     }
@@ -14162,11 +17396,27 @@ void OnCloudsRender() {
     if (!g_renderingStereoEye && g_origCloudsRender) {
         g_origCloudsRender();                              // retain vanilla non-VR/reflection passes
     } else if (g_renderingStereoEye) {
+        if (g_aircraftFogSceneOverridePending) {
+            const bool applied = ApplyMobileDistanceFog(
+                g_aircraftFogSceneSnapshot, g_aircraftFogSceneStart,
+                g_aircraftFogSceneEnd);
+            static bool loggedFogSceneOverride = false;
+            if (!loggedFogSceneOverride) {
+                loggedFogSceneOverride = true;
+                LOGI("[vr.fog.scene] late apply=%d range=%.1f..%.1fm",
+                     applied ? 1 : 0, g_aircraftFogSceneStart,
+                     g_aircraftFogSceneEnd);
+            }
+        }
         static bool logged = false;
         if (!logged) {
             logged = true;
             LOGI("[sky] suppressed flat CClouds sprites in stereo eye passes");
         }
+        // The runtime-supplied mesh covers only lens-hidden pixels. Stamp it
+        // after the flat cloud backdrop and before weapons/roads/world atomics,
+        // while the eye camera and its depth target are current.
+        RenderHiddenAreaDepthMask();
     }
     for (int i = 0; i < g_pendingWeaponCount; ++i)
         if (g_pendingWeapons[i].clump)
@@ -14197,16 +17447,17 @@ bool OnCloudsCalcScreenCoors(const V3& world, V3* screen,
         g_origCloudsCalcScreenCoors(world, screen, screenX, screenY,
                                     checkFar, checkNear);
 }
-// Triple-buffered: [set][eye]. The engine renders on a separate async thread, so
-// the consumer reads a set two frames behind the writer — guaranteed finished on
-// the GPU and not about to be overwritten — which kills the flicker/double-image.
-constexpr int kEyeSets = 3;
+// Four-buffered: [set][eye]. Presentation still trails the writer by one frame;
+// the extra slot extends the reuse deadline by one producer period.
+constexpr int kEyeSets = 4;
 void* g_eyeRaster[kEyeSets][2] = {};
 void* g_pendingEyeRaster[kEyeSets][2] = {};
 void* g_retiredEyeRaster[kEyeSets][2] = {};
 void* g_hudRaster[kEyeSets] = {};
 int   g_recordCounter = 0;                    // monotonic; set = counter % kEyeSets
 int   g_eyeRasterW = 0, g_eyeRasterH = 0;    // eye raster (render) size — scaled down
+std::atomic<int> g_stereoBaseW{0};
+std::atomic<int> g_stereoBaseH{0};
 int   g_mainW = 0, g_mainH = 0;              // the main pass size we sized from
 int   g_pendingEyeRasterW = 0, g_pendingEyeRasterH = 0;
 int   g_pendingMainW = 0, g_pendingMainH = 0;
@@ -14230,6 +17481,10 @@ void* GameplayRwCamera() {
 
 struct AircraftCoarseLodProfile {
     bool active{};
+    bool coarseShellActive{};
+    bool scanAlignmentActive{};
+    bool hlodFillActive{};
+    bool flightRangeOverrideActive{};
     float altitudeM{};
     float groundRadiusM{};
     float scanFarM{};
@@ -14238,25 +17493,131 @@ struct AircraftCoarseLodProfile {
     float lowLodScale{1.0f};
 };
 
+thread_local bool g_aircraftLodAltitudeLatched = false;
+thread_local float g_aircraftLodLastValidAltitudeM = 0.0f;
+thread_local float g_aircraftGroundRetailFarM = 0.0f;
+
 AircraftCoarseLodProfile CurrentAircraftCoarseLodProfile() {
     AircraftCoarseLodProfile profile{};
     if (!g_stereoActive.load(std::memory_order_relaxed) ||
         !g_lodHandoffHookActive.load(std::memory_order_acquire) ||
         driving::GetActiveVehicleType() != driving::VEHICLE_PLANE ||
         (g.CCutsceneMgr_ms_running && *g.CCutsceneMgr_ms_running)) {
+        g_aircraftLodAltitudeLatched = false;
+        g_aircraftLodLastValidAltitudeM = 0.0f;
+        g_aircraftGroundRetailFarM = 0.0f;
         return profile;
     }
-
-    profile.active = true;
+    profile.scanAlignmentActive = true;
+    profile.hlodFillActive = true;
+    bool altitudeValid = false;
     if (g.FindPlayerCoors && g.CWorld_FindGroundZForCoord) {
         const GameSymbols::Vec3 player = g.FindPlayerCoors(-1);
         if (std::isfinite(player.x) && std::isfinite(player.y) &&
             std::isfinite(player.z)) {
-            float groundZ = g.CWorld_FindGroundZForCoord(player.x, player.y);
-            if (!std::isfinite(groundZ)) groundZ = 0.0f;
-            profile.altitudeM = std::max(0.0f, player.z - groundZ);
+            const float groundZ = g.CWorld_FindGroundZForCoord(
+                player.x, player.y);
+            if (std::isfinite(groundZ)) {
+                profile.altitudeM = std::max(0.0f, player.z - groundZ);
+                altitudeValid = std::isfinite(profile.altitudeM);
+            }
         }
     }
+    if (g.CDraw_ms_fFarClipZ && g.LoadBase &&
+        reinterpret_cast<std::uintptr_t>(g.CDraw_ms_fFarClipZ) ==
+            g.LoadBase + kRetailDrawFarClipOffset) {
+        const float retailDrawFar = *g.CDraw_ms_fFarClipZ;
+        if (std::isfinite(retailDrawFar) && retailDrawFar > 0.0f)
+            profile.retailDrawFarM = retailDrawFar;
+    }
+    // Mobile SA shortens its live CDraw far as the camera gains altitude.
+    // Capture the unmodified retail value while the plane is on/near the
+    // ground and use it as a floor for the rest of that flight. This is not a
+    // new flight-distance preset: it merely prevents altitude from reducing
+    // visibility below the exact ground-level stock value.
+    if (altitudeValid && profile.altitudeM <= 20.0f &&
+        profile.retailDrawFarM > 0.0f) {
+        g_aircraftGroundRetailFarM = std::max(
+            g_aircraftGroundRetailFarM,profile.retailDrawFarM);
+    }
+    if (g_aircraftGroundRetailFarM > 0.0f &&
+        profile.retailDrawFarM > 0.0f &&
+        profile.retailDrawFarM + 1.0f < g_aircraftGroundRetailFarM) {
+        profile.flightRangeOverrideActive = true;
+        profile.retailDrawFarM = g_aircraftGroundRetailFarM;
+        static unsigned int groundFarLog=0;
+        if ((++groundFarLog%240u)==1u)
+            LOGI("[lod.air.groundfar] agl=%.1f floor=%.1f",
+                 profile.altitudeM,profile.retailDrawFarM);
+    }
+    // HLOD is a pre-world colour safety layer, so stock detail overwrites it.
+    // Bound it to the live retail fog: no new horizon, projection or streaming
+    // work is introduced, while missing retail tiles do not expose blue limbo.
+    const float retailFillRadius = profile.retailDrawFarM > 0.0f
+        ? profile.retailDrawFarM
+        : kAircraftOrdinaryHorizonMaxGroundDistanceM;
+    profile.groundRadiusM = std::clamp(
+        retailFillRadius, kAircraftOrdinaryHorizonMaxGroundDistanceM,
+        kAircraftLodSupplementalMaxRadiusM);
+    profile.scanFarM = profile.retailDrawFarM;
+    profile.farClipM = profile.retailDrawFarM;
+    profile.lowLodScale = 1.0f;
+
+    // User flight range is deliberately a cheap background-only control. It
+    // exposes more of the existing HLOD underlay and extends projection/fog,
+    // but never widens ScanWorld, streaming, the deterministic detail union,
+    // authored BIG roots or low-LOD scale. RETAIL (0) is the current camera
+    // policy, and invalid retail state always fails open.
+    const int configuredFlightDistanceM =
+        GraphicsDistanceMetresInternal(GFXDIST_FLIGHT_DISTANCE);
+    if (configuredFlightDistanceM > 0 &&
+        std::isfinite(profile.retailDrawFarM) &&
+        profile.retailDrawFarM > 0.0f &&
+        static_cast<float>(configuredFlightDistanceM) >
+            profile.retailDrawFarM) {
+        profile.flightRangeOverrideActive = true;
+        profile.groundRadiusM = std::clamp(
+            static_cast<float>(configuredFlightDistanceM),
+            kAircraftOrdinaryHorizonMaxGroundDistanceM,
+            kAircraftLodMaxGroundRadiusM);
+        profile.farClipM = std::clamp(
+            std::hypot(profile.altitudeM, profile.groundRadiusM) +
+                kAircraftLodFarMarginM,
+            profile.groundRadiusM, kAircraftLodMaxFarClipM);
+    }
+
+    if (!kAircraftExpandedCoarseShellEnabled) {
+        g_aircraftLodAltitudeLatched = false;
+        g_aircraftLodLastValidAltitudeM = altitudeValid
+            ? profile.altitudeM : 0.0f;
+        return profile;
+    }
+
+    if (altitudeValid) {
+        g_aircraftLodLastValidAltitudeM = profile.altitudeM;
+        if (!g_aircraftLodAltitudeLatched &&
+            profile.altitudeM >= kAircraftLodEngageAltitudeM) {
+            g_aircraftLodAltitudeLatched = true;
+            LOGI("[lod.air.gate] active=1 agl=%.1f engage=%.1f disengage=%.1f",
+                 static_cast<double>(profile.altitudeM),
+                 static_cast<double>(kAircraftLodEngageAltitudeM),
+                 static_cast<double>(kAircraftLodDisengageAltitudeM));
+        } else if (g_aircraftLodAltitudeLatched &&
+                   profile.altitudeM < kAircraftLodDisengageAltitudeM) {
+            g_aircraftLodAltitudeLatched = false;
+            LOGI("[lod.air.gate] active=0 agl=%.1f engage=%.1f disengage=%.1f",
+                 static_cast<double>(profile.altitudeM),
+                 static_cast<double>(kAircraftLodEngageAltitudeM),
+                 static_cast<double>(kAircraftLodDisengageAltitudeM));
+        }
+    } else if (g_aircraftLodAltitudeLatched) {
+        // A one-frame terrain-query miss must not tear down an already active
+        // in-air shell.  It cannot engage a shell that never had a valid AGL.
+        profile.altitudeM = g_aircraftLodLastValidAltitudeM;
+    }
+    if (!g_aircraftLodAltitudeLatched) return profile;
+    profile.active = true;
+    profile.coarseShellActive = true;
 
     profile.groundRadiusM = std::clamp(
         kAircraftLodBaseGroundRadiusM +
@@ -14271,13 +17632,6 @@ AircraftCoarseLodProfile CurrentAircraftCoarseLodProfile() {
         std::hypot(profile.altitudeM, profile.groundRadiusM) +
             kAircraftLodFarMarginM,
         kAircraftLodBaseGroundRadiusM, kAircraftLodMaxFarClipM);
-    if (g.CDraw_ms_fFarClipZ && g.LoadBase &&
-        reinterpret_cast<std::uintptr_t>(g.CDraw_ms_fFarClipZ) ==
-            g.LoadBase + kRetailDrawFarClipOffset) {
-        const float retailDrawFar = *g.CDraw_ms_fFarClipZ;
-        if (std::isfinite(retailDrawFar) && retailDrawFar > 0.0f)
-            profile.retailDrawFarM = retailDrawFar;
-    }
     float cameraLod = 1.0f;
     if (g.TheCamera) {
         const float observed = *reinterpret_cast<const float*>(
@@ -14691,16 +18045,14 @@ bool BetterAircraftOrdinaryCandidateGeometry(
 bool BetterAircraftOrdinaryRadialCandidate(
         const AircraftOrdinaryRadialCandidate& candidate,
         const AircraftOrdinaryRadialCandidate& current) {
-    // The spatial cells are a bounded rescue budget. A stock-retained entry
-    // already contributes to the retail union for free, so a genuine safe miss
-    // consumes the current-frame rescue slot first.
-    const bool candidateNeedsReplay =
-        !candidate.retained && candidate.replaySafe;
-    const bool currentNeedsReplay = !current.retained && current.replaySafe;
-    if (candidateNeedsReplay != currentNeedsReplay)
-        return candidateNeedsReplay;
-    if (candidate.wasPersistent != current.wasPersistent)
-        return candidate.wasPersistent;
+    // retained/replaySafe are the two outcomes of the CURRENT camera-frustum
+    // test. Ranking either one first made the chosen object inside a fixed
+    // world-space cell change when the pilot only pitched their head. Preserve
+    // a previously proven cell owner first (also pitch-independent), then rank
+    // only by stable live geometry. This keeps the fade witness aligned while
+    // the aircraft moves and the replay path warms a replacement.
+    if (candidate.wasPersistentProven != current.wasPersistentProven)
+        return candidate.wasPersistentProven;
     return BetterAircraftOrdinaryCandidateGeometry(candidate, current);
 }
 
@@ -14725,34 +18077,121 @@ bool AircraftOrdinaryExactRangeWarmup(
 bool BetterAircraftOrdinaryPersistentCandidate(
         const AircraftOrdinaryRadialCandidate& candidate,
         const AircraftOrdinaryRadialCandidate& current) {
-    // A historically proven member is ranked only by stable live geometry, not
-    // by this frame's traversal result. This makes altitude/ring shrink choose
-    // the same subset regardless of head pitch. A one-frame warmup gets one
-    // chance to become proven, then yields to a new candidate.
+    // The persistent roster must choose the same identity as the current
+    // selector. A prior proven identity is stable; current retained/replaySafe
+    // visibility is deliberately not a ranking key because it follows head
+    // pitch and is validated separately before the exact transaction commits.
     if (candidate.wasPersistentProven != current.wasPersistentProven)
         return candidate.wasPersistentProven;
-    if (candidate.wasPersistentProven)
-        return BetterAircraftOrdinaryCandidateGeometry(candidate, current);
-    const bool candidatePriorTrial = candidate.wasPersistent &&
-        (candidate.retained || candidate.replaySafe);
-    const bool currentPriorTrial = current.wasPersistent &&
-        (current.retained || current.replaySafe);
-    const bool candidateNeedsWarmup = !candidate.wasPersistent &&
-        AircraftOrdinaryExactRangeWarmup(candidate);
-    const bool currentNeedsWarmup = !current.wasPersistent &&
-        AircraftOrdinaryExactRangeWarmup(current);
-    const bool candidateNeedsReplay =
-        !candidate.retained && candidate.replaySafe;
-    const bool currentNeedsReplay = !current.retained && current.replaySafe;
-    const int candidateClass = candidatePriorTrial
-        ? 3 : (candidateNeedsWarmup ? 2 : (candidateNeedsReplay ? 1 : 0));
-    const int currentClass = currentPriorTrial
-        ? 3 : (currentNeedsWarmup ? 2 : (currentNeedsReplay ? 1 : 0));
-    if (candidateClass != currentClass)
-        return candidateClass > currentClass;
-    if (candidate.wasPersistent != current.wasPersistent)
-        return candidate.wasPersistent;
     return BetterAircraftOrdinaryCandidateGeometry(candidate, current);
+}
+
+void SelectAircraftOrdinaryStockMaxRoster() {
+    std::array<int, kAircraftOrdinaryStockMaxLimit> cells{};
+    cells.fill(-1);
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+        g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)]
+            .stockMaxRosterSelected = false;
+    }
+    if (!g.TheCamera) return;
+
+    const float* const cameraPosition = reinterpret_cast<const float*>(
+        static_cast<const std::uint8_t*>(g.TheCamera) + kOffPos);
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kTau = 2.0f * kPi;
+
+    const auto sourceEligible = [](const AircraftOrdinaryRadialCandidate& c) {
+        // Stock-range retained entries are already covered by the horizontal
+        // first-pass union, while screen misses belong to the normal replay
+        // shell. New slots come only from exact pre-sphere radial rejects; an
+        // existing slot survives only after this frame's exact admission
+        // witness, preventing promoted/retained oscillation.
+        return c.stockMaxCarryEligible ||
+            (!c.wasStockMaxRoster &&
+             AircraftOrdinaryExactRangeWarmup(c));
+    };
+    const auto betterCandidate = [](
+            const AircraftOrdinaryRadialCandidate& candidate,
+            const AircraftOrdinaryRadialCandidate& current) {
+        if (candidate.stockMaxCarryEligible !=
+            current.stockMaxCarryEligible) {
+            return candidate.stockMaxCarryEligible;
+        }
+        return BetterAircraftOrdinaryCandidateGeometry(candidate, current);
+    };
+    const auto candidateCell = [&](const AircraftOrdinaryRadialCandidate& c) {
+        if (c.outerBand || !c.rootless || !c.promotionEligible ||
+            c.fallbackEligible || !c.sectorValid || c.rosterSelected ||
+            !sourceEligible(c)) {
+            return -1;
+        }
+        const float dx = c.worldX - cameraPosition[0];
+        const float dy = c.worldY - cameraPosition[1];
+        float worldAngle = std::atan2(dy, dx) + kPi;
+        if (!std::isfinite(worldAngle)) return -1;
+        if (worldAngle >= kTau)
+            worldAngle = std::nextafter(kTau, 0.0f);
+        const int angularBin = std::clamp(
+            static_cast<int>(worldAngle / kTau *
+                kAircraftOrdinaryStockMaxAngularBins),
+            0, kAircraftOrdinaryStockMaxAngularBins - 1);
+        const int radialBin = std::clamp(
+            static_cast<int>(c.groundDistanceM /
+                kAircraftOrdinaryHorizonMaxGroundDistanceM *
+                kAircraftOrdinaryStockMaxRadialBins),
+            0, kAircraftOrdinaryStockMaxRadialBins - 1);
+        return angularBin * kAircraftOrdinaryStockMaxRadialBins + radialBin;
+    };
+
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+        const AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        const int cell = candidateCell(candidate);
+        if (cell < 0) continue;
+        int& selected = cells[static_cast<std::size_t>(cell)];
+        if (selected < 0 || betterCandidate(
+                candidate,
+                g_aircraftOrdinaryRadialCandidates[
+                    static_cast<std::size_t>(selected)])) {
+            selected = i;
+        }
+    }
+
+    int selectedCount = 0;
+    for (int index : cells) {
+        if (index < 0) continue;
+        AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[
+                static_cast<std::size_t>(index)];
+        if (!candidate.stockMaxRosterSelected) {
+            candidate.stockMaxRosterSelected = true;
+            ++selectedCount;
+        }
+    }
+    // Empty city/water cells do not strand the separate allowance.  Backfill
+    // only after all occupied bins have representatives, using stable geometry
+    // over the complete candidate disk rather than list traversal order.
+    while (selectedCount < kAircraftOrdinaryStockMaxLimit) {
+        int bestIndex = -1;
+        for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
+            const AircraftOrdinaryRadialCandidate& candidate =
+                g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+            if (candidate.stockMaxRosterSelected ||
+                candidateCell(candidate) < 0) {
+                continue;
+            }
+            if (bestIndex < 0 || betterCandidate(
+                    candidate,
+                    g_aircraftOrdinaryRadialCandidates[
+                        static_cast<std::size_t>(bestIndex)])) {
+                bestIndex = i;
+            }
+        }
+        if (bestIndex < 0) break;
+        g_aircraftOrdinaryRadialCandidates[
+            static_cast<std::size_t>(bestIndex)].stockMaxRosterSelected = true;
+        ++selectedCount;
+    }
 }
 
 void SelectAircraftOrdinaryPersistentRoster() {
@@ -14809,6 +18248,39 @@ void SelectAircraftOrdinaryPersistentRoster() {
                 candidate.fallbackEligible, candidate.outerBand);
         candidate.wasPersistentProven =
             candidate.wasPersistent && prior->proven;
+        const AircraftOrdinaryStockMaxEntry* const priorStockMax =
+            FindAircraftOrdinaryStockMaxRoster(candidate.entity);
+        candidate.wasStockMaxRoster = priorStockMax &&
+            AircraftOrdinaryStockMaxIdentityMatches(
+                *priorStockMax, candidate.modelId, candidate.worldX,
+                candidate.worldY, candidate.worldZ);
+        candidate.stockMaxCoveredStreak = 0u;
+        if (candidate.wasStockMaxRoster) {
+            const bool exactRetained = candidate.retained;
+            const bool promotedAndRetained =
+                priorStockMax->matchedThisFrame &&
+                priorStockMax->promotionAcceptedThisFrame && exactRetained;
+            const unsigned int coveredStreak = promotedAndRetained
+                ? 0u
+                : std::min<unsigned int>(
+                      static_cast<unsigned int>(
+                          priorStockMax->stockCoveredStreak) + 1u,
+                      std::numeric_limits<std::uint8_t>::max());
+            const bool boundedStockGrace = priorStockMax->proven &&
+                priorStockMax->matchedThisFrame && exactRetained &&
+                coveredStreak <= 1u;
+            candidate.stockMaxCarryEligible =
+                (promotedAndRetained || boundedStockGrace) &&
+                !candidate.outerBand && candidate.rootless &&
+                candidate.promotionEligible &&
+                !candidate.fallbackEligible && candidate.sectorValid;
+            candidate.stockMaxCoveredStreak =
+                candidate.stockMaxCarryEligible
+                    ? static_cast<std::uint8_t>(coveredStreak)
+                    : 0u;
+        } else {
+            candidate.stockMaxCarryEligible = false;
+        }
     }
 
     for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
@@ -14819,12 +18291,12 @@ void SelectAircraftOrdinaryPersistentRoster() {
             AircraftOrdinaryExactRangeWarmup(candidate);
         const bool warmupEligible = exactRangeWarmup &&
             (!candidate.wasPersistent || candidate.wasPersistentProven);
-        const bool retainedEligible =
-            candidate.retained && candidate.wasPersistent;
-        if (!candidate.rootless || !candidate.sectorValid ||
+        const bool sourceEligible = candidate.retained ||
+            candidate.replaySafe || warmupEligible;
+        if (candidate.wasStockMaxRoster ||
+            !candidate.rootless || !candidate.sectorValid ||
             (!candidate.promotionEligible && !candidate.fallbackEligible) ||
-            (!retainedEligible && !candidate.replaySafe &&
-             !warmupEligible)) {
+            !sourceEligible) {
             continue;
         }
         if (!candidate.outerBand) {
@@ -14885,14 +18357,14 @@ void SelectAircraftOrdinaryPersistentRoster() {
                 AircraftOrdinaryExactRangeWarmup(candidate);
             const bool warmupEligible = exactRangeWarmup &&
                 (!candidate.wasPersistent || candidate.wasPersistentProven);
-            const bool retainedEligible =
-                candidate.retained && candidate.wasPersistent;
-            if (candidate.rosterSelected || !candidate.rootless ||
+            const bool sourceEligible = candidate.retained ||
+                candidate.replaySafe || warmupEligible;
+            if (candidate.rosterSelected ||
+                candidate.wasStockMaxRoster || !candidate.rootless ||
                 !candidate.sectorValid || candidate.outerBand != outerBand ||
                 (fallback ? !candidate.fallbackEligible
-                          : !candidate.promotionEligible) ||
-                (!retainedEligible && !candidate.replaySafe &&
-                 !warmupEligible) ||
+                           : !candidate.promotionEligible) ||
+                !sourceEligible ||
                 (ring == 0 && farRing) || (ring == 1 && !farRing)) {
                 continue;
             }
@@ -14977,8 +18449,12 @@ void CommitAircraftOrdinaryPersistentRoster() {
             nextCount < kAircraftOrdinaryHorizonForcedLimitMax; ++i) {
         const AircraftOrdinaryRadialCandidate& candidate =
             g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        // Exact membership is as strong a proof as a completed replay. Requiring
+        // an exact retained candidate to have been persistent already excluded
+        // the head-facing half of a new geometry-first roster on its first
+        // frame, while misses were allowed to persist.
         const bool provenThisFrame = candidate.replayCompleted ||
-            (candidate.wasPersistent && candidate.retained);
+            candidate.retained;
         const bool exactRangeWarmup =
             AircraftOrdinaryExactRangeWarmup(candidate);
         const bool newExactRangeWarmup = !candidate.wasPersistent &&
@@ -15026,6 +18502,48 @@ void CommitAircraftOrdinaryPersistentRoster() {
     g_aircraftOrdinaryOuter.rosterNotVisited = notVisited;
 }
 
+void CommitAircraftOrdinaryStockMaxRoster() {
+    int nextCount = 0;
+    for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount &&
+            nextCount < kAircraftOrdinaryStockMaxLimit; ++i) {
+        const AircraftOrdinaryRadialCandidate& candidate =
+            g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
+        if (!candidate.stockMaxRosterSelected || !candidate.entity ||
+            candidate.outerBand || !candidate.rootless ||
+            !candidate.promotionEligible || candidate.fallbackEligible ||
+            !candidate.sectorValid || candidate.modelId < 0) {
+            continue;
+        }
+        const bool carryProven = candidate.stockMaxCarryEligible;
+        g_aircraftOrdinaryStockMaxRoster[static_cast<std::size_t>(nextCount)] = {
+            candidate.entity,
+            candidate.worldX,
+            candidate.worldY,
+            candidate.worldZ,
+            candidate.modelId,
+            false,
+            false,
+            candidate.stockMaxCoveredStreak,
+            carryProven,
+        };
+        if (carryProven) ++g_aircraftOrdinaryStockMax.rosterKept;
+        ++nextCount;
+    }
+    g_aircraftOrdinaryStockMaxRosterCount = nextCount;
+    if (nextCount > 0 && g.TheCamera) {
+        const float* const cameraPosition = reinterpret_cast<const float*>(
+            static_cast<const std::uint8_t*>(g.TheCamera) + kOffPos);
+        g_aircraftOrdinaryStockMaxAnchorX = cameraPosition[0];
+        g_aircraftOrdinaryStockMaxAnchorY = cameraPosition[1];
+        g_aircraftOrdinaryStockMaxAnchorValid =
+            std::isfinite(cameraPosition[0]) &&
+            std::isfinite(cameraPosition[1]);
+    } else {
+        g_aircraftOrdinaryStockMaxAnchorValid = false;
+    }
+    g_aircraftOrdinaryStockMax.rosterPrepared = nextCount;
+}
+
 bool SelectAircraftOrdinaryRadialCandidates() {
     std::array<int, kAircraftOrdinaryHorizonForcedLimit> innerCells{};
     std::array<int, kAircraftOrdinaryHorizonForcedLimit> innerFallbackCells{};
@@ -15060,8 +18578,11 @@ bool SelectAircraftOrdinaryRadialCandidates() {
         const bool observedRetained = candidate.retained;
         const AircraftOrdinaryRetentionSnapshot retention =
             InspectAircraftOrdinaryRetention(candidate.entity);
-        const bool exact = retention.ExactRenderable();
-        const bool missing = retention.Missing();
+        const bool alphaOverflow =
+            AircraftOrdinaryAlphaOverflowContains(candidate.entity);
+        const bool exact = retention.ExactRenderable() ||
+            (retention.Missing() && alphaOverflow);
+        const bool missing = retention.Missing() && !alphaOverflow;
         if (missing && candidate.phaseObserved &&
             candidate.phaseResult == 0u && candidate.phaseScreenTested) {
             if (candidate.phaseScreenVisible)
@@ -15094,11 +18615,13 @@ bool SelectAircraftOrdinaryRadialCandidates() {
     // They are not rendered here; next frame retail encounters and revalidates
     // each exact pointer before the normal SetupMap transaction is promoted.
     SelectAircraftOrdinaryPersistentRoster();
+    SelectAircraftOrdinaryStockMaxRoster();
 
     for (int i = 0; i < g_aircraftOrdinaryRadialCandidateCount; ++i) {
         AircraftOrdinaryRadialCandidate& candidate =
             g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
-        if (!candidate.rootless || !candidate.promotionEligible ||
+        if (candidate.stockMaxRosterSelected ||
+            !candidate.rootless || !candidate.promotionEligible ||
             !candidate.sectorValid ||
             (!candidate.retained && !candidate.replaySafe)) {
             continue;
@@ -15188,6 +18711,7 @@ bool SelectAircraftOrdinaryRadialCandidates() {
             const AircraftOrdinaryRadialCandidate& candidate =
                 g_aircraftOrdinaryRadialCandidates[static_cast<std::size_t>(i)];
             if (candidate.outerBand || candidate.selected ||
+                candidate.stockMaxRosterSelected ||
                 !candidate.rootless || !candidate.promotionEligible ||
                 !candidate.sectorValid ||
                 (!candidate.retained && !candidate.replaySafe)) {
@@ -15548,6 +19072,8 @@ bool ReplayAircraftOrdinarySector(int sectorX, int sectorY,
         static_cast<std::uint16_t>(currentScanCode ^ 0x8000u);
     const AircraftOrdinaryRenderListTotals totalsBefore =
         ReadAircraftOrdinaryRenderListTotals();
+    const int aircraftAlphaOverflowBefore =
+        g_aircraftOrdinaryAlphaOverflowCount;
     if (!totalsBefore.valid) return false;
 
     // Validate every pending target before touching any scan stamp. Observed
@@ -15655,8 +19181,11 @@ bool ReplayAircraftOrdinarySector(int sectorX, int sectorY,
             candidate->replayVisited = *scanCode == currentScanCode;
             const AircraftOrdinaryRetentionSnapshot retention =
                 InspectAircraftOrdinaryRetention(candidate->entity);
-            const bool exact = retention.ExactRenderable();
-            const bool missing = retention.Missing();
+            const bool alphaOverflow =
+                AircraftOrdinaryAlphaOverflowContains(candidate->entity);
+            const bool exact = retention.ExactRenderable() ||
+                (retention.Missing() && alphaOverflow);
+            const bool missing = retention.Missing() && !alphaOverflow;
             const bool visibleResult = candidate->replayResult == 0u ||
                 candidate->replayResult == 1u;
             candidate->replayCompleted = candidate->replayVisited &&
@@ -15703,10 +19232,14 @@ bool ReplayAircraftOrdinarySector(int sectorX, int sectorY,
         const int allowedGrowth = deltaVisibleEntities +
             deltaAlphaEntities + deltaAlphaUnderwater +
             deltaAlphaReallyDrawLast;
+        const int aircraftAlphaOverflowGrowth =
+            g_aircraftOrdinaryAlphaOverflowCount -
+                aircraftAlphaOverflowBefore;
         sectorOk = sectorOk && nonNegative && deltaVisibleLods == 0 &&
             deltaVisibleSuperLods == 0 && deltaScratch == 0 &&
-            allowedGrowth == completedTargets &&
-            allowedGrowth <= actualTargets;
+            aircraftAlphaOverflowGrowth >= 0 &&
+            allowedGrowth + aircraftAlphaOverflowGrowth == completedTargets &&
+            allowedGrowth + aircraftAlphaOverflowGrowth <= actualTargets;
     }
     return sectorOk &&
         g_aircraftOrdinaryOuter.faults == faultsBefore;
@@ -15729,8 +19262,9 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
         !AircraftOrdinaryRadialSelectionSupported()) {
         return;
     }
-    const float outerRadius = AircraftOrdinaryOuterRadiusForAltitude(
-        profile.altitudeM);
+    const float outerRadius = profile.coarseShellActive
+        ? AircraftOrdinaryOuterRadiusForAltitude(profile.altitudeM)
+        : kAircraftOrdinaryHorizonMaxGroundDistanceM;
     g_aircraftOrdinaryRadialMaxGroundM = outerRadius;
     g_aircraftOrdinaryOuter.radiusM = outerRadius;
     const double wallStart = NowMs();
@@ -15856,7 +19390,15 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
         g_aircraftOrdinaryHorizonContextOuterFarBand ||
         g_aircraftOrdinaryPersistentContext ||
         g_aircraftOrdinaryHorizonRangePromoted ||
-        g_aircraftOrdinaryHorizonRangePromotionAccepted;
+        g_aircraftOrdinaryHorizonRangePromotionAccepted ||
+        g_aircraftOrdinaryFirstPassPitchUnionContext ||
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted ||
+        g_aircraftOrdinaryRaisedPitchUnionContext ||
+        g_aircraftOrdinaryManagedOuterObserveContext ||
+        g_aircraftOrdinaryRaisedPitchUnionAccepted ||
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained ||
+        g_aircraftOrdinaryStockMaxContext ||
+        g_aircraftOrdinaryStockMaxRangePromoted;
     if (structuralReplayFault || incompleteReplay) {
         ++g_aircraftOrdinaryOuter.faults;
     }
@@ -15866,6 +19408,7 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
     }
     if (!g_aircraftOrdinaryOuterSessionDisabled && !structuralReplayFault) {
         CommitAircraftOrdinaryPersistentRoster();
+        CommitAircraftOrdinaryStockMaxRoster();
         // Selection/replay has now resolved exact list membership. Queue the
         // full-fade draw distance for every selected cheap silhouette, including
         // result-0 entities living in an alpha list, and retain pointer-level
@@ -15884,9 +19427,11 @@ void SelectAndReplayAircraftOrdinaryRadialShell(
 
 void ScanAircraftOrdinaryOuterAnnulus(
         const AircraftCoarseLodProfile& profile) {
-    const float outerRadius = AircraftOrdinaryOuterRadiusForAltitude(
-        profile.altitudeM);
-    if (!profile.active || g_aircraftOrdinaryOuterSessionDisabled ||
+    const float outerRadius = profile.coarseShellActive
+        ? AircraftOrdinaryOuterRadiusForAltitude(profile.altitudeM)
+        : kAircraftOrdinaryHorizonMaxGroundDistanceM;
+    if (!profile.active || !profile.coarseShellActive ||
+        g_aircraftOrdinaryOuterSessionDisabled ||
         outerRadius <= kAircraftOrdinaryHorizonMaxGroundDistanceM + 0.01f) {
         return;
     }
@@ -15912,7 +19457,15 @@ void ScanAircraftOrdinaryOuterAnnulus(
         g_aircraftOrdinaryHorizonContextOuterBand ||
         g_aircraftOrdinaryHorizonContextOuterFarBand ||
         g_aircraftOrdinaryHorizonRangePromoted ||
-        g_aircraftOrdinaryHorizonRangePromotionAccepted) {
+        g_aircraftOrdinaryHorizonRangePromotionAccepted ||
+        g_aircraftOrdinaryFirstPassPitchUnionContext ||
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted ||
+        g_aircraftOrdinaryRaisedPitchUnionContext ||
+        g_aircraftOrdinaryManagedOuterObserveContext ||
+        g_aircraftOrdinaryRaisedPitchUnionAccepted ||
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained ||
+        g_aircraftOrdinaryStockMaxContext ||
+        g_aircraftOrdinaryStockMaxRangePromoted) {
         ++g_aircraftOrdinaryOuter.faults;
         g_aircraftOrdinaryOuterSessionDisabled = true;
         return;
@@ -16068,7 +19621,15 @@ void ScanAircraftOrdinaryOuterAnnulus(
         g_aircraftOrdinaryHorizonContextOuterBand ||
         g_aircraftOrdinaryHorizonContextOuterFarBand ||
         g_aircraftOrdinaryHorizonRangePromoted ||
-        g_aircraftOrdinaryHorizonRangePromotionAccepted) {
+        g_aircraftOrdinaryHorizonRangePromotionAccepted ||
+        g_aircraftOrdinaryFirstPassPitchUnionContext ||
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted ||
+        g_aircraftOrdinaryRaisedPitchUnionContext ||
+        g_aircraftOrdinaryManagedOuterObserveContext ||
+        g_aircraftOrdinaryRaisedPitchUnionAccepted ||
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained ||
+        g_aircraftOrdinaryStockMaxContext ||
+        g_aircraftOrdinaryStockMaxRangePromoted) {
         ++g_aircraftOrdinaryOuter.faults;
         g_aircraftOrdinaryOuterSessionDisabled = true;
         g_aircraftOrdinaryHorizonContextEntity = nullptr;
@@ -16078,6 +19639,14 @@ void ScanAircraftOrdinaryOuterAnnulus(
         g_aircraftOrdinaryHorizonContextOuterFarBand = false;
         g_aircraftOrdinaryHorizonRangePromoted = false;
         g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
+        g_aircraftOrdinaryFirstPassPitchUnionContext = false;
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted = false;
+        g_aircraftOrdinaryRaisedPitchUnionContext = false;
+        g_aircraftOrdinaryManagedOuterObserveContext = false;
+        g_aircraftOrdinaryRaisedPitchUnionAccepted = false;
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained = false;
+        g_aircraftOrdinaryStockMaxContext = false;
+        g_aircraftOrdinaryStockMaxRangePromoted = false;
     }
 }
 
@@ -16437,7 +20006,8 @@ int ScaledEyeDimension(int base, int scaleIndex) {
 void TickRetiredRasterSet() {
     if (!RasterSetHasAny(g_retiredEyeRaster)) return;
     if (g_retiredFrames > 0) --g_retiredFrames;
-    if (g_retiredFrames == 0) {
+    if (g_retiredFrames == 0 &&
+        xr::StereoEyeRetiredRingCanBeDestroyed()) {
         DestroyRasterSet(g_retiredEyeRaster);
         LOGI("[stereo] retired eye-texture generation released");
     }
@@ -16480,15 +20050,16 @@ void ActivatePendingRasterSet() {
     g_mainW = g_pendingMainW;
     g_mainH = g_pendingMainH;
     g_currentRenderScaleIndex = g_pendingScaleIndex;
-    g_requestedRenderScaleIndex.store(g_currentRenderScaleIndex,
-                                      std::memory_order_release);
+    g_appliedRenderScaleIndex.store(g_currentRenderScaleIndex,
+                                    std::memory_order_release);
     g_pendingEyeRasterW = g_pendingEyeRasterH = 0;
     g_pendingMainW = g_pendingMainH = 0;
     g_pendingScaleIndex = -1;
     g_pendingWaitFrames = 0;
-    g_recordCounter = 0;
+    // Keep sequence numbers monotonic across raster epochs. Resetting to zero
+    // creates an ABA window where an old seq0 probe can accept the new seq0
+    // before the normal one-frame RenderQueue safety lag has elapsed.
     xr::ResetStereoEyeTextures();
-    SaveGraphicsSettings();
     LOGI("[stereo] render scale active: %d%% (%dx%d per eye)",
          static_cast<int>(kEyeRenderScales[g_currentRenderScaleIndex] * 100.0f + 0.5f),
          g_eyeRasterW, g_eyeRasterH);
@@ -16514,6 +20085,8 @@ bool PrepareEyeRasterSet(int mainWidth, int mainHeight) {
                 g_mainW = mainWidth;
                 g_mainH = mainHeight;
                 g_currentRenderScaleIndex = selected;
+                g_appliedRenderScaleIndex.store(selected,
+                                                std::memory_order_release);
                 g_requestedRenderScaleIndex.store(selected, std::memory_order_release);
                 if (selected != requested) SaveGraphicsSettings();
                 LOGI("[stereo] %d eye-texture sets created %dx%d (main %dx%d, %d%%)",
@@ -16548,6 +20121,10 @@ bool PrepareEyeRasterSet(int mainWidth, int mainHeight) {
             if (!sizeChanged) {
                 g_requestedRenderScaleIndex.store(g_currentRenderScaleIndex,
                                                   std::memory_order_release);
+                SaveGraphicsSettings();
+                LOGW("[stereo] render scale apply failed; restored active %d%%",
+                     static_cast<int>(kEyeRenderScales[g_currentRenderScaleIndex] *
+                                      100.0f + 0.5f));
             }
             return !sizeChanged;
         }
@@ -16565,6 +20142,7 @@ bool PrepareEyeRasterSet(int mainWidth, int mainHeight) {
             CancelPendingRasterSet();
             g_requestedRenderScaleIndex.store(g_currentRenderScaleIndex,
                                               std::memory_order_release);
+            SaveGraphicsSettings();
         }
     }
     return !sizeChanged;
@@ -16602,6 +20180,15 @@ private:
     std::int32_t* values_{};
     std::int32_t savedWidth_{};
     std::int32_t savedHeight_{};
+};
+
+class ScopedStereoEyeWrite {
+public:
+    explicit ScopedStereoEyeWrite(int sequence) : sequence_(sequence) {}
+    ~ScopedStereoEyeWrite() { xr::CancelStereoEyeWrite(sequence_); }
+
+private:
+    int sequence_;
 };
 
 void OnRenderScene(bool underwater) {
@@ -16654,7 +20241,8 @@ void OnRenderScene(bool underwater) {
     float savedRendererFar = -1.0f;
     float savedDrawFar = -1.0f;
     float savedLowLodScale = -1.0f;
-    if (aircraftLod.active) {
+    if (aircraftLod.coarseShellActive ||
+        aircraftLod.flightRangeOverrideActive) {
         if (g.RwCameraSetFarClipPlane) {
             farRwCamera = GameplayRwCamera();
             if (farRwCamera) {
@@ -16687,7 +20275,8 @@ void OnRenderScene(bool underwater) {
                 *g.CDraw_ms_fFarClipZ = aircraftLod.farClipM;
             }
         }
-        if (IsRetailGlobalAt(g.CRenderer_ms_lowLodDistScale, 0x87a1b8u)) {
+        if (aircraftLod.coarseShellActive &&
+            IsRetailGlobalAt(g.CRenderer_ms_lowLodDistScale, 0x87a1b8u)) {
             const float current = *g.CRenderer_ms_lowLodDistScale;
             if (std::isfinite(current) && current > 0.0f &&
                 current < aircraftLod.lowLodScale) {
@@ -16718,20 +20307,63 @@ void OnRenderScene(bool underwater) {
     // Small reflection/water RenderScene calls above deliberately leave the
     // profile open.  This is the first verified large headset pass, so its
     // entry is the exact end of engine_pre for the enclosing JNI callback.
-    // Complete a guarded deferred retail Finish here: all ScanWorld CPU work
-    // has now overlapped the RenderQueue consumer, while no eye raster can be
-    // reused until the original completion semaphore has actually fired.
-    DrainDeferredRenderQueueFinish(DeferredFinishDrainReason::LargeScene);
+    // The guarded retail Finish token belongs to the previous recorded frame.
+    // Four eye rows and the mandatory one-frame XR read lag make this frame's
+    // write row independent from that token.  The accepted path overlaps the
+    // left eye. An explicit A/B may extend that window through the complete
+    // current eye-set, but still consumes the exact retail semaphore before
+    // restoring any stock surface or returning to engine work.  This is
+    // deliberately a same-frame overlap, not a queue of Finish tokens:
+    // retail exposes only one global request flag/semaphore and its fence covers
+    // every transient RenderWare resource in the queue, not just eye textures.
+    // Resource creation/retirement and every fallback retain the old immediate
+    // drain so no lifetime crosses into a later game frame.
+    EnginePreProfile enginePreProfile{};
+    bool renderQueueFinishLifecycleVerified = false;
+    bool enginePreFinishClosed = false;
+    auto closeEnginePreFinish = [&] {
+        if (enginePreFinishClosed) return;
+        DrainDeferredRenderQueueFinish(DeferredFinishDrainReason::LargeScene);
+        enginePreProfile = ConsumeEnginePreProfile();
+        LogGameUpdateHitch(enginePreProfile, g_recordCounter);
+        renderQueueFinishLifecycleVerified =
+            IsVerifiedRenderQueueFinishLifecycle(enginePreProfile);
+        enginePreFinishClosed = true;
+    };
+    const bool overlapFinishWithLeftEye =
+        RenderQueueFinishEyeOverlapRequested();
+    const bool eyeSetBackingRequested = overlapFinishWithLeftEye &&
+        RenderQueueEyeSetBackingRequested();
+    // Never stack the old after-both lifetime experiment on the generation
+    // A/B.  If a ticket cannot be captured, the new path must fall back to the
+    // accepted after-left drain even when a stale device property is still 1.
+    const bool overlapFinishWithEyeSet = overlapFinishWithLeftEye &&
+        !eyeSetBackingRequested && RenderQueueFinishEyeSetOverlapRequested();
+    bool eyeSetBackingCaptured = false;
+    std::uint64_t eyeSetBackingGeneration = 0u;
+    if (!overlapFinishWithLeftEye) closeEnginePreFinish();
     const double stereoHookEntryMonoMs = NowMs();
     const double stereoHookEntryCpuMs = perf::ThreadCpuMs();
-    const EnginePreProfile enginePreProfile = ConsumeEnginePreProfile();
-    const bool renderQueueFinishLifecycleVerified =
-        IsVerifiedRenderQueueFinishLifecycle(enginePreProfile);
 
     // Lazily create, and on a menu scale change safely replace, the complete
-    // triple-buffer ring. Until a new-size ring is ready the normal flat pass is
+    // four-slot ring. Until a new-size ring is ready the normal flat pass is
     // preferable to publishing half-created or mismatched eye textures.
-    if (!PrepareEyeRasterSet(w, h)) {
+    EnsureGraphicsSettingsLoaded();
+    const int requestedRenderScale = ClampRenderScaleIndex(
+        g_requestedRenderScaleIndex.load(std::memory_order_acquire));
+    const bool steadyEyeRasterGeneration = overlapFinishWithLeftEye &&
+        RasterSetReady(g_eyeRaster) &&
+        !RasterSetHasAny(g_pendingEyeRaster) &&
+        !RasterSetHasAny(g_retiredEyeRaster) &&
+        w == g_mainW && h == g_mainH &&
+        requestedRenderScale == g_currentRenderScaleIndex;
+    if (!steadyEyeRasterGeneration) closeEnginePreFinish();
+    const int stereoMainW=g_stereoBaseW.load(std::memory_order_acquire)>0
+        ? g_stereoBaseW.load(std::memory_order_relaxed):w;
+    const int stereoMainH=g_stereoBaseH.load(std::memory_order_acquire)>0
+        ? g_stereoBaseH.load(std::memory_order_relaxed):h;
+    if (!steadyEyeRasterGeneration &&
+        !PrepareEyeRasterSet(stereoMainW,stereoMainH)) {
         g_origRenderScene(underwater);
         return;
     }
@@ -16746,7 +20378,8 @@ void OnRenderScene(bool underwater) {
             depth[s][e] = EyeRasterDepthId(g_eyeRaster[s][e]);
             if (tex[s][e] == 0) {
                 static int waited = 0;
-                if ((++waited % 120) == 1) LOGI("[stereo] eye textures not ready yet");
+             if ((++waited % 120) == 1) LOGI("[stereo] eye textures not ready yet");
+                closeEnginePreFinish();
                 g_origRenderScene(underwater);
                 return;
             }
@@ -16758,9 +20391,19 @@ void OnRenderScene(bool underwater) {
         hud::GetElementSettings(hud::MESSAGES).enabled||
         hud::GetElementSettings(hud::HELP_TEXT).enabled||
         hud::GetElementSettings(hud::TIMERS).enabled;
-    const bool hudNeeded=hud::ShouldRenderClassicHud()||
-        hud::ShouldRenderWristHud()||directTextEnabled||
-        xr::HudCalibrationActive();
+    // Stereo story and gameplay cutscenes own the whole view. The phone HUD
+    // raster also contains mission/help text, so merely disabling CLASSIC is
+    // insufficient: publish no HUD source for these frames. The short scripted
+    // scene debounce above prevents a one-frame HUD flash between camera shots.
+    const bool cutsceneHudSuppressed = FormalCutsceneRunning() ||
+        ScriptedCutsceneRunning();
+    const bool hudNeeded=!cutsceneHudSuppressed&&(
+        hud::ShouldRenderClassicHud()||hud::ShouldRenderWristHud()||
+        directTextEnabled||xr::HudCalibrationActive());
+    // First-time HUD raster creation records RenderQueue resource commands.
+    // Keep that rare lifecycle transition behind the completed retail token;
+    // the steady already-materialised HUD ring remains overlap-safe.
+    if (hudNeeded && !g_hudRaster[0]) closeEnginePreFinish();
     const bool hudReady=hudNeeded&&PrepareHudRasterRing();
     if (hudReady)
         for (int setIndex=0;setIndex<kEyeSets;++setIndex)
@@ -16778,10 +20421,23 @@ void OnRenderScene(bool underwater) {
     // Scope the vehicle change to the two headset world passes. Mirrors, menus,
     // centre-camera work and the next stock SetRenderWareCamera value remain
     // untouched; telemetry below observes the applied value before restoration.
+    const int set = g_recordCounter % kEyeSets;
+    if (xr::ShouldThrottleStereoProducer(g_recordCounter)) {
+        closeEnginePreFinish();
+        return;
+    }
+    // Claim before the first RenderWare command can target this row. If XR is
+    // still copying it, keep the stock flat frame alive and retry the same
+    // sequence next callback; never overwrite a source texture in flight.
+    if (!xr::TryBeginStereoEyeWrite(g_recordCounter)) {
+        closeEnginePreFinish();
+        g_origRenderScene(underwater);
+        return;
+    }
+    ScopedStereoEyeWrite stereoEyeWrite(g_recordCounter);
     ScopedVehicleLod0Override vehicleLod0Override;
     ScopedPedRenderDistanceOverride pedRenderDistanceOverride;
     inHook = true;
-    const int set = g_recordCounter % kEyeSets;
     const std::uintptr_t camU = reinterpret_cast<std::uintptr_t>(g.TheCamera);
     const CamBasis base = ReadCam(camU);
     unsigned char black[4] = {0, 0, 0, 255};
@@ -16792,11 +20448,14 @@ void OnRenderScene(bool underwater) {
     // three, so editing can never create a second copy of the same gun.
     g_pendingWeaponCount = 0;
     const bool scopedFrame = scopeaim::IsActive();
-    auto queueWeapon = [scopedFrame](void* clump, const RwMat& matrix) {
-        // qbuild lets the optic own the complete view. Keep all tracked weapon
+    const bool hideChuteWeapons =
+        g_hideWeaponsForChuteDeploy.load(std::memory_order_relaxed);
+    auto queueWeapon = [scopedFrame,hideChuteWeapons](void* clump,
+                                                      const RwMat& matrix) {
+        // reference Quest build lets the optic own the complete view. Keep all tracked weapon
         // poses current for firing/ownership, but do not bake held, flying or
         // holstered models into a zoomed eye texture.
-        if (scopedFrame || !clump ||
+        if (scopedFrame || hideChuteWeapons || !clump ||
             g_pendingWeaponCount >= kMaxPendingWeapons) return;
         g_pendingWeapons[g_pendingWeaponCount++] = PendingWeaponDraw{clump, matrix};
     };
@@ -16814,32 +20473,22 @@ void OnRenderScene(bool underwater) {
     // for both eyes and the flat mirror; the animation pass rebuilds them
     // next frame. IMMERSIVE driving hides the whole body instead. The chase
     // view sees CJ from outside — his head must stay on there.
-    const bool cutsceneFirstPersonHead = g.CCutsceneMgr_ms_running &&
-        *g.CCutsceneMgr_ms_running && locomotion::CutsceneMode() == 2;
-    // In first-person cutscenes the camera sits on the CUTSCENE CJ actor
-    // (player model index 0 in the actor list), so that is the head to
-    // collapse; in a vehicle it is the ordinary player ped.
+    const bool cutsceneFirstPersonHead = FormalCutsceneRunning() &&
+        g_cutsceneCameraActor != nullptr;
+    // Collapse exactly the staged actor selected by R3, not a guessed CJ model;
+    // camera 0 is the director and therefore hides no actor head.
     void* headHideClump = nullptr;
-    if (cutsceneFirstPersonHead && g.CCutsceneMgr_ms_pCutsceneObjects &&
-        g.CCutsceneMgr_ms_numCutsceneObjs) {
-        const int actorCount =
-            std::clamp(*g.CCutsceneMgr_ms_numCutsceneObjs, 0, 50);
-        auto** actors = reinterpret_cast<std::uint8_t**>(
-            g.CCutsceneMgr_ms_pCutsceneObjects);
-        for (int i = 0; i < actorCount; ++i) {
-            std::uint8_t* candidate = actors[i];
-            if (candidate != nullptr &&
-                *reinterpret_cast<std::uint16_t*>(candidate + 0x32) == 0) {
-                headHideClump = *reinterpret_cast<void**>(candidate + 0x20);
-                break;
-            }
-        }
+    if (cutsceneFirstPersonHead) {
+        headHideClump = *reinterpret_cast<void**>(
+            static_cast<std::uint8_t*>(g_cutsceneCameraActor) + 0x20);
     } else if (playerPed && playerInVehicle &&
                driving::GetMode() != driving::MODE_IMMERSIVE &&
                !driving::ThirdPersonViewActive()) {
         headHideClump = *reinterpret_cast<void**>(
             static_cast<char*>(playerPed) + 0x20);
     }
+    RwMat* hiddenHeadMatrix = nullptr;
+    RwMat savedHiddenHead{};
     if (headHideClump &&
         g.GetAnimHierarchyFromSkinClump && g.RpHAnimIDGetIndex &&
         g.RpHAnimHierarchyGetMatrixArray) {
@@ -16851,6 +20500,8 @@ void OnRenderScene(bool underwater) {
                 g.RpHAnimHierarchyGetMatrixArray(hierarchy));
             if (matrices) {
                 RwMat& head = matrices[headIndex];
+                hiddenHeadMatrix = &head;
+                savedHiddenHead = head;
                 std::memset(head.r, 0, sizeof(head.r));
                 std::memset(head.u, 0, sizeof(head.u));
                 std::memset(head.a, 0, sizeof(head.a));
@@ -16867,11 +20518,10 @@ void OnRenderScene(bool underwater) {
     unsigned int renderedHeldMask = 0;
     xr::TwoHandVisualState twoHandVisualState{};
 
-    // IMMERSIVE driving keeps the physical weapon system live in the seat
-    // (fired with B), so its held/holstered models must keep rendering there
-    // too — without this the drawn sidearm was invisible on the bike.
+    // Immersive driving, or ordinary driving with immersive drive-by, keeps
+    // the physical weapon system live in the seat.
     const bool vehicleImmersiveWeapons = playerInVehicle &&
-        driving::GetMode() == driving::MODE_IMMERSIVE;
+        driving::VehicleWeaponsImmersive();
     if (playerPed && g_vrBaseValid &&
         (!playerInVehicle || vehicleImmersiveWeapons)) {
         // Held models. The exact final matrix is fed back in OpenXR LOCAL space;
@@ -16991,6 +20641,7 @@ void OnRenderScene(bool underwater) {
 
         const std::uint32_t occupied = physicalweapon::OccupiedSlotMask();
         for (int point = 0; point < holster::PointCount(); ++point) {
+            if (!holster::PointVisible(point)) continue;
             const int slot = holster::PointSlot(point);
             if (havePreview && point == previewPoint) continue;
             if (slot <= 0 || slot >= 13) {
@@ -17045,6 +20696,9 @@ void OnRenderScene(bool underwater) {
     // RenderScene; re-arm the count before EACH eye so both eyes draw them.
     const unsigned short savedShadows =
         g.CShadows_ShadowsStoredToBeRendered ? *g.CShadows_ShadowsStoredToBeRendered : 0;
+    g_dynamicShadowDiagnostics.maxStoredShadows = std::max(
+        g_dynamicShadowDiagnostics.maxStoredShadows,
+        static_cast<unsigned int>(savedShadows));
 
     const double profT0 = NowMs();                           // time the whole two-eye render block
     const double profCpuT0 = perf::ThreadCpuMs();
@@ -17071,10 +20725,86 @@ void OnRenderScene(bool underwater) {
     const float savedNearClip = *reinterpret_cast<float*>(scc + 0xA8);
     const float eyeNearClip = g.RwCameraSetNearClipPlane ? 0.05f : savedNearClip;
     const float savedFarClip = *reinterpret_cast<float*>(scc + 0xAC);
+    const float savedFogPlane = *reinterpret_cast<float*>(scc + 0xB0);
+    const float savedViewWindowX=*reinterpret_cast<float*>(scc+0x90);
+    const float savedViewWindowY=*reinterpret_cast<float*>(scc+0x94);
+    const float savedRecipViewWindowX=*reinterpret_cast<float*>(scc+0x98);
+    const float savedRecipViewWindowY=*reinterpret_cast<float*>(scc+0x9c);
     const float requestedFarClip = StaticVisibilityFarFloorM();
-    const float eyeFarClip = g.RwCameraSetFarClipPlane
-        ? std::max(savedFarClip, requestedFarClip)
+    // GameplayRwCamera and SceneRwCamera normally alias, but do not rely on
+    // that undocumented relationship. CopyCameraMatrixToRWCam can restore the
+    // retail projection on `sc`; feed the aircraft slant distance directly to
+    // every eye so camera-space far clipping cannot change ground coverage with
+    // head pitch even if the two pointers diverge in a transient camera state.
+    const float aircraftEyeFarClip =
+        (aircraftLod.coarseShellActive ||
+         aircraftLod.flightRangeOverrideActive)
+        ? aircraftLod.farClipM : 0.0f;
+    float eyeFarClip = g.RwCameraSetFarClipPlane
+        ? std::max({savedFarClip, requestedFarClip, aircraftEyeFarClip})
         : savedFarClip;
+    // A camera-depth fog plane necessarily rotates with HMD yaw and pitch.
+    // During every stereo world pass, neutralise that plane at the far edge and
+    // replace it with one world-Z radial volume.  The previous implementation
+    // enabled that volume only after the aircraft profile became active, so the
+    // ground test (and the first seated/take-off frames) still used rotating
+    // camera-depth fog despite reporting the neutral 398..400 m parameters.
+    // The feature is fail-open: without the exact mobile bridge or Im3D path,
+    // all retail fog state remains untouched.
+    const MobileDistanceFogSnapshot mobileFog = CaptureMobileDistanceFog();
+    const bool aircraftFogFlight=aircraftLod.scanAlignmentActive;
+    if (!aircraftFogFlight) {
+        g_aircraftGroundFogBaseline={};
+    } else if (mobileFog.valid &&
+               (!g_aircraftFogWasActive||aircraftLod.altitudeM<=20.0f)) {
+        g_aircraftGroundFogBaseline=mobileFog;
+        static unsigned int fogGroundLog=0;
+        if ((++fogGroundLog%120u)==1u)
+            LOGI("[lod.air.groundfog] agl=%.1f range=%.1f..%.1f",
+                 aircraftLod.altitudeM,mobileFog.start,mobileFog.end);
+    }
+    g_aircraftFogWasActive=aircraftFogFlight;
+    const bool groundFogActive=aircraftFogFlight&&
+        g_aircraftGroundFogBaseline.valid;
+    const MobileDistanceFogSnapshot fogForEyes=mobileFog.valid
+        ?mobileFog:g_aircraftGroundFogBaseline;
+    if (groundFogActive&&g.RwCameraSetFarClipPlane)
+        eyeFarClip=std::max(eyeFarClip,g_aircraftGroundFogBaseline.end);
+    const float aircraftFogInnerRadius = savedFogPlane;
+    const float aircraftFogFarMargin = std::max(
+        2.0f, std::isfinite(eyeFarClip) ? eyeFarClip * 0.005f : 2.0f);
+    const float aircraftFogOuterRadius = eyeFarClip - aircraftFogFarMargin;
+    const float aircraftFogAltitudeM =
+        std::isfinite(aircraftLod.altitudeM)
+        ? std::max(0.0f, aircraftLod.altitudeM) : 0.0f;
+    // Never centre the radial volume on the per-eye/per-head camera.  The
+    // yaw-only body basis excludes HMD translation; FindPlayerCoors is an even
+    // stronger world-space anchor when it is available.
+    CamBasis aircraftFogAnchor = g_vrBaseValid ? g_vrBase : base;
+    if (g.FindPlayerCoors) {
+        const GameSymbols::Vec3 player = g.FindPlayerCoors(-1);
+        if (std::isfinite(player.x) && std::isfinite(player.y)) {
+            aircraftFogAnchor.pos.x = player.x;
+            aircraftFogAnchor.pos.y = player.y;
+        }
+    }
+    const bool worldFogNeutralActive = !groundFogActive&&mobileFog.valid &&
+        std::isfinite(savedFogPlane) && savedFogPlane > eyeNearClip + 5.0f &&
+        std::isfinite(eyeFarClip) && eyeFarClip > savedFogPlane + 10.0f;
+    // The layered cylinder was world-locked, but its twelve full-screen alpha
+    // shells exposed visible rings and consumed the flight GPU budget.  Keep
+    // the cheap mobile fog plane neutral at the projection edge and do not draw
+    // any replacement geometry.  HLOD remains the distant colour underlay.
+    const bool aircraftRadialFogActive = false;
+    const float eyeFogPlane=groundFogActive
+        ?g_aircraftGroundFogBaseline.start
+        :(worldFogNeutralActive
+            ?(aircraftRadialFogActive
+                ?aircraftFogOuterRadius
+                :eyeFarClip-aircraftFogFarMargin)
+            :savedFogPlane);
+    const float eyeFogEnd=groundFogActive
+        ?g_aircraftGroundFogBaseline.end:eyeFarClip;
     float renderedNear[2] = {eyeNearClip, eyeNearClip};
     float renderedFar[2] = {eyeFarClip, eyeFarClip};
 
@@ -17114,10 +20844,41 @@ void OnRenderScene(bool underwater) {
         // near objects (the weapon) double badly while far scenery only shimmers.
         const float sign = (e == 0) ? 1.0f : -1.0f;          // 0 = left, 1 = right
         eye.pos = base.pos + base.right * (sign * kVrHalfIpd);
+        const float renderFovX = g.CDraw_ms_fFOV &&
+                std::isfinite(*g.CDraw_ms_fFOV) &&
+                *g.CDraw_ms_fFOV > 20.0f && *g.CDraw_ms_fFOV < 160.0f
+            ? *g.CDraw_ms_fFOV : kVrFovX;
+        g_hiddenAreaMaskEye = eye;
+        g_hiddenAreaMaskTanX = std::tan(
+            renderFovX * 0.5f * 3.14159265f / 180.0f);
+        g_hiddenAreaMaskTanY = g_hiddenAreaMaskTanX *
+            static_cast<float>(g_eyeRasterH) /
+            static_cast<float>(std::max(1, g_eyeRasterW));
+        // Stay safely beyond the clip plane while remaining in front of every
+        // world/weapon fragment that could otherwise consume hidden pixels.
+        g_hiddenAreaMaskDepth = std::max(0.075f, eyeNearClip * 1.5f);
         WriteCam(camU, eye);
         if (g.CCamera_CalculateDerivedValues)
             g.CCamera_CalculateDerivedValues(g.TheCamera, false, true);
         g_origCopy(g.TheCamera, false);                      // push eye camera to the RW frame
+
+        // The flat Android surface deliberately uses GTA's 640:448 menu
+        // aspect. CopyCameraMatrixToRWCam also copies that flat camera's
+        // view-window into the shared RwCamera; replace it for each headset eye
+        // so the world cannot inherit the landscape squeeze. These are the
+        // stock RwCamera viewWindow/recipViewWindow fields immediately before
+        // near/far/fog at +A8/+AC/+B0.
+        const float eyeViewX=std::tan(
+            renderFovX*0.5f*3.14159265f/180.0f);
+        const float eyeViewY=eyeViewX*static_cast<float>(g_eyeRasterH)/
+            static_cast<float>(std::max(1,g_eyeRasterW));
+        if (std::isfinite(eyeViewX) && std::isfinite(eyeViewY) &&
+            eyeViewX>0.01f && eyeViewY>0.01f) {
+            *reinterpret_cast<float*>(scc+0x90)=eyeViewX;
+            *reinterpret_cast<float*>(scc+0x94)=eyeViewY;
+            *reinterpret_cast<float*>(scc+0x98)=1.0f/eyeViewX;
+            *reinterpret_cast<float*>(scc+0x9c)=1.0f/eyeViewY;
+        }
 
         // RenderScene slightly biases the camera near plane internally. Reset the
         // same base value for each eye, then capture the actual values that encoded
@@ -17127,16 +20888,44 @@ void OnRenderScene(bool underwater) {
         // actual RenderWare far plane after that copy for every eye; otherwise
         // ScanWorld admits distant props but the eye projection clips them anyway.
         if (g.RwCameraSetFarClipPlane) g.RwCameraSetFarClipPlane(sc, eyeFarClip);
+        // fogPlane is a plain RwCamera field immediately after farPlane.
+        *reinterpret_cast<float*>(scc + 0xB0) = eyeFogPlane;
         *reinterpret_cast<void**>(scc + 0x80) = g_eyeRaster[set][e];
         if (g.RwCameraClear) g.RwCameraClear(sc, black, 1 | 2 | 4);
         g.RwCameraBeginUpdate(sc);
+        // RwCameraBeginUpdate may already have mirrored the raw camera fields,
+        // but the 2.11 mobile backend also owns an emulator-side fog range.
+        // Reassert the compensated start after BeginUpdate so the GLES shaders,
+        // rather than only the RwCamera struct, observe the aircraft ring.
+        const bool mobileFogApplied =
+            (worldFogNeutralActive||groundFogActive) &&
+            ApplyMobileDistanceFog(fogForEyes,eyeFogPlane,eyeFogEnd);
+        if (e == 0 && (worldFogNeutralActive||groundFogActive)) {
+            static unsigned int mobileFogLogCounter = 0;
+            if ((++mobileFogLogCounter % 144u) == 1u) {
+                const auto& fogApi = DistanceFogApi();
+                const float* const live = fogApi.ready
+                    ? fogApi.getParameters() : nullptr;
+                LOGI("[vr.fog.live] world_radial=%d aircraft=%d "
+                     "radial=%.1f..%.1fm "
+                     "camera_neutral=%.1f..%.1fm mobile=%.1f..%.1fm "
+                     "applied=%d agl=%.1fm",
+                     aircraftRadialFogActive ? 1 : 0,
+                     aircraftLod.scanAlignmentActive ? 1 : 0,
+                     aircraftFogInnerRadius, aircraftFogOuterRadius,
+                     eyeFogPlane, eyeFarClip,
+                     live ? live[0] : -1.0f,
+                     live ? live[1] : -1.0f,
+                     mobileFogApplied ? 1 : 0, aircraftFogAltitudeM);
+            }
+        }
         // The sky gradient is drawn by DoRWStuffStartOfFrame_Horizon BEFORE
         // RenderScene into the main surface, so it never reaches our eye raster.
         // Re-issue it here (at this eye's camera; the sky is at infinity so it is
         // parallax-free and correct per eye) — otherwise the sky is black.
         tA = NowMs();
-        if (g.DefinedState)           g.DefinedState();
-        if (g.CClouds_RenderSkyPolys) g.CClouds_RenderSkyPolys();
+        if (g.DefinedState) g.DefinedState();
+        RenderWorldStableSkyPolys(camU, mobileFog);
         graphicsfx::RenderSkyEye(sc, e);
         tSky[e] += NowMs() - tA;
         // Opaque path: the CClouds::Render hook (OnCloudsRender) suppresses the
@@ -17153,13 +20942,50 @@ void OnRenderScene(bool underwater) {
             // CClouds::Render is hooked and uses this scope to omit only its flat
             // moon/star/low-cloud sprites from the two headset eye recordings.
             ScopedStereoEyePass stereoEyePass(e);
+            ScopedStereoDynamicShadowRouting dynamicShadowRouting;
             // DEFAULT vehicle mode keeps the stock seated CJ body and suppresses
             // late VR hands. IMMERSIVE uses the same eye anchor but hides CJ and
             // renders the tracked hands plus the virtual wheel instead.
             const bool hideBody = !playerInVehicle ||
                 driving::GetMode() == driving::MODE_IMMERSIVE;
             ScopedPlayerBodyHide hidePlayerBody(hideBody ? playerPed : nullptr);
+            airhlod::Render(eye.pos.x, eye.pos.y,
+                            aircraftLod.hlodFillActive,
+                            aircraftLod.groundRadiusM);
+            if (aircraftLod.hlodFillActive && g.DefinedState) {
+                // HLOD records only a colour-buffer safety layer. Restore the
+                // exact baseline expected by stock RenderScene afterwards.
+                g.DefinedState();
+            }
+            if (kAircraftMegaMeshEnabled && g_aircraftMegaMeshActive) {
+                RenderAircraftMegaMesh();
+                // The proxy deliberately owns no RenderWare state beyond this
+                // pre-world draw. Re-establish the same baseline RenderScene
+                // expects before normal world atomics are submitted.
+                if (g.DefinedState) g.DefinedState();
+            }
+            g_aircraftFogSceneOverridePending =
+                worldFogNeutralActive||groundFogActive;
+            if (g_aircraftFogSceneOverridePending) {
+                g_aircraftFogSceneSnapshot = fogForEyes;
+                g_aircraftFogSceneStart = eyeFogPlane;
+                g_aircraftFogSceneEnd = eyeFogEnd;
+            }
             g_origRenderScene(underwater);                   // world -> eye raster[set][e]
+            if (e == 0 && (worldFogNeutralActive||groundFogActive)) {
+                static unsigned int postSceneFogLogCounter = 0;
+                if ((++postSceneFogLogCounter % 144u) == 1u) {
+                    const auto& fogApi = DistanceFogApi();
+                    const float* const live = fogApi.ready
+                        ? fogApi.getParameters() : nullptr;
+                    LOGI("[lod.air.fog.postscene] mobile=%.1f..%.1fm "
+                         "expected=%.1f..%.1fm",
+                         live ? live[0] : -1.0f,
+                         live ? live[1] : -1.0f,
+                         eyeFogPlane, eyeFogEnd);
+                }
+            }
+            g_aircraftFogSceneOverridePending = false;
         }
         // NPC held weapons are drawn pre-record (OnCloudsRender /
         // DrawNpcWeaponSnapshots): RpClumpRender calls recorded here, after
@@ -17168,6 +20994,24 @@ void OnRenderScene(bool underwater) {
         // after both eye textures are already closed. Record only the curated
         // VR-safe subset here while this eye's camera and depth are active.
         graphicsfx::RenderEye(sc, e);
+        if (aircraftRadialFogActive) {
+            const bool radialFogDrawn = RenderAircraftRadialFog(
+                aircraftFogAnchor, mobileFog, aircraftFogInnerRadius,
+                aircraftFogOuterRadius, aircraftFogAltitudeM);
+            if (e == 0) {
+                static unsigned int radialFogLogCounter = 0;
+                if ((++radialFogLogCounter % 144u) == 1u) {
+                    LOGI("[lod.air.fog.radial] drawn=%d center=(%.1f,%.1f) "
+                         "range=%.1f..%.1fm layers=12 segments=32",
+                         radialFogDrawn ? 1 : 0,
+                         aircraftFogAnchor.pos.x, aircraftFogAnchor.pos.y,
+                         aircraftFogInnerRadius, aircraftFogOuterRadius);
+                }
+            }
+            // The fog shell deliberately owns no RenderWare state after this
+            // eye; restore the normal baseline before EndUpdate.
+            if (g.DefinedState) g.DefinedState();
+        }
         // Stock C3dMarkers replay removed: its RpAtomicRender draws recorded
         // here were dropped like the NPC weapon clumps, so no marker was ever
         // visible in the headset. The present-pass GL cones (published from
@@ -17185,7 +21029,40 @@ void OnRenderScene(bool underwater) {
         tA = NowMs();
         g.RwCameraEndUpdate(sc);
         tEnd += NowMs() - tA;
+        if (e == 0) {
+            // A successful generation ticket detaches the immutable left-eye
+            // prefix and resets only the stock backing.  The right eye can then
+            // record immediately while RenderThread consumes that ticket first.
+            // Any guard failure keeps the accepted after-left Finish boundary.
+            if (eyeSetBackingRequested) {
+                eyeSetBackingCaptured = CaptureRenderQueueEyeSetBacking(
+                    static_cast<std::uint64_t>(g_recordCounter),
+                    static_cast<unsigned int>(set),
+                    &eyeSetBackingGeneration);
+            }
+            if (!overlapFinishWithEyeSet && !eyeSetBackingCaptured)
+                closeEnginePreFinish();
         }
+        }
+
+        // In the explicit A/B both eyes target the exclusively claimed current
+        // ring row while the pending Finish belongs to the previous row. Close
+        // it here at the latest: HUD/centre-camera work below can touch stock
+        // surfaces and must never inherit the widened lifetime.
+        // The head collapse is a render-only mask. Leaving the HAnim matrix
+        // zeroed made the next camera update alternate between the posed look
+        // direction and its root fallback. Restore before any later centre/HUD
+        // work and, crucially, before the next frame reads the actor head.
+        if (hiddenHeadMatrix) {
+            *hiddenHeadMatrix = savedHiddenHead;
+            hiddenHeadMatrix = nullptr;
+        }
+        closeEnginePreFinish();
+        // The retail Finish token can legally belong to a later stock suffix.
+        // Do not infer detached-prefix completion from that process-global
+        // semaphore: wait for the exact copied generation before HUD/resource
+        // reuse.  A zero generation means capture was empty or rejected.
+        WaitRenderQueueEyeSetBackingTicket(eyeSetBackingGeneration);
 
         // The model table is shared process-wide. Restore immediately after
         // the right world eye, before HUD, centre camera or later reflection
@@ -17223,6 +21100,13 @@ void OnRenderScene(bool underwater) {
     if (g.CTimer_ms_fTimeStepNonClipped) *g.CTimer_ms_fTimeStepNonClipped = savedNonClip;
     if (g.RwCameraSetNearClipPlane) g.RwCameraSetNearClipPlane(sc, savedNearClip);   // restore near clip
     if (g.RwCameraSetFarClipPlane) g.RwCameraSetFarClipPlane(sc, savedFarClip);       // restore far clip
+    *reinterpret_cast<float*>(scc + 0xB0) = savedFogPlane;                            // restore fog start
+    *reinterpret_cast<float*>(scc+0x90)=savedViewWindowX;
+    *reinterpret_cast<float*>(scc+0x94)=savedViewWindowY;
+    *reinterpret_cast<float*>(scc+0x98)=savedRecipViewWindowX;
+    *reinterpret_cast<float*>(scc+0x9c)=savedRecipViewWindowY;
+    if (mobileFog.valid)
+        ApplyMobileDistanceFog(mobileFog, mobileFog.start, mobileFog.end);
 
     // Restore the surface target and the centre camera for the HUD / game logic.
     *reinterpret_cast<void**>(scc + 0x80) = origColor;
@@ -17408,7 +21292,8 @@ void OnRenderScene(bool underwater) {
     if ((g_recordCounter % 72) == 0) {
         LOGI("[lod.alpha-batch] candidates=%d unique/applied=%d/%d "
              "conflict/overflow/restore_fault=%d/%d/%d "
-             "air_shell=test/rescue/covered/fault=%d/%d/%d/%d",
+             "air_shell=test/rescue/covered/fault=%d/%d/%d/%d "
+             "air_alpha_overflow=current/draw=%d/%llu",
              g_lodHandoffCounters.modelDrawBatchCandidates,
              g_lodHandoffCounters.modelDrawBatchUnique,
              g_lodHandoffCounters.modelDrawBatchApplied,
@@ -17418,7 +21303,11 @@ void OnRenderScene(bool underwater) {
              g_lodHandoffCounters.aircraftAlphaShellTests,
              g_lodHandoffCounters.aircraftAlphaShellRescues,
              g_lodHandoffCounters.aircraftAlphaShellCovered,
-             g_lodHandoffCounters.aircraftAlphaShellApplyFaults);
+             g_lodHandoffCounters.aircraftAlphaShellApplyFaults,
+             g_aircraftOrdinaryAlphaOverflowCount,
+             static_cast<unsigned long long>(
+                 g_aircraftOrdinaryAlphaOverflowDraws.load(
+                     std::memory_order_relaxed)));
     }
     if ((g_recordCounter % 72) == 0 &&
         g_aircraftOrdinaryRenderWitness.active) {
@@ -17468,6 +21357,7 @@ void OnRenderScene(bool underwater) {
                  g_neonOverflowDrops.load(std::memory_order_relaxed)),
              g_neonOverflowHooksActive.load(std::memory_order_relaxed) ? 1 : 0);
     }
+    LogRenderQueueUnsizedCallerHitch(enginePreProfile, g_recordCounter);
     perf::StereoFrameSample stereoSample{
         .sequence = g_recordCounter,
         .hookEntryMonoMs = stereoHookEntryMonoMs,
@@ -18033,6 +21923,7 @@ void OnRenderScene(bool underwater) {
     // GetIsOnScreen builds the frame's render list before this RenderScene hook,
     // so reset only after publishing. Resetting at stereo entry would erase the
     // attribution we came here to measure.
+    ReportStereoDispatchCullWindow();
     g_profCull = {};
     g_lodHandoffCounters = {};
     g_vehicleLodCounters = {};
@@ -18250,6 +22141,7 @@ bool OnGetIsOnScreen(void* entity) {
             : V3{gameForward[0], gameForward[1], gameForward[2]};
         const float dx = e[0] - c[0], dy = e[1] - c[1], dz = e[2] - c[2];
         const float distSq = dx * dx + dy * dy + dz * dz;
+        const float groundDistSq = dx * dx + dy * dy;
         const float fdot = dx * forward.x + dy * forward.y + dz * forward.z;
 
         // Runtime entity-render evidence found the same car repeatedly
@@ -18307,7 +22199,36 @@ bool OnGetIsOnScreen(void* entity) {
         constexpr float kPedOmnidirectionalSafetyM=25.0f;
         const bool nearPedSafety=entityType==3&&
             distSq<kPedOmnidirectionalSafetyM*kPedOmnidirectionalSafetyM;
-        const bool nearFront=nearPedSafety||
+        // CObject is the remaining large aircraft-only hole in the render
+        // union.  Its generic safety used the camera-to-object 3D distance, so
+        // at 80 m AGL even an object directly below the aircraft crossed the
+        // 80 m boundary and fell back to the current HMD frustum.  Keep the
+        // identical 80 m budget, but interpret it as a ground footprint while
+        // the aircraft ScanWorld transaction owns this render-only call.  This
+        // does not widen peds, vehicles, ground play or streaming, and the
+        // existing aircraft slant ceiling remains authoritative at altitude.
+        const bool aircraftObjectRadialSafety = entityType == 4 &&
+            g_aircraftOrdinaryHorizonScanActive &&
+            IsKnownCullOwnerThread() &&
+            std::isfinite(groundDistSq) &&
+            groundDistSq < safetyRadiusM * safetyRadiusM &&
+            std::isfinite(distSq) &&
+            std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) &&
+            g_aircraftOrdinaryHorizonMaxSlantM > 0.0f &&
+            distSq <= g_aircraftOrdinaryHorizonMaxSlantM *
+                g_aircraftOrdinaryHorizonMaxSlantM;
+        if (aircraftObjectRadialSafety) {
+            static std::atomic<bool> loggedAircraftObjectRadial{false};
+            if (!loggedAircraftObjectRadial.exchange(
+                    true, std::memory_order_relaxed)) {
+                LOGI("[cull.dynamic.air] horizontal CObject safety active "
+                     "radius=%.1f ground=%.1f slant=%.1f",
+                     static_cast<double>(safetyRadiusM),
+                     static_cast<double>(std::sqrt(groundDistSq)),
+                     static_cast<double>(distance));
+            }
+        }
+        const bool nearFront=aircraftObjectRadialSafety||nearPedSafety||
             (distSq<safetyRadiusM*safetyRadiusM&&
              (headsetCone||legacyCone));
         if (VisibilityWitnessEnabled()) {
@@ -18370,15 +22291,33 @@ bool OnIsEntityOccluded(void* entity) {
         // Consume the witness before calling retail so a nested/foreign test can
         // never inherit it. Stock remains authoritative when it says visible;
         // only its occluded result is bypassed for the exact sphere acceptance
-        // that the level-gaze horizontal union just supplied.
+        // that the fixed level-gaze 3D union just supplied.
+        const bool firstPassPitchUnion =
+            g_aircraftOrdinaryFirstPassPitchUnionAccepted;
+        const bool raisedPitchUnion =
+            g_aircraftOrdinaryRaisedPitchUnionAccepted;
         g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
         ++g_aircraftOrdinaryHorizon.occlusionTests;
+        if (firstPassPitchUnion)
+            ++g_aircraftOrdinaryHorizon.firstPassOcclusionTests;
+        if (raisedPitchUnion)
+            ++g_aircraftStockPitchMax.occlusionTests;
         const bool stockOccluded = g_origIsEntityOccluded
             ? g_origIsEntityOccluded(entity) : false;
-        if (stockOccluded)
+        if (stockOccluded) {
             ++g_aircraftOrdinaryHorizon.occlusionBypasses;
-        else
+            if (firstPassPitchUnion)
+                ++g_aircraftOrdinaryHorizon.firstPassOcclusionBypasses;
+            if (raisedPitchUnion)
+                ++g_aircraftStockPitchMax.occlusionBypasses;
+        } else {
             ++g_aircraftOrdinaryHorizon.occlusionStockVisible;
+            if (firstPassPitchUnion) {
+                ++g_aircraftOrdinaryHorizon.firstPassOcclusionStockVisible;
+            }
+            if (raisedPitchUnion)
+                ++g_aircraftStockPitchMax.occlusionStockVisible;
+        }
         return false;
     }
     if (g_stereoActive.load(std::memory_order_relaxed) && entity &&
@@ -18417,7 +22356,42 @@ bool OnIsEntityOccluded(void* entity) {
                 }
             };
 
-            if (TargetedRadialVisibilityEnabled()) {
+            // In aircraft the configured vegetation/roadside safety distance
+            // is a ground footprint, not a 3D bubble around the elevated
+            // camera.  Keep this exact audited category omnidirectional while
+            // the aircraft render-list scan owns the transaction; otherwise a
+            // tree directly below the plane falls outside the HMD cone and
+            // retail occlusion replaces it with the grey authored LOD merely
+            // because the pilot tilts their head.
+            const bool aircraftRadialSafety = [&] {
+                if (!g_aircraftOrdinaryHorizonScanActive || !g.TheCamera)
+                    return false;
+                V3 world{};
+                if (!ReadEntityWorldPosition(entity, &world)) return false;
+                const auto* camera =
+                    static_cast<const std::uint8_t*>(g.TheCamera);
+                const float* position = reinterpret_cast<const float*>(
+                    camera + kOffPos);
+                const float dx = world.x - position[0];
+                const float dy = world.y - position[1];
+                const float dz = world.z - position[2];
+                const float groundDistSq = dx * dx + dy * dy;
+                const float slantDistSq = groundDistSq + dz * dz;
+                float safetyM = 0.0f;
+                if (IsLargeVegetationModel(modelId))
+                    safetyM = std::max(safetyM, LargeVegetationSafetyM());
+                if (IsRoadsideVisibilityModel(modelId))
+                    safetyM = std::max(safetyM, RoadsideVisibilitySafetyM());
+                return std::isfinite(groundDistSq) &&
+                    std::isfinite(slantDistSq) &&
+                    std::isfinite(safetyM) && safetyM > 0.0f &&
+                    groundDistSq < safetyM * safetyM &&
+                    std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) &&
+                    g_aircraftOrdinaryHorizonMaxSlantM > 0.0f &&
+                    slantDistSq <= g_aircraftOrdinaryHorizonMaxSlantM *
+                        g_aircraftOrdinaryHorizonMaxSlantM;
+            }();
+            if (aircraftRadialSafety || TargetedRadialVisibilityEnabled()) {
                 ++g_profCull.targetedOcclusionRadialBypasses;
                 ++g_profCull.targetedOcclusionBypasses;
                 tracePalm("radial", -1.0f, false);
@@ -18480,6 +22454,14 @@ bool OnIsEntityOccluded(void* entity) {
 }
 
 bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
+    if (g_stereoDispatchExactFrustumContext) {
+        // Draw-dispatch admission is intentionally stock-exact.  The broad
+        // stereo visibility policy has already done its job by keeping the
+        // entity resident and in the shared list; applying it again here would
+        // send off-screen geometry to both eyes and defeat the optimization.
+        return g_origIsSphereVisible
+            ? g_origIsSphereVisible(cam, origin, radius) : true;
+    }
     const bool stereo = g_stereoActive.load(std::memory_order_relaxed);
     const bool profileCull = stereo && ShouldProfileCullOnCurrentThread();
     if (stereo && origin && g.TheCamera) {
@@ -18494,7 +22476,8 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
         const bool aircraftOrdinaryRangePromotionContext =
             g_aircraftOrdinaryHorizonScanActive &&
             g_aircraftOrdinaryHorizonContextEntity != nullptr &&
-            g_aircraftOrdinaryHorizonRangePromoted &&
+            (g_aircraftOrdinaryHorizonRangePromoted ||
+             g_aircraftOrdinaryStockMaxRangePromoted) &&
             IsKnownCullOwnerThread();
         if (distSq < 45.0f * 45.0f &&
             !aircraftOrdinaryRangePromotionContext) {
@@ -18559,16 +22542,141 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
                 g_origIsSphereVisible(cam, origin, radius);
             if (stockVisible)
                 ++g_aircraftOrdinaryHorizon.stockVisible;
-            // Stock phases only collect the exact candidate/result witnesses.
-            // The stable radial selector below decides one bounded union after
-            // the complete static-sector enumeration, so head pitch cannot let
-            // first-come phase-1 entities consume its slots.
-            if (g_aircraftOrdinaryRadialSelectionActive &&
-                !g_aircraftOrdinaryRadialAdmissionActive &&
-                !deterministicPersistentRoster &&
-                (g_visibilityScanPhase == 1 ||
-                 g_visibilityScanPhase == 2)) {
-                return stockVisible;
+            // The retail scan stamps an entity before SetupMap reaches this
+            // sphere test. Returning the phone-camera frustum result here made
+            // that first visit authoritative: the later full-sector disk could
+            // recover only the bounded 48/80 replay roster, while every other
+            // stock-range building still appeared or disappeared with head
+            // pitch. The SetupMap owner scopes this union to resident,
+            // substantial, inner-band BUILDING/DUMMY candidates. It has already
+            // accepted retail's draw threshold; the exact sphere checks below
+                // only add a bounded omnidirectional set, without requesting a
+                // model.  Head pitch and yaw therefore cannot change this
+                // detailed inner-band membership.
+            if (g_aircraftOrdinaryFirstPassPitchUnionContext) {
+                ++g_aircraftOrdinaryHorizon.firstPassTests;
+                const float distance = std::sqrt(std::max(0.0f, distSq));
+                const float groundDistance = std::hypot(dx, dy);
+                const float extent = std::isfinite(radius)
+                    ? std::max(0.0f, radius) : 0.0f;
+                const bool geometryEligible =
+                    std::isfinite(radius) &&
+                    std::isfinite(distance) &&
+                    std::isfinite(groundDistance) &&
+                    distance + extent >=
+                        kAircraftOrdinaryHorizonMinSlantDistanceM &&
+                    groundDistance - extent <=
+                        kAircraftOrdinaryHorizonMaxGroundDistanceM &&
+                    std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) &&
+                    g_aircraftOrdinaryHorizonMaxSlantM > 0.0f &&
+                    distance - extent <=
+                        g_aircraftOrdinaryHorizonMaxSlantM;
+                if (!geometryEligible) {
+                    ++g_aircraftOrdinaryHorizon.firstPassGeometryRejects;
+                    return g_aircraftOrdinaryStockMaxRangePromoted
+                        ? false : stockVisible;
+                }
+                ++g_aircraftOrdinaryHorizon.firstPassOmniEligible;
+                if (g_aircraftOrdinaryHorizon.firstPassAccepted >=
+                        kAircraftOrdinaryFirstPassUnionLimit) {
+                    ++g_aircraftOrdinaryHorizon.firstPassUnionLimit;
+                    return false;
+                }
+                if (!ReadAircraftLodCapacity().CanAdmitOrdinary()) {
+                    ++g_aircraftOrdinaryHorizon.firstPassCapacityStops;
+                    if (g_aircraftOrdinaryStockMaxContext)
+                        ++g_aircraftOrdinaryStockMax.capacityStops;
+                    return false;
+                }
+                ++g_aircraftOrdinaryHorizon.firstPassAccepted;
+                g_aircraftOrdinaryFirstPassPitchUnionAccepted = true;
+                g_aircraftOrdinaryHorizonForcedOcclusionEntity =
+                    g_aircraftOrdinaryHorizonContextEntity;
+                if (stockVisible) {
+                    ++g_aircraftOrdinaryHorizon.firstPassStockCovered;
+                    if (g_aircraftOrdinaryStockMaxContext)
+                        ++g_aircraftOrdinaryStockMax.stockCovered;
+                } else {
+                    ++g_aircraftOrdinaryHorizon.firstPassRescues;
+                    if (g_aircraftOrdinaryStockMaxContext)
+                        ++g_aircraftOrdinaryStockMax.rescues;
+                    if (g_visibilityScanPhase == 1)
+                        ++g_aircraftOrdinaryHorizon.firstPassStockPhase;
+                    else
+                        ++g_aircraftOrdinaryHorizon.firstPassNearbyPhase;
+                }
+                return true;
+            }
+            if (g_aircraftOrdinaryRaisedPitchUnionContext) {
+                ++g_aircraftStockPitchMax.tests;
+                if (stockVisible)
+                    ++g_aircraftStockPitchMax.stockVisible;
+                const float distance = std::sqrt(std::max(0.0f, distSq));
+                const float groundDistance = std::hypot(dx, dy);
+                const float extent = std::isfinite(radius)
+                    ? std::max(0.0f, radius) : 0.0f;
+                // This residual class includes special/linked retail entities,
+                // so unknown or out-of-domain geometry must stay stock-owned.
+                // The separate exact context below is true only for the
+                // rootless substantial outer class that phase 6 captures and
+                // can deterministically select/replay.
+                if (!std::isfinite(radius) ||
+                    !std::isfinite(distance) ||
+                    !std::isfinite(groundDistance) ||
+                    !std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) ||
+                    g_aircraftOrdinaryHorizonMaxSlantM <= 0.0f) {
+                    ++g_aircraftStockPitchMax.unknownFailOpen;
+                    return stockVisible;
+                }
+                if (distance + extent <
+                        kAircraftOrdinaryHorizonMinSlantDistanceM) {
+                    ++g_aircraftStockPitchMax.nearRetail;
+                    return stockVisible;
+                }
+                const bool slantOutside = distance - extent >
+                    g_aircraftOrdinaryHorizonMaxSlantM;
+                const bool outsideCompleteInnerDisk =
+                    groundDistance - extent >
+                        kAircraftOrdinaryHorizonMaxGroundDistanceM;
+                if (g_aircraftOrdinaryManagedOuterObserveContext &&
+                    outsideCompleteInnerDisk) {
+                    ++g_aircraftStockPitchMax.managedOuterRetail;
+                    if (stockVisible)
+                        ++g_aircraftStockPitchMax.managedOuterStockVisible;
+                    if (slantOutside)
+                        ++g_aircraftStockPitchMax.managedSlantFailOpen;
+                    // This counter measures the phase-1 stock extras that a
+                    // future complete selector would need to own. Do not cull
+                    // them here: phase 6 chooses only a bounded subset and has
+                    // no same-frame rollback after overflow/replay failure.
+                    return stockVisible;
+                }
+                if (slantOutside) {
+                    // No exact radial-class witness means phase 6 cannot be
+                    // trusted to replace this entity. Preserve retail rather
+                    // than manufacturing a new hole.
+                    return stockVisible;
+                }
+                if (outsideCompleteInnerDisk) return stockVisible;
+                if (g_aircraftStockPitchMax.accepted >=
+                        kAircraftStockPitchMaxRescueLimit) {
+                    ++g_aircraftStockPitchMax.rescueLimit;
+                    // The cap is an optimization budget, not a proof that a
+                    // retail-visible entity may be removed. Preserve stock at
+                    // the boundary so a denser scene cannot manufacture a
+                    // head-pitch-dependent hole.
+                    return stockVisible;
+                }
+                if (!ReadAircraftLodCapacity().CanAdmitOrdinary()) {
+                    ++g_aircraftStockPitchMax.capacityStops;
+                    return false;
+                }
+                ++g_aircraftStockPitchMax.accepted;
+                if (!stockVisible) ++g_aircraftStockPitchMax.rescues;
+                g_aircraftOrdinaryRaisedPitchUnionAccepted = true;
+                g_aircraftOrdinaryHorizonForcedOcclusionEntity =
+                    g_aircraftOrdinaryHorizonContextEntity;
+                return true;
             }
             // Outside deterministic phase 6, a stock-range entity remains
             // completely stock-authoritative. A range-promoted transaction,
@@ -18581,10 +22689,13 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
                 g_aircraftOrdinaryHorizonRangePromoted;
             if (stockVisible && !rangePromoted &&
                 !aircraftOrdinaryOuterCall &&
-                !deterministicRadialReplay) {
-                // A previous-shell member that retail already sees is part of
-                // the stock union for free.  Do not charge recovery quota or
-                // replace stock occlusion with our deterministic bypass.
+                !deterministicRadialReplay &&
+                !deterministicPersistentRoster) {
+                // Non-roster stock visibility remains free. Every persistent
+                // shell member, however, owns one deterministic quota slot
+                // whether the current head frustum happened to see it or not;
+                // otherwise looking up freed replay budget while looking down
+                // charged the same object and shrank the guaranteed union.
                 return true;
             }
 
@@ -18620,9 +22731,19 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
                 ++g_aircraftOrdinaryHorizon.horizontalRangeRejects;
                 return false;
             }
+            // Direct enumeration admitted this exact deterministic target with
+            // the model collision bound.  Its transformed render sphere can be
+            // smaller or offset enough to fall wholly inside the generic 100 m
+            // safety island.  Rejecting it a second time made phase 6 lose one
+            // selected detail directly below a low aircraft, so the authored
+            // grey parent replaced it whenever head pitch changed.  Retail
+            // and non-roster promotions keep the near guard unchanged.
+            const bool deterministicNearOwner =
+                deterministicRadialReplay || deterministicPersistentRoster;
             if (!std::isfinite(distance) ||
-                distance + extent <
-                    kAircraftOrdinaryHorizonMinSlantDistanceM) {
+                (!deterministicNearOwner &&
+                 distance + extent <
+                     kAircraftOrdinaryHorizonMinSlantDistanceM)) {
                 ++g_aircraftOrdinaryHorizon.sphereRangeRejects;
                 ++g_aircraftOrdinaryHorizon.innerSlantRangeRejects;
                 return false;
@@ -18777,25 +22898,48 @@ bool OnIsSphereVisible(void* cam, const void* origin, float radius) {
                 return true;
             }
         }
+        const float groundDistSq = dx * dx + dy * dy;
+        const bool aircraftRadialSafety =
+            g_aircraftOrdinaryHorizonScanActive &&
+            std::isfinite(groundDistSq) &&
+            std::isfinite(g_aircraftOrdinaryHorizonMaxSlantM) &&
+            g_aircraftOrdinaryHorizonMaxSlantM > 0.0f &&
+            distSq <= g_aircraftOrdinaryHorizonMaxSlantM *
+                g_aircraftOrdinaryHorizonMaxSlantM;
+        // Ground detail under an elevated aircraft must use the configured
+        // horizontal footprint.  The old 3D sphere silently shrank toward zero
+        // as altitude increased and then the HMD cone made the surviving slice
+        // change with head pitch/yaw.
         const bool baseSafetyCall = auditedStaticCall &&
-            staticSafetyM > 45.01f && distSq < staticSafetyM * staticSafetyM;
+            staticSafetyM > 45.01f &&
+            (aircraftRadialSafety
+                ? groundDistSq < staticSafetyM * staticSafetyM
+                : distSq < staticSafetyM * staticSafetyM);
         const bool largeVegetationExtensionCall = auditedStaticCall &&
             contextLargeVegetation &&
             largeVegetationSafetyM > staticSafetyM + 0.01f &&
-            distSq >= staticSafetyM * staticSafetyM &&
-            distSq < largeVegetationSafetyM * largeVegetationSafetyM;
+            (aircraftRadialSafety
+                ? groundDistSq >= staticSafetyM * staticSafetyM &&
+                  groundDistSq <
+                      largeVegetationSafetyM * largeVegetationSafetyM
+                : distSq >= staticSafetyM * staticSafetyM &&
+                  distSq <
+                      largeVegetationSafetyM * largeVegetationSafetyM);
         const bool roadsideExtensionCall = auditedStaticCall &&
             contextRoadside && roadsideSafetyM > staticSafetyM + 0.01f &&
-            distSq >= staticSafetyM * staticSafetyM &&
-            distSq < roadsideSafetyM * roadsideSafetyM;
+            (aircraftRadialSafety
+                ? groundDistSq >= staticSafetyM * staticSafetyM &&
+                  groundDistSq < roadsideSafetyM * roadsideSafetyM
+                : distSq >= staticSafetyM * staticSafetyM &&
+                  distSq < roadsideSafetyM * roadsideSafetyM);
         if (baseSafetyCall || largeVegetationExtensionCall ||
             roadsideExtensionCall) {
             const bool stockVisible = g_origIsSphereVisible(cam, origin, radius);
             const bool targetedRadial =
                 TargetedRadialVisibilityEnabled() &&
                 (contextLargeVegetation || contextRoadside);
-            const bool coneAllows = targetedRadial || StaticCullConeAllows(
-                dx, dy, dz, distSq, radius);
+            const bool coneAllows = aircraftRadialSafety || targetedRadial ||
+                StaticCullConeAllows(dx, dy, dz, distSq, radius);
             const bool forceVisible = !stockVisible && coneAllows;
             if (profileCull) {
                 if (baseSafetyCall) {
@@ -18902,7 +23046,9 @@ void OnScanWorld() {
     float savedHeading = 0.0f;
     float scanForwardX = 0.0f;
     float scanForwardY = 0.0f;
-    if (ReadAircraftHorizontalForward(&scanForwardX, &scanForwardY) &&
+    const bool scanForwardValid =
+        ReadAircraftHorizontalForward(&scanForwardX, &scanForwardY);
+    if (scanForwardValid &&
         g.CRenderer_ms_fCameraHeading && g.LoadBase &&
         reinterpret_cast<std::uintptr_t>(g.CRenderer_ms_fCameraHeading) -
                 g.LoadBase == 0xa0d6ccu) {
@@ -18962,8 +23108,23 @@ void OnScanWorld() {
     // footprint to one square under the camera (desktop-port parity).
     g_visibilityScanPhase = 1;
     float scanFrameSaved[9];
-    float* scanFrameMatrix =
-        headsetGameplay ? FlattenScanFrameMatrix(scanFrameSaved) : nullptr;
+    float* scanFrameMatrix = headsetGameplay
+        ? FlattenScanFrameMatrix(
+              scanFrameSaved,
+              aircraftScanLod.scanAlignmentActive && scanForwardValid,
+              scanForwardX, scanForwardY)
+        : nullptr;
+    if (aircraftScanLod.scanAlignmentActive && scanFrameMatrix &&
+        scanForwardValid) {
+        static std::atomic<bool> loggedAlignedAircraftScan{false};
+        if (!loggedAlignedAircraftScan.exchange(
+                true, std::memory_order_relaxed)) {
+            LOGI("[lod.air.scan] heading and flattened frame aligned "
+                 "forward=(%.3f,%.3f)",
+                 static_cast<double>(scanForwardX),
+                 static_cast<double>(scanForwardY));
+        }
+    }
     const double stockScanWallStart = enginePreMainScan.Active()
         ? NowMs() : 0.0;
     const double stockScanCpuStart = enginePreMainScan.Active()
@@ -18988,6 +23149,14 @@ void OnScanWorld() {
     g_aircraftOrdinaryHorizonContextOuterFarBand = false;
     g_aircraftOrdinaryHorizonRangePromoted = false;
     g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
+    g_aircraftOrdinaryFirstPassPitchUnionContext = false;
+    g_aircraftOrdinaryFirstPassPitchUnionAccepted = false;
+    g_aircraftOrdinaryRaisedPitchUnionContext = false;
+    g_aircraftOrdinaryManagedOuterObserveContext = false;
+    g_aircraftOrdinaryRaisedPitchUnionAccepted = false;
+    g_aircraftOrdinaryRaisedPitchUnionAlphaRetained = false;
+    g_aircraftOrdinaryStockMaxContext = false;
+    g_aircraftOrdinaryStockMaxRangePromoted = false;
     g_aircraftOrdinaryHorizonMaxSlantM = 0.0f;
     g_aircraftOrdinaryOuterScanActive = false;
     g_aircraftOrdinaryOuterPriorityActive = false;
@@ -19001,6 +23170,7 @@ void OnScanWorld() {
     g_aircraftOrdinaryFrameForcedLimit =
         kAircraftOrdinaryHorizonForcedLimit;
     g_aircraftOrdinaryOuter = {};
+    g_aircraftStockPitchMax = {};
     if (g_aircraftOrdinaryOuterSessionDisabled)
         g_aircraftOrdinaryOuter.faults = 1;
     g_aircraftOrdinaryPrefetchCandidates.fill({});
@@ -19032,6 +23202,7 @@ void OnScanWorld() {
         g_aircraftCoarseLodRadialAccepts = 0;
         g_aircraftCoarseLodStockVisible = 0;
         g_aircraftCoarseLodRootCalls = 0;
+        g_aircraftCoarseLodRootRangeSkips = 0;
         g_aircraftCoarseLodNonRootSkips = 0;
         g_aircraftCoarseLodBigCalls = 0;
         g_aircraftCoarseLodRootGuardRejects = 0;
@@ -19041,6 +23212,7 @@ void OnScanWorld() {
         g_aircraftStandaloneHorizonEntity = nullptr;
         g_aircraftStandaloneHorizonVisibilityDepth = 0;
         g_aircraftOrdinaryHorizon = {};
+        g_aircraftOrdinaryStockMax = {};
         g_aircraftOrdinaryHorizonContextEntity = nullptr;
         g_aircraftOrdinaryHorizonForcedOcclusionEntity = nullptr;
         g_aircraftOrdinaryRadialScreenProbeEntity = nullptr;
@@ -19051,9 +23223,19 @@ void OnScanWorld() {
         g_aircraftOrdinaryHorizonContextOuterFarBand = false;
         g_aircraftOrdinaryHorizonRangePromoted = false;
         g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
+        g_aircraftOrdinaryFirstPassPitchUnionContext = false;
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted = false;
+        g_aircraftOrdinaryRaisedPitchUnionContext = false;
+        g_aircraftOrdinaryManagedOuterObserveContext = false;
+        g_aircraftOrdinaryRaisedPitchUnionAccepted = false;
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained = false;
+        g_aircraftOrdinaryStockMaxContext = false;
+        g_aircraftOrdinaryStockMaxRangePromoted = false;
         g_aircraftOrdinaryHorizonScanActive = true;
-        const float outerPriorityRadius =
-            AircraftOrdinaryOuterRadiusForAltitude(aircraftScanLod.altitudeM);
+        const float outerPriorityRadius = aircraftScanLod.coarseShellActive
+            ? AircraftOrdinaryOuterRadiusForAltitude(
+                  aircraftScanLod.altitudeM)
+            : kAircraftOrdinaryHorizonMaxGroundDistanceM;
         const AircraftOrdinaryPriorityLimits priorityLimits =
             AircraftOrdinaryPriorityForRadius(outerPriorityRadius);
         g_aircraftOrdinaryRadialMaxGroundM = outerPriorityRadius;
@@ -19119,16 +23301,21 @@ void OnScanWorld() {
         g_aircraftLodPendingRequests.fill({});
         g_aircraftLodPendingModelCount = 0;
         g_aircraftLodPendingGroundRadiusM = aircraftScanLod.groundRadiusM;
-        g_aircraftCoarseLodVisibilityFarM = aircraftScanLod.farClipM;
-        g_aircraftCoarseLodRootLowLodScale = aircraftScanLod.lowLodScale;
+        g_aircraftCoarseLodVisibilityFarM =
+            aircraftScanLod.coarseShellActive ? aircraftScanLod.farClipM : 0.0f;
+        g_aircraftCoarseLodRootLowLodScale =
+            aircraftScanLod.coarseShellActive ? aircraftScanLod.lowLodScale
+                                              : 1.0f;
         g_aircraftStandaloneHorizonGroundRadiusM =
             kAircraftStandaloneHorizonEnabled
                 ? std::min(aircraftScanLod.groundRadiusM,
                            kAircraftStandaloneHorizonMaxRadiusM)
                 : 0.0f;
-        g_aircraftCoarseLodScanActive = true;
+        g_aircraftCoarseLodScanActive = aircraftScanLod.coarseShellActive;
     } else {
         BeginAircraftOrdinaryPersistentFrame(false, 0.0f, 0.0f);
+        g_aircraftMegaMeshActive = false;
+        g_aircraftMegaMeshStats.active = false;
     }
     g_origScanWorld();
     if (enginePreMainScan.Active() && EnginePreProfileOwnedByCurrentThread()) {
@@ -19139,7 +23326,7 @@ void OnScanWorld() {
     }
     RestoreScanFrameMatrix(scanFrameMatrix, scanFrameSaved);
     AircraftLodDiskStats aircraftDiskStats{};
-    if (aircraftScanLod.active) {
+    if (aircraftScanLod.coarseShellActive) {
         // The stock pass used a yaw-only frame for its forward horizon.  The
         // direct BIG-grid pass runs after restoration. Its strict SetupBig hook
         // admits only top-level authored parents as a head-independent shell.
@@ -19166,7 +23353,12 @@ void OnScanWorld() {
     auto finalizeAircraftRootUnion = [&] {
         if (aircraftRootUnionFinalized) return;
         aircraftRootUnionFinalized = true;
-        if (!aircraftScanLod.active) return;
+        if (!aircraftScanLod.coarseShellActive) {
+            g_aircraftOpaqueChildCaptureActive = false;
+            g_aircraftMegaMeshActive = false;
+            g_aircraftMegaMeshStats = {};
+            return;
+        }
         // The nearby ordinary-sector pass runs after the radial root disk and
         // can still append detail entries. Re-read the actual retail arrays and
         // scratch cursor here; the union is disabled for the whole frame unless
@@ -19182,10 +23374,20 @@ void OnScanWorld() {
             ApplyAircraftRootUnion(completeRootShell);
         const AircraftOpaqueChildExclusiveStats exclusive =
             ApplyAircraftOpaqueChildExclusivity(stats.enabled);
+        AircraftMegaMeshStats mega{};
+        if (kAircraftMegaMeshEnabled) {
+            mega = BuildAndPruneAircraftMegaMesh(stats.enabled);
+        } else {
+            g_aircraftMegaMeshActive = false;
+            g_aircraftMegaMeshStats = {};
+        }
         g_aircraftOpaqueChildCaptureActive = false;
         const int finalVisibleEntities = g.CRenderer_ms_nNoOfVisibleEntities
             ? *g.CRenderer_ms_nNoOfVisibleEntities
             : finalCapacity.visibleEntities;
+        const int finalVisibleLods = g.CRenderer_ms_nNoOfVisibleLods
+            ? *g.CRenderer_ms_nNoOfVisibleLods
+            : finalCapacity.visibleLods;
 
         static thread_local double lastAircraftRootUnionLogMs = 0.0;
         const double nowMs = perf::MonotonicMs();
@@ -19195,6 +23397,7 @@ void OnScanWorld() {
                  "complete=%d sentinel=%d overflow=%d stop=%d reject=%d "
                  "pre1=%d/%d/%d/%d/%d bad=%d preN=%d/%d preSent=%d "
                  "excl=%d cut=%.0f p/c/r/e/x=%d/%d/%d/%d/%d "
+                 "final=p/c/e/x=%d/%d/%d/%d "
                  "near=%d fade=%d "
                  "miss=%d/%d dup=%d inv=%d xov=%d "
                  "final=%d/%d/%d/%d",
@@ -19221,9 +23424,13 @@ void OnScanWorld() {
                  exclusive.probes,
                  exclusive.candidates,
                  exclusive.retainedRoots,
-                 exclusive.eligible,
-                 exclusive.pruned,
-                 exclusive.nearSkips,
+                  exclusive.eligible,
+                  exclusive.pruned,
+                  exclusive.finalListProbes,
+                  exclusive.finalListCandidates,
+                  exclusive.finalListEligible,
+                  exclusive.finalListPruned,
+                  exclusive.nearSkips,
                  exclusive.fadeSkips,
                  exclusive.parentMissing,
                  exclusive.childMissing,
@@ -19231,9 +23438,33 @@ void OnScanWorld() {
                  exclusive.invalid,
                  exclusive.overflow ? 1 : 0,
                  finalVisibleEntities,
-                 finalCapacity.visibleLods,
+                 finalVisibleLods,
                  finalCapacity.visibleSuperLods,
                  finalCapacity.scratchEntries);
+            LOGI("[lod.air.megamesh] active=%d rebuild=%d roots/src/col/box/flat=%d/%d/%d/%d/%d "
+                 "batch/v/t=%d/%d/%d col_t/reject=%d/%d "
+                 "reject=model/geom/range=%d/%d/%d "
+                 "overflow=%d pruned_lods=%d draw/fail=%d/%d age=%d",
+                 mega.active ? 1 : 0,
+                 mega.rebuilt ? 1 : 0,
+                 mega.roots,
+                 mega.sources,
+                 mega.collisionSources,
+                 mega.boundsFallback,
+                 mega.flatBoundsFallback,
+                 mega.batches,
+                 mega.vertices,
+                 mega.triangles,
+                 mega.collisionTriangles,
+                 mega.collisionRejected,
+                 mega.modelMissing,
+                 mega.geometryRejected,
+                 mega.rangeRejected,
+                 mega.overflow ? 1 : 0,
+                 mega.prunedLods,
+                 g_aircraftMegaMeshStats.drawCalls,
+                 g_aircraftMegaMeshStats.drawFailures,
+                 g_aircraftMegaMeshAgeFrames);
         }
     };
 
@@ -19314,6 +23545,73 @@ void OnScanWorld() {
                      g_aircraftOrdinaryHorizonFrameMaxSlantM),
                  static_cast<double>(kStaticCullConeHalfAngleDeg),
                  g_aircraftOrdinaryFrameForcedLimit);
+            LOGI("[lod.air.firstpass] tests/omni/accept/stock/rescue="
+                 "%d/%d/%d/%d/%d "
+                 "phase=stock/near=%d/%d reject=geometry/limit/cap=%d/%d/%d "
+                 "occ=test/stock/bypass/unconsumed=%d/%d/%d/%d "
+                 "retention_miss=%d policy=inner_stock_range_omni_cap%d",
+                 g_aircraftOrdinaryHorizon.firstPassTests,
+                 g_aircraftOrdinaryHorizon.firstPassOmniEligible,
+                 g_aircraftOrdinaryHorizon.firstPassAccepted,
+                 g_aircraftOrdinaryHorizon.firstPassStockCovered,
+                 g_aircraftOrdinaryHorizon.firstPassRescues,
+                 g_aircraftOrdinaryHorizon.firstPassStockPhase,
+                 g_aircraftOrdinaryHorizon.firstPassNearbyPhase,
+                 g_aircraftOrdinaryHorizon.firstPassGeometryRejects,
+                 g_aircraftOrdinaryHorizon.firstPassUnionLimit,
+                 g_aircraftOrdinaryHorizon.firstPassCapacityStops,
+                 g_aircraftOrdinaryHorizon.firstPassOcclusionTests,
+                 g_aircraftOrdinaryHorizon.firstPassOcclusionStockVisible,
+                 g_aircraftOrdinaryHorizon.firstPassOcclusionBypasses,
+                 g_aircraftOrdinaryHorizon.firstPassOcclusionUnconsumed,
+                 g_aircraftOrdinaryHorizon.firstPassRetentionMisses,
+                 kAircraftOrdinaryFirstPassUnionLimit);
+            LOGI("[lod.air.pitchmax] tests/accept/stock/rescue="
+                 "%d/%d/%d/%d limit/cap=%d/%d "
+                 "scope=unknown/near/outer_retail/outer_stock/slant_open="
+                 "%d/%d/%d/%d/%d "
+                 "occ=test/stock/bypass/unconsumed=%d/%d/%d/%d "
+                 "alpha_overflow=captured/dropped=%d/%d "
+                 "cfg=gaze=max limit=%d stock_range=1",
+                 g_aircraftStockPitchMax.tests,
+                 g_aircraftStockPitchMax.accepted,
+                 g_aircraftStockPitchMax.stockVisible,
+                 g_aircraftStockPitchMax.rescues,
+                 g_aircraftStockPitchMax.rescueLimit,
+                 g_aircraftStockPitchMax.capacityStops,
+                 g_aircraftStockPitchMax.unknownFailOpen,
+                 g_aircraftStockPitchMax.nearRetail,
+                 g_aircraftStockPitchMax.managedOuterRetail,
+                 g_aircraftStockPitchMax.managedOuterStockVisible,
+                 g_aircraftStockPitchMax.managedSlantFailOpen,
+                 g_aircraftStockPitchMax.occlusionTests,
+                 g_aircraftStockPitchMax.occlusionStockVisible,
+                 g_aircraftStockPitchMax.occlusionBypasses,
+                 g_aircraftStockPitchMax.occlusionUnconsumed,
+                 g_aircraftStockPitchMax.alphaOverflowCaptured,
+                 g_aircraftStockPitchMax.alphaOverflowDropped,
+                 kAircraftStockPitchMaxRescueLimit);
+            LOGI("[lod.air.stockmax] roster=prev/next/match/keep=%d/%d/%d/%d "
+                 "tests/promotions/filter=%d/%d/%d stock/rescue=%d/%d "
+                 "retention/cap=%d/%d fade=queue/cap=%d/%d "
+                 "cfg=extra%d bins=%dx%d "
+                 "yaw=world360 rootless_inner_resident=1",
+                 g_aircraftOrdinaryStockMax.rosterPrevious,
+                 g_aircraftOrdinaryStockMax.rosterPrepared,
+                 g_aircraftOrdinaryStockMax.rosterMatches,
+                 g_aircraftOrdinaryStockMax.rosterKept,
+                 g_aircraftOrdinaryStockMax.tests,
+                 g_aircraftOrdinaryStockMax.promotions,
+                 g_aircraftOrdinaryStockMax.filtered,
+                 g_aircraftOrdinaryStockMax.stockCovered,
+                 g_aircraftOrdinaryStockMax.rescues,
+                 g_aircraftOrdinaryStockMax.retentionMisses,
+                 g_aircraftOrdinaryStockMax.capacityStops,
+                 g_aircraftOrdinaryStockMax.fadeQueued,
+                 g_aircraftOrdinaryStockMax.fadeCapped,
+                 kAircraftOrdinaryStockMaxLimit,
+                 kAircraftOrdinaryStockMaxAngularBins,
+                 kAircraftOrdinaryStockMaxRadialBins);
             LOGI("[lod.air.outer] active=%d radius=%.0f "
                  "quota=i/o/n/f/t=%d/%d/%d/%d/%d "
                  "cells=c/s/cone/limit=%d/%d/%d/%d "
@@ -19332,7 +23630,7 @@ void OnScanWorld() {
                   "replay=req/visit/done/miss/sec=%d/%d/%d/%d/%d "
                   "out=v/c/s/o=%d/%d/%d/%d "
                   "overflow=c/s=%d/%d "
-                  "fade=alpha/queue/cap=%d/%d/%d "
+                  "fade=alpha/queue/cap/overflow/drop=%d/%d/%d/%d/%d "
                   "roster=prev/next/match/rej/prom/admit/keep/miss="
                   "%d/%d/%d/%d/%d/%d/%d/%d "
                   "time=wall/cpu=%.3f/%.3fms",
@@ -19409,6 +23707,8 @@ void OnScanWorld() {
                   g_aircraftOrdinaryOuter.radialAlphaRetained,
                   g_aircraftOrdinaryOuter.radialFadeSafeQueued,
                   g_aircraftOrdinaryOuter.radialFadeSafeCapped,
+                  g_aircraftOrdinaryOuter.radialAlphaOverflowCaptured,
+                  g_aircraftOrdinaryOuter.radialAlphaOverflowDropped,
                   g_aircraftOrdinaryOuter.rosterPrevious,
                   g_aircraftOrdinaryOuter.rosterPrepared,
                   g_aircraftOrdinaryOuter.rosterMatches,
@@ -19438,6 +23738,14 @@ void OnScanWorld() {
         g_aircraftOrdinaryHorizonRangePromoted = false;
         g_aircraftOrdinaryHorizonMaxSlantM = 0.0f;
         g_aircraftOrdinaryHorizonRangePromotionAccepted = false;
+        g_aircraftOrdinaryFirstPassPitchUnionContext = false;
+        g_aircraftOrdinaryFirstPassPitchUnionAccepted = false;
+        g_aircraftOrdinaryRaisedPitchUnionContext = false;
+        g_aircraftOrdinaryManagedOuterObserveContext = false;
+        g_aircraftOrdinaryRaisedPitchUnionAccepted = false;
+        g_aircraftOrdinaryRaisedPitchUnionAlphaRetained = false;
+        g_aircraftOrdinaryStockMaxContext = false;
+        g_aircraftOrdinaryStockMaxRangePromoted = false;
         g_aircraftOrdinaryOuterScanActive = false;
         g_aircraftOrdinaryOuterPriorityActive = false;
         g_aircraftOrdinaryOuterMaxGroundM =
@@ -19467,17 +23775,18 @@ void OnScanWorld() {
             const float headForwardZ = g_staticCullCone.valid &&
                     std::isfinite(g_staticCullCone.forward.z)
                 ? g_staticCullCone.forward.z : 2.0f;
-            LOGI("[lod.air] alt=%.1f ground=%.1f scan=%.1f far=%.1f "
+            LOGI("[lod.air] alt=%.1f coarse=%d ground=%.1f scan=%.1f far=%.1f "
                  "retail_far=%.1f low=%.2f "
                  "headz=%.3f "
                  "list=%d/%d/%d coarse=%d reject=%d scratch=%d "
-                 "hmd=%d radial=%d stock=%d roots=%d skip=%d big=%d "
+                 "hmd=%d radial=%d stock=%d roots=%d rrange=%d skip=%d big=%d "
                  "rguard=%d disk=%.0f cells=%d/%d stop=%d dsetup=%d "
                  "capture=%d request=%d q=%d>%d dms=%.2f "
                  "detail_cap=retail root_union=pre1+max+exclusive_cfg "
                  "root_scope=%d/%d",
-                 static_cast<double>(aircraftScanLod.altitudeM),
-                 static_cast<double>(aircraftScanLod.groundRadiusM),
+                  static_cast<double>(aircraftScanLod.altitudeM),
+                  aircraftScanLod.coarseShellActive ? 1 : 0,
+                  static_cast<double>(aircraftScanLod.groundRadiusM),
                   static_cast<double>(aircraftScanLod.scanFarM),
                   static_cast<double>(aircraftScanLod.farClipM),
                   static_cast<double>(aircraftScanLod.retailDrawFarM),
@@ -19491,6 +23800,7 @@ void OnScanWorld() {
                  g_aircraftCoarseLodRadialAccepts,
                  g_aircraftCoarseLodStockVisible,
                  g_aircraftCoarseLodRootCalls,
+                 g_aircraftCoarseLodRootRangeSkips,
                  g_aircraftCoarseLodNonRootSkips,
                  g_aircraftCoarseLodBigCalls,
                  g_aircraftCoarseLodRootGuardRejects,
@@ -19535,7 +23845,16 @@ void OnScanWorld() {
         }
     }
 
-    const float radius = EffectiveNearbySectorScanM();
+    const float configuredNearbyRadius = EffectiveNearbySectorScanM();
+    // Aircraft max-gaze admission relies on phase 2 visiting the complete
+    // ordinary 300 m disk.  TreesPalmsM currently supplies that radius, but a
+    // graphics-profile change must not silently reintroduce an HMD-dependent
+    // sector set.  Keep the floor aircraft-only; ground and cutscene behavior
+    // retain the configured radius exactly.
+    const float radius = aircraftScanLod.active
+        ? std::max(configuredNearbyRadius,
+                   kAircraftOrdinaryHorizonMaxGroundDistanceM)
+        : configuredNearbyRadius;
     if (radius <= 0.0f ||
         !g_stereoActive.load(std::memory_order_relaxed) ||
         !g.CRenderer_ScanSectorList || !g.CRenderer_ms_vecCameraPosition ||
@@ -19586,8 +23905,14 @@ void OnScanWorld() {
         ? std::sqrt(g_staticCullCone.forward.x * g_staticCullCone.forward.x +
                     g_staticCullCone.forward.y * g_staticCullCone.forward.y)
         : 0.0f;
-    const bool sectorConeValid = std::isfinite(horizontalLength) &&
-        horizontalLength > 0.25f;
+    // A nearly vertical HMD already selected the complete bounded disk, while
+    // an ordinary gaze kept only the current head-facing cone. That branch was
+    // the exact "look higher, get more city/fog moves away" switch on both the
+    // ground and in flight. Always use the maximum of those two existing
+    // footprints for stereo gameplay. The radius, per-entity visibility tests,
+    // streaming policy and aircraft replay quotas remain unchanged; only the
+    // coarse sector discovery set no longer rotates or expands with head pitch.
+    const bool sectorConeValid = false;
     const float coneForwardX = sectorConeValid
         ? g_staticCullCone.forward.x / horizontalLength : 0.0f;
     const float coneForwardY = sectorConeValid
@@ -19702,25 +24027,1024 @@ void* InstallTrampoline(void* target, void* replacement) {
     return tramp;
 }
 
+#ifdef SAVR_DEV
+using GameUpdateVoidFn = void (*)();
+using GameUpdateBoolFn = void (*)(bool);
+using GameUpdateSelfFn = void (*)(void*);
+using GameUpdateSelfBoolFn = void (*)(void*, bool);
+using GameUpdateVectorFn = void (*)(const void*);
+using TextureDatabaseUpdateFn = void (*)(float, bool);
+using TextureDatabasePumpFn = unsigned int (*)(void*, unsigned int,
+                                                unsigned int);
+using TextureDatabaseLoadFn = unsigned int (*)(void*, unsigned int);
+using TextureDatabaseOpenFn = void* (*)(const char*, bool, int);
+using GameUpdateIntFn = void (*)(int);
+
+// Retail fills as many as sixteen objects into one streaming channel.  When a
+// completed channel contains several new TXDs, ProcessLoadingChannel converts
+// every object synchronously and LoadFullTexture can spend tens of milliseconds
+// on the GameThread in one frame.  Keep loading semantics intact and reduce
+// only the normal gameplay channel fill.  LoadAllRequestedModels and every
+// direct/non-gameplay RequestModelStream call temporarily retain the retail
+// sixteen-object batch.
+constexpr char kStreamingSchedulerModelsProperty[] =
+    "debug.savr.streaming_scheduler_models";
+constexpr char kTextureStreamingCompletionsProperty[] =
+    "debug.savr.texture_stream_completions";
+constexpr char kTextureStreamingBudgetUsProperty[] =
+    "debug.savr.texture_stream_budget_us";
+constexpr int kTextureStreamingDefaultBudgetUs = 1250;
+constexpr std::uintptr_t kRequestModelStreamOffset = 0x3b2734u;
+constexpr std::uintptr_t kRequestModelStreamCapacityOffset = 0x3b2a94u;
+constexpr std::uint32_t kRequestModelStreamRetailCompare = 0xf1003b7fu;
+constexpr int kRequestModelStreamRetailModels = 16;
+
+// Mobile SA keeps only 45 MiTexels resident before it starts recycling full
+// textures.  That made sense on the original phones, but on Quest it can turn
+// driving through one stable scene into a load/evict/load cycle.  Keep the
+// model-batch experiment available separately and raise only the retail
+// texture residency target.  No texture is fabricated or exposed early: the
+// stock streamer still owns loading, priorities, and every RwTexture lifetime.
+constexpr char kTextureCacheMTexelsProperty[] =
+    "debug.savr.texture_cache_mtexels";
+constexpr int kTextureCacheRetailMTexels = 45;
+constexpr int kTextureCacheDefaultMTexels = 128;
+constexpr int kTextureCacheMaximumMTexels = 256;
+constexpr std::uint32_t kTextureCacheImmediateMask = 0x001fffe0u;
+
+struct TextureCachePatchSite {
+    std::uintptr_t offset{};
+    std::uint32_t retail{};
+    bool negative{};
+};
+
+constexpr std::array<TextureCachePatchSite, 8> kTextureCachePatchSites{{
+    {0x795ed0u, 0x72a05a0au, false}, // MOVK W10,#0x2d0,LSL#16
+    {0x795ee0u, 0x52bfa60bu, true},  // MOV  W11,#-0x2d00000
+    {0x795f08u, 0x52a05a0au, false}, // MOV  W10,#0x2d00000
+    {0x795ff0u, 0x52a05a0au, false},
+    {0x79605cu, 0x52a05a16u, false}, // MOV  W22,#0x2d00000
+    {0x7960c0u, 0x52a05a16u, false},
+    {0x796124u, 0x52a05a16u, false},
+    {0x79637cu, 0x52a05a19u, false}, // force sentinel in per-DB pump
+}};
+
+std::uint32_t* g_textureDatabaseStoredTexels = nullptr;
+
+int RequestedTextureCacheMTexels() {
+    static const int requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        if (__system_property_get(kTextureCacheMTexelsProperty, text) <= 0)
+            return kTextureCacheDefaultMTexels;
+        char* end = nullptr;
+        const long value = std::strtol(text, &end, 10);
+        if (end == text || *end != '\0') {
+            LOGW("[stream.texture.cache] ignoring invalid %s=%s",
+                 kTextureCacheMTexelsProperty, text);
+            return kTextureCacheDefaultMTexels;
+        }
+        return static_cast<int>(std::clamp<long>(
+            value, kTextureCacheRetailMTexels,
+            kTextureCacheMaximumMTexels));
+    }();
+    return requested;
+}
+
+std::uint32_t TextureCacheInstruction(const TextureCachePatchSite& site,
+                                      int requestedMTexels) {
+    const std::uint32_t positive =
+        static_cast<std::uint32_t>(requestedMTexels) << 4u;
+    const std::uint32_t immediate = site.negative
+        ? ((0x10000u - positive) & 0xffffu) : positive;
+    return (site.retail & ~kTextureCacheImmediateMask) |
+        (immediate << 5u);
+}
+
+bool InstallTextureCacheBudgetPatch(void* gameHandle) {
+    g_textureDatabaseStoredTexels = gameHandle
+        ? reinterpret_cast<std::uint32_t*>(dlsym(
+              gameHandle,
+              "_ZN22TextureDatabaseRuntime12storedTexelsE"))
+        : nullptr;
+    const int requested = RequestedTextureCacheMTexels();
+    if (requested == kTextureCacheRetailMTexels) {
+        LOGI("[stream.texture.cache] requested=%d active=0 retail=%d "
+             "stored_symbol=%d property=%s", requested,
+             kTextureCacheRetailMTexels,
+             g_textureDatabaseStoredTexels ? 1 : 0,
+             kTextureCacheMTexelsProperty);
+        return true;
+    }
+    if (!g.LoadBase) {
+        LOGW("[stream.texture.cache] requested=%d active=0 no libGame base",
+             requested);
+        return false;
+    }
+
+    std::array<std::uint32_t*, kTextureCachePatchSites.size()> targets{};
+    std::array<std::uint32_t, kTextureCachePatchSites.size()> replacements{};
+    for (std::size_t i = 0; i < kTextureCachePatchSites.size(); ++i) {
+        targets[i] = reinterpret_cast<std::uint32_t*>(
+            g.LoadBase + kTextureCachePatchSites[i].offset);
+        replacements[i] = TextureCacheInstruction(
+            kTextureCachePatchSites[i], requested);
+        if (__atomic_load_n(targets[i], __ATOMIC_ACQUIRE) !=
+                kTextureCachePatchSites[i].retail) {
+            LOGW("[stream.texture.cache] requested=%d active=0 "
+                 "fingerprint=0 site=%zu offset=0x%llx observed=0x%08x",
+                 requested, i,
+                 static_cast<unsigned long long>(
+                     kTextureCachePatchSites[i].offset),
+                 __atomic_load_n(targets[i], __ATOMIC_RELAXED));
+            return false;
+        }
+    }
+
+    const long rawPageSize = sysconf(_SC_PAGESIZE);
+    if (rawPageSize <= 0) {
+        LOGW("[stream.texture.cache] requested=%d active=0 invalid page size",
+             requested);
+        return false;
+    }
+    const std::uintptr_t pageSize = static_cast<std::uintptr_t>(rawPageSize);
+    const std::uintptr_t firstPage =
+        reinterpret_cast<std::uintptr_t>(targets.front()) & ~(pageSize - 1u);
+    const std::uintptr_t lastPage =
+        reinterpret_cast<std::uintptr_t>(targets.back()) & ~(pageSize - 1u);
+    const std::array<std::uintptr_t, 2> pages{{firstPage, lastPage}};
+    std::size_t writablePages = 0;
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+        if (i != 0 && pages[i] == pages[i - 1]) continue;
+        if (mprotect(reinterpret_cast<void*>(pages[i]), pageSize,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            for (std::size_t j = 0; j < i; ++j) {
+                if (j != 0 && pages[j] == pages[j - 1]) continue;
+                mprotect(reinterpret_cast<void*>(pages[j]), pageSize,
+                         PROT_READ | PROT_EXEC);
+            }
+            LOGW("[stream.texture.cache] requested=%d active=0 rwx=0 page=%zu",
+                 requested, i);
+            return false;
+        }
+        ++writablePages;
+    }
+
+    std::size_t applied = 0;
+    for (; applied < targets.size(); ++applied) {
+        std::uint32_t expected = kTextureCachePatchSites[applied].retail;
+        if (!__atomic_compare_exchange_n(
+                targets[applied], &expected, replacements[applied], false,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+        __builtin___clear_cache(reinterpret_cast<char*>(targets[applied]),
+                                reinterpret_cast<char*>(targets[applied] + 1));
+    }
+    const bool allApplied = applied == targets.size();
+    if (!allApplied) {
+        while (applied != 0) {
+            --applied;
+            std::uint32_t expected = replacements[applied];
+            __atomic_compare_exchange_n(
+                targets[applied], &expected,
+                kTextureCachePatchSites[applied].retail, false,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+            __builtin___clear_cache(
+                reinterpret_cast<char*>(targets[applied]),
+                reinterpret_cast<char*>(targets[applied] + 1));
+        }
+    }
+
+    bool rx = true;
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+        if (i != 0 && pages[i] == pages[i - 1]) continue;
+        rx = mprotect(reinterpret_cast<void*>(pages[i]), pageSize,
+                      PROT_READ | PROT_EXEC) == 0 && rx;
+    }
+    bool rolledBackAfterRxFailure = false;
+    if (allApplied && !rx) {
+        bool reopened = true;
+        for (std::size_t i = 0; i < pages.size(); ++i) {
+            if (i != 0 && pages[i] == pages[i - 1]) continue;
+            reopened = mprotect(reinterpret_cast<void*>(pages[i]), pageSize,
+                                PROT_READ | PROT_WRITE | PROT_EXEC) == 0 &&
+                reopened;
+        }
+        if (reopened) {
+            rolledBackAfterRxFailure = true;
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                std::uint32_t expected = replacements[i];
+                __atomic_compare_exchange_n(
+                    targets[i], &expected, kTextureCachePatchSites[i].retail,
+                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                __builtin___clear_cache(
+                    reinterpret_cast<char*>(targets[i]),
+                    reinterpret_cast<char*>(targets[i] + 1));
+            }
+            rx = true;
+            for (std::size_t i = 0; i < pages.size(); ++i) {
+                if (i != 0 && pages[i] == pages[i - 1]) continue;
+                rx = mprotect(reinterpret_cast<void*>(pages[i]), pageSize,
+                              PROT_READ | PROT_EXEC) == 0 && rx;
+            }
+        }
+    }
+    if (!allApplied || !rx || rolledBackAfterRxFailure) {
+        LOGW("[stream.texture.cache] requested=%d active=0 atomic=%d rx=%d "
+             "writable_pages=%zu", requested, allApplied ? 1 : 0,
+             rx ? 1 : 0, writablePages);
+        return false;
+    }
+
+    LOGI("[stream.texture.cache] requested=%d active=1 retail=%d "
+         "rgba_worst_mib=%d sites=%zu stored_symbol=%d property=%s",
+         requested, kTextureCacheRetailMTexels, requested * 4,
+         kTextureCachePatchSites.size(),
+         g_textureDatabaseStoredTexels ? 1 : 0,
+         kTextureCacheMTexelsProperty);
+    return true;
+}
+
+std::atomic<void*> g_streamingSchedulerScopeOwner{nullptr};
+std::atomic<bool> g_streamingSchedulerPatchActive{false};
+std::atomic<std::uint64_t> g_streamingSchedulerGameplayCalls{0};
+std::atomic<std::uint64_t> g_streamingSchedulerRetailCalls{0};
+std::atomic<std::uint64_t> g_streamingSchedulerPatchFaults{0};
+std::uint32_t* g_streamingSchedulerCapacityInstruction = nullptr;
+std::uint32_t g_streamingSchedulerLimitedCompare =
+    kRequestModelStreamRetailCompare;
+std::mutex g_streamingSchedulerCallMutex;
+
+// UpdateTextureStreaming removes an entry from its pending queue immediately
+// before LoadFullTexture creates and uploads it.  Passing a zero texel budget
+// therefore still completes exactly one pending texture, while returning
+// without calling retail leaves every pending entry owned by the original
+// queue.  Use that existing transaction boundary to spread normal gameplay
+// completions across frames without ever publishing a half-uploaded texture.
+// Forced updates and direct/mission loads bypass this policy entirely.
+thread_local bool g_textureStreamingUpdateActive = false;
+thread_local bool g_textureStreamingUpdateForce = false;
+thread_local unsigned int g_textureStreamingCompletionsThisFrame = 0u;
+thread_local bool g_textureStreamingFeedbackInitialised = false;
+thread_local double g_textureStreamingFeedbackCreditMs = 0.0;
+thread_local double g_textureStreamingCompletionWallEwmaMs = 0.0;
+std::atomic<std::uint64_t> g_textureStreamingCompletionFrames{0u};
+std::atomic<std::uint64_t> g_textureStreamingCompleted{0u};
+std::atomic<std::uint64_t> g_textureStreamingDeferred{0u};
+std::atomic<std::uint64_t> g_textureStreamingFeedbackDeferredFrames{0u};
+std::atomic<std::uint64_t> g_textureStreamingCompletionWallUs{0u};
+std::atomic<std::uint64_t> g_textureStreamingLastCompletionWallUs{0u};
+std::atomic<std::uint64_t> g_textureStreamingMaxCompletionWallUs{0u};
+
+int RequestedTextureStreamingCompletions() {
+    static const int requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        if (__system_property_get(kTextureStreamingCompletionsProperty, text) <= 0)
+            return 0;
+        char* end = nullptr;
+        const long value = std::strtol(text, &end, 10);
+        if (end == text || *end != '\0') {
+            LOGW("[stream.texture.frame] ignoring invalid %s=%s",
+                 kTextureStreamingCompletionsProperty, text);
+            return 0;
+        }
+        return static_cast<int>(std::clamp<long>(value, 0, 8));
+    }();
+    return requested;
+}
+
+int RequestedTextureStreamingBudgetUs() {
+    static const int requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        if (__system_property_get(kTextureStreamingBudgetUsProperty, text) <= 0)
+            return kTextureStreamingDefaultBudgetUs;
+        char* end = nullptr;
+        const long value = std::strtol(text, &end, 10);
+        if (end == text || *end != '\0') {
+            LOGW("[stream.texture.feedback] ignoring invalid %s=%s",
+                 kTextureStreamingBudgetUsProperty, text);
+            return kTextureStreamingDefaultBudgetUs;
+        }
+        // Zero is an explicit A/B escape hatch that retains the count-only
+        // scheduler.  Positive values stay well below a 72 Hz frame budget.
+        if (value == 0) return 0;
+        return static_cast<int>(std::clamp<long>(value, 250, 4000));
+    }();
+    return requested;
+}
+
+void UpdateTextureStreamingCompletionMax(std::uint64_t wallUs) {
+    std::uint64_t observed =
+        g_textureStreamingMaxCompletionWallUs.load(std::memory_order_relaxed);
+    while (observed < wallUs &&
+           !g_textureStreamingMaxCompletionWallUs.compare_exchange_weak(
+               observed, wallUs, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+}
+
+unsigned int TextureStreamingPendingCount(const void* runtime,
+                                          unsigned int tier) {
+    if (!runtime || tier > 2u) return 0u;
+    const auto* const bytes = static_cast<const std::uint8_t*>(runtime);
+    return *reinterpret_cast<const std::uint32_t*>(
+        bytes + 0xacu + static_cast<std::size_t>(tier) * 0x10u);
+}
+
+int RequestedStreamingSchedulerModels() {
+    static const int requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        if (__system_property_get(kStreamingSchedulerModelsProperty, text) <= 0)
+            return 0;
+        char* end = nullptr;
+        const long value = std::strtol(text, &end, 10);
+        if (end == text || *end != '\0' || value <= 0) return 0;
+        // The stock B.HI sequence cannot encode a one-object batch without a
+        // second instruction change.  Two is the smallest exact/safe batch.
+        return static_cast<int>(std::clamp<long>(value, 2, 16));
+    }();
+    return requested;
+}
+
+std::uint32_t StreamingSchedulerCompareInstruction(int models) {
+    // Original sequence compares the zero-based slot index with 14 and exits
+    // when it is higher, producing 16 entries.  For N entries compare against
+    // N-2; the existing ADD/B.HI and channel finalisation remain byte-exact.
+    const std::uint32_t immediate = static_cast<std::uint32_t>(models - 2);
+    return 0xf100037fu | (immediate << 10u); // CMP X27,#imm12
+}
+
+bool SetStreamingSchedulerCapacityInstruction(std::uint32_t instruction) {
+    auto* const target = g_streamingSchedulerCapacityInstruction;
+    if (!target) return false;
+    const std::uint32_t observed =
+        __atomic_load_n(target, __ATOMIC_ACQUIRE);
+    if (observed != kRequestModelStreamRetailCompare &&
+        observed != g_streamingSchedulerLimitedCompare) {
+        g_streamingSchedulerPatchFaults.fetch_add(1,
+                                                  std::memory_order_relaxed);
+        return false;
+    }
+    if (observed == instruction) return true;
+    __atomic_store_n(target, instruction, __ATOMIC_RELEASE);
+    __builtin___clear_cache(reinterpret_cast<char*>(target),
+                            reinterpret_cast<char*>(target + 1));
+    return __atomic_load_n(target, __ATOMIC_ACQUIRE) == instruction;
+}
+
+GameUpdateVoidFn g_origProfileGameProcess = nullptr;
+GameUpdateVoidFn g_origProfileStreamingUpdate = nullptr;
+GameUpdateVoidFn g_origProfileScriptsProcess = nullptr;
+GameUpdateSelfBoolFn g_origProfilePathStreaming = nullptr;
+GameUpdateBoolFn g_origProfilePopulationUpdate = nullptr;
+GameUpdateVoidFn g_origProfileWorldProcess = nullptr;
+GameUpdateVoidFn g_origProfilePickupsUpdate = nullptr;
+GameUpdateSelfFn g_origProfileCameraProcess = nullptr;
+GameUpdateVectorFn g_origProfilePlantsUpdate = nullptr;
+GameUpdateSelfFn g_origProfileAudioService = nullptr;
+TextureDatabaseUpdateFn g_origProfileTextureDatabaseUpdate = nullptr;
+TextureDatabasePumpFn g_origProfileTextureDatabasePump = nullptr;
+TextureDatabaseLoadFn g_origProfileTextureDatabaseLoad = nullptr;
+TextureDatabaseOpenFn g_origProfileTextureDatabaseOpen = nullptr;
+GameUpdateVoidFn g_origProfileLoadRequestedModels = nullptr;
+GameUpdateIntFn g_origProfileRequestModelStream = nullptr;
+
+void OnProfileGameProcess() {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::Game);
+    g_origProfileGameProcess();
+}
+
+void OnProfileStreamingUpdate() {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::Streaming);
+    g_origProfileStreamingUpdate();
+}
+
+void OnProfileTextureDatabaseUpdate(float elapsedSeconds, bool force) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::TextureDatabase);
+    const bool previousActive = g_textureStreamingUpdateActive;
+    const bool previousForce = g_textureStreamingUpdateForce;
+    g_textureStreamingUpdateActive = true;
+    g_textureStreamingUpdateForce = force;
+    g_origProfileTextureDatabaseUpdate(elapsedSeconds, force);
+    g_textureStreamingUpdateForce = previousForce;
+    g_textureStreamingUpdateActive = previousActive;
+}
+
+unsigned int OnProfileTextureDatabasePump(void* self, unsigned int budget,
+                                           unsigned int tier) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::TexturePump);
+    const int limit = RequestedTextureStreamingCompletions();
+    const bool scheduled = limit > 0 && g_textureStreamingUpdateActive &&
+        !g_textureStreamingUpdateForce &&
+        EnginePreProfileOwnedByCurrentThread() &&
+        g_stereoActive.load(std::memory_order_relaxed) && ShouldRunStereo();
+    if (!scheduled) {
+        return g_origProfileTextureDatabasePump(self, budget, tier);
+    }
+
+    const unsigned int pendingBefore = TextureStreamingPendingCount(self, tier);
+    if (pendingBefore == 0u) {
+        return g_origProfileTextureDatabasePump(self, budget, tier);
+    }
+    if (g_textureStreamingCompletionsThisFrame >=
+            static_cast<unsigned int>(limit)) {
+        g_textureStreamingDeferred.fetch_add(pendingBefore,
+                                              std::memory_order_relaxed);
+        return 0u;
+    }
+
+    const int feedbackBudgetUs = RequestedTextureStreamingBudgetUs();
+    const double feedbackBudgetMs =
+        static_cast<double>(feedbackBudgetUs) / 1000.0;
+    if (feedbackBudgetUs > 0 &&
+        g_textureStreamingFeedbackCreditMs + 1e-6 < feedbackBudgetMs) {
+        g_textureStreamingDeferred.fetch_add(pendingBefore,
+                                              std::memory_order_relaxed);
+        g_textureStreamingFeedbackDeferredFrames.fetch_add(
+            1u, std::memory_order_relaxed);
+        return 0u;
+    }
+
+    // A zero budget makes the retail loop finish after its first positive-size
+    // texture.  The queue remains authoritative and the loaded texture still
+    // performs its mandatory final RenderQueue drain before becoming visible.
+    const double completionStartMs = NowMs();
+    const unsigned int loadedTexels =
+        g_origProfileTextureDatabasePump(self, 0u, tier);
+    const double completionWallMs =
+        std::max(0.0, NowMs() - completionStartMs);
+    const unsigned int pendingAfter = TextureStreamingPendingCount(self, tier);
+    const unsigned int completed = pendingBefore > pendingAfter
+        ? pendingBefore - pendingAfter : (loadedTexels != 0u ? 1u : 0u);
+    g_textureStreamingCompletionsThisFrame += completed;
+    g_textureStreamingCompleted.fetch_add(completed,
+                                           std::memory_order_relaxed);
+    if (completed != 0u && feedbackBudgetUs > 0) {
+        // The credit already contains this frame's allowance.  Debit the full
+        // measured transaction wall time, including decode/copy and its one
+        // mandatory RenderQueue publication drain.  Negative credit is useful
+        // feedback: future normal completions wait while each frame repays one
+        // budget quantum.  Forced/mission paths never enter this scheduler.
+        g_textureStreamingFeedbackCreditMs = std::max(
+            -100.0, g_textureStreamingFeedbackCreditMs - completionWallMs);
+        g_textureStreamingCompletionWallEwmaMs =
+            g_textureStreamingCompletionWallEwmaMs <= 0.0
+            ? completionWallMs
+            : g_textureStreamingCompletionWallEwmaMs * 0.875 +
+                completionWallMs * 0.125;
+        const std::uint64_t wallUs = static_cast<std::uint64_t>(
+            std::llround(completionWallMs * 1000.0));
+        g_textureStreamingCompletionWallUs.fetch_add(
+            wallUs, std::memory_order_relaxed);
+        g_textureStreamingLastCompletionWallUs.store(
+            wallUs, std::memory_order_relaxed);
+        UpdateTextureStreamingCompletionMax(wallUs);
+        if (completionWallMs >= 3.0) {
+            LOGI("[stream.texture.feedback] completed=%u wall=%.3fms "
+                 "credit=%.3fms ewma=%.3fms pending=%u->%u budget_us=%d",
+                 completed, completionWallMs,
+                 g_textureStreamingFeedbackCreditMs,
+                 g_textureStreamingCompletionWallEwmaMs,
+                 pendingBefore, pendingAfter, feedbackBudgetUs);
+        }
+    }
+    return loadedTexels;
+}
+
+std::array<char, 32> TextureDatabaseDebugName(const void* runtime) {
+    std::array<char, 32> result{};
+    result[0] = '?';
+    if (!runtime) return result;
+
+    // Retail TextureDatabaseRuntime owns a strdup()'d database name at +0x8.
+    // The same layout is proven by TextureDatabaseRuntime::Load before the
+    // object is published to the global runtime array.  Keep this helper
+    // diagnostic-only: it never participates in loading or cache policy.
+    const auto* const bytes = static_cast<const std::uint8_t*>(runtime);
+    const char* name = nullptr;
+    std::memcpy(&name, bytes + 0x8u, sizeof(name));
+    if (!name) return result;
+
+    std::size_t length = 0;
+    for (; length + 1u < result.size(); ++length) {
+        const unsigned char value = static_cast<unsigned char>(name[length]);
+        if (value == 0u) break;
+        if (value < 0x20u || value > 0x7eu) {
+            result[0] = '?';
+            result[1] = '\0';
+            return result;
+        }
+        result[length] = static_cast<char>(value);
+    }
+    result[length] = '\0';
+    return result;
+}
+
+void* OnProfileTextureDatabaseOpen(const char* name, bool preload,
+                                   int format) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::TextureDatabase);
+    const double wallStartMs = NowMs();
+    const double cpuStartMs = perf::ThreadCpuMs();
+    void* const runtime = g_origProfileTextureDatabaseOpen(name, preload,
+                                                           format);
+    const double wallMs = std::max(0.0, NowMs() - wallStartMs);
+    const double cpuMs = std::max(0.0, perf::ThreadCpuMs() - cpuStartMs);
+    const auto* const bytes = static_cast<const std::uint8_t*>(runtime);
+    const std::uint32_t entries = runtime
+        ? *reinterpret_cast<const std::uint32_t*>(bytes + 0x24u) : 0u;
+    LOGI("[stream.texture.db] name=%s runtime=%p entries=%u preload=%u "
+         "format=%d wall/cpu=%.3f/%.3fms",
+         name ? name : "?", runtime, entries, preload ? 1u : 0u, format,
+         wallMs, cpuMs);
+    return runtime;
+}
+
+unsigned int OnProfileTextureDatabaseLoad(void* self, unsigned int texture) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::TextureLoad);
+    const bool profileCurrent = EnginePreProfileOwnedByCurrentThread();
+    const double wallStartMs = profileCurrent ? NowMs() : 0.0;
+    const double cpuStartMs = profileCurrent ? perf::ThreadCpuMs() : 0.0;
+
+    auto readFlags = [](void* runtime, unsigned int id) {
+        std::uint16_t flags = 0xffffu;
+        if (!runtime) return flags;
+        auto* const bytes = static_cast<std::uint8_t*>(runtime);
+        const std::uint32_t count = *reinterpret_cast<const std::uint32_t*>(
+            bytes + 0x24u);
+        auto* const entries = *reinterpret_cast<std::uint8_t* const*>(
+            bytes + 0x28u);
+        if (!entries || id >= count) return flags;
+        // Retail TextureDatabaseEntry is exactly 31 bytes.
+        std::memcpy(&flags, entries + static_cast<std::size_t>(id) * 31u + 0xcu,
+                    sizeof(flags));
+        return flags;
+    };
+    const std::uint16_t beforeFlags = profileCurrent
+        ? readFlags(self, texture) : 0xffffu;
+    const unsigned int loaded = g_origProfileTextureDatabaseLoad(self, texture);
+    if (!profileCurrent) return loaded;
+
+    const double wallMs = std::max(0.0, NowMs() - wallStartMs);
+    const double cpuMs = std::max(0.0, perf::ThreadCpuMs() - cpuStartMs);
+    if (wallMs < 8.0) return loaded;
+
+    struct TextureLoadHistory {
+        void* runtime{};
+        unsigned int texture{};
+        unsigned int loads{};
+    };
+    static thread_local std::array<TextureLoadHistory, 64> history{};
+    static thread_local std::size_t historyCursor = 0;
+    TextureLoadHistory* match = nullptr;
+    for (auto& item : history) {
+        if (item.runtime == self && item.texture == texture) {
+            match = &item;
+            break;
+        }
+    }
+    if (!match) {
+        match = &history[historyCursor++ % history.size()];
+        *match = TextureLoadHistory{self, texture, 0u};
+    }
+    ++match->loads;
+
+    static thread_local double logWindowStartMs = 0.0;
+    static thread_local int logsInWindow = 0;
+    const double nowMs = NowMs();
+    if (logWindowStartMs <= 0.0 || nowMs - logWindowStartMs >= 1000.0) {
+        logWindowStartMs = nowMs;
+        logsInWindow = 0;
+    }
+    if (logsInWindow >= 8) return loaded;
+    ++logsInWindow;
+
+    const auto* const bytes = static_cast<const std::uint8_t*>(self);
+    const unsigned int q0 = self
+        ? *reinterpret_cast<const std::uint32_t*>(bytes + 0xacu) : 0u;
+    const unsigned int q1 = self
+        ? *reinterpret_cast<const std::uint32_t*>(bytes + 0xbcu) : 0u;
+    const unsigned int q2 = self
+        ? *reinterpret_cast<const std::uint32_t*>(bytes + 0xccu) : 0u;
+    const std::uint32_t stored = g_textureDatabaseStoredTexels
+        ? __atomic_load_n(g_textureDatabaseStoredTexels, __ATOMIC_RELAXED) : 0u;
+    const auto databaseName = TextureDatabaseDebugName(self);
+    LOGI("[stream.texture.load] db=%s runtime=%p id=%u repeat=%u "
+         "flags=0x%04x->0x%04x result=%u wall/cpu=%.3f/%.3fms "
+         "stored_mtex=%.2f queues=%u/%u/%u",
+         databaseName.data(), self, texture, match->loads, beforeFlags,
+         readFlags(self, texture), loaded, wallMs, cpuMs,
+         static_cast<double>(stored) / 1048576.0, q0, q1, q2);
+    return loaded;
+}
+
+void OnProfileLoadRequestedModels() {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::ModelRequests);
+    const bool schedulerScope =
+        g_streamingSchedulerPatchActive.load(std::memory_order_acquire) &&
+        EnginePreProfileOwnedByCurrentThread() &&
+        g_stereoActive.load(std::memory_order_relaxed) && ShouldRunStereo();
+    void* const thread = __builtin_thread_pointer();
+    if (schedulerScope) {
+        g_streamingSchedulerScopeOwner.store(thread,
+                                             std::memory_order_release);
+    }
+    g_origProfileLoadRequestedModels();
+    if (schedulerScope) {
+        void* expected = thread;
+        g_streamingSchedulerScopeOwner.compare_exchange_strong(
+            expected, nullptr, std::memory_order_acq_rel,
+            std::memory_order_relaxed);
+    }
+}
+
+void OnProfileRequestModelStream(int channel) {
+    if (!g_origProfileRequestModelStream) return;
+    std::lock_guard<std::mutex> lock(g_streamingSchedulerCallMutex);
+    const bool gameplay =
+        g_streamingSchedulerPatchActive.load(std::memory_order_acquire) &&
+        g_streamingSchedulerScopeOwner.load(std::memory_order_acquire) ==
+            __builtin_thread_pointer();
+    if (gameplay) {
+        g_streamingSchedulerGameplayCalls.fetch_add(1,
+                                                    std::memory_order_relaxed);
+        if (!SetStreamingSchedulerCapacityInstruction(
+                g_streamingSchedulerLimitedCompare)) {
+            g_streamingSchedulerPatchActive.store(false,
+                                                  std::memory_order_release);
+        }
+        g_origProfileRequestModelStream(channel);
+        return;
+    }
+
+    g_streamingSchedulerRetailCalls.fetch_add(1, std::memory_order_relaxed);
+    const bool restoreLimited =
+        g_streamingSchedulerPatchActive.load(std::memory_order_acquire);
+    if (restoreLimited && !SetStreamingSchedulerCapacityInstruction(
+            kRequestModelStreamRetailCompare)) {
+        g_streamingSchedulerPatchActive.store(false,
+                                              std::memory_order_release);
+    }
+    g_origProfileRequestModelStream(channel);
+    if (restoreLimited &&
+        g_streamingSchedulerPatchActive.load(std::memory_order_acquire) &&
+        !SetStreamingSchedulerCapacityInstruction(
+            g_streamingSchedulerLimitedCompare)) {
+        g_streamingSchedulerPatchActive.store(false,
+                                              std::memory_order_release);
+    }
+}
+
+void OnProfileScriptsProcess() {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::Scripts);
+    g_origProfileScriptsProcess();
+}
+
+void OnProfilePathStreaming(void* self, bool loadScene) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::PathStreaming);
+    g_origProfilePathStreaming(self, loadScene);
+}
+
+void OnProfilePopulationUpdate(bool generate) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::Population);
+    g_origProfilePopulationUpdate(generate);
+}
+
+void OnProfileWorldProcess() {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::World);
+    g_origProfileWorldProcess();
+}
+
+void OnProfilePickupsUpdate() {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::Pickups);
+    g_origProfilePickupsUpdate();
+}
+
+void OnProfileCameraProcess(void* self) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::Camera);
+    g_origProfileCameraProcess(self);
+}
+
+void OnProfilePlantsUpdate(const void* cameraPosition) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::Plants);
+    g_origProfilePlantsUpdate(cameraPosition);
+}
+
+void OnProfileAudioService(void* self) {
+    ScopedGameUpdateTiming timing(GameUpdateSubsystem::Audio);
+    g_origProfileAudioService(self);
+}
+
+void InstallGameUpdateHitchProfiler() {
+    void* const gameHandle = dlopen("libGame.so", RTLD_NOLOAD | RTLD_NOW);
+    if (!gameHandle || !g.LoadBase) {
+        LOGW("[perf.hitch.game] profiler disabled: libGame handle/base unavailable");
+        if (gameHandle) dlclose(gameHandle);
+        return;
+    }
+
+    InstallTextureCacheBudgetPatch(gameHandle);
+
+    const auto install = [&](const char* label, const char* symbol,
+                             std::uintptr_t expectedOffset,
+                             const std::array<std::uint32_t, 4>& prologue,
+                             void* replacement) -> void* {
+        void* const target = dlsym(gameHandle, symbol);
+        const bool offsetMatches = target &&
+            reinterpret_cast<std::uintptr_t>(target) - g.LoadBase ==
+                expectedOffset;
+        const bool prologueMatches = offsetMatches && std::memcmp(
+            target, prologue.data(), sizeof(std::uint32_t) * prologue.size()) == 0;
+        if (!prologueMatches) {
+            LOGW("[perf.hitch.game] %s hook disabled target=%p offset_ok=%d "
+                 "prologue_ok=%d", label, target, offsetMatches ? 1 : 0,
+                 prologueMatches ? 1 : 0);
+            return nullptr;
+        }
+        void* const original = InstallTrampoline(target, replacement);
+        LOGI("[perf.hitch.game] %s hook=%d offset=0x%llx", label,
+             original ? 1 : 0,
+             static_cast<unsigned long long>(expectedOffset));
+        return original;
+    };
+
+    g_origProfileGameProcess = reinterpret_cast<GameUpdateVoidFn>(install(
+        "game", "_ZN5CGame7ProcessEv", 0x49608cu,
+        {0xfc1b0fe8u, 0xa900fbfdu, 0xf9000ff9u, 0xa9025ff8u},
+        reinterpret_cast<void*>(&OnProfileGameProcess)));
+    g_origProfileStreamingUpdate = reinterpret_cast<GameUpdateVoidFn>(install(
+        "stream", "_ZN10CStreaming6UpdateEv", 0x3ae8ecu,
+        {0xd101c3ffu, 0xfd0013e8u, 0xa902fbfdu, 0xf9001ff9u},
+        reinterpret_cast<void*>(&OnProfileStreamingUpdate)));
+    g_origProfileTextureDatabaseUpdate =
+        reinterpret_cast<TextureDatabaseUpdateFn>(install(
+            "texdb", "_ZN22TextureDatabaseRuntime15UpdateStreamingEfb",
+            0x795e3cu,
+            {0xd101c3ffu, 0xa9017bfdu, 0xa9026ffcu, 0xa90367fau},
+            reinterpret_cast<void*>(&OnProfileTextureDatabaseUpdate)));
+    g_origProfileTextureDatabasePump =
+        reinterpret_cast<TextureDatabasePumpFn>(install(
+            "texpump",
+            "_ZN22TextureDatabaseRuntime22UpdateTextureStreamingEjj",
+            0x796318u,
+            {0xa9bb7bfdu, 0xf9000bf9u, 0xa9025ff8u, 0xa90357f6u},
+            reinterpret_cast<void*>(&OnProfileTextureDatabasePump)));
+    g_origProfileTextureDatabaseLoad =
+        reinterpret_cast<TextureDatabaseLoadFn>(install(
+            "texload", "_ZN22TextureDatabaseRuntime15LoadFullTextureEj",
+            0x7957e8u,
+            {0xd10603ffu, 0xa9137bfdu, 0xa91467fcu, 0xa9155ff8u},
+            reinterpret_cast<void*>(&OnProfileTextureDatabaseLoad)));
+    g_origProfileTextureDatabaseOpen =
+        reinterpret_cast<TextureDatabaseOpenFn>(install(
+            "texopen",
+            "_ZN22TextureDatabaseRuntime4LoadEPKcb21TextureDatabaseFormat",
+            0x797a84u,
+            {0xa9bb7bfdu, 0xf9000bf9u, 0xa9025ff8u, 0xa90357f6u},
+            reinterpret_cast<void*>(&OnProfileTextureDatabaseOpen)));
+    g_origProfileLoadRequestedModels =
+        reinterpret_cast<GameUpdateVoidFn>(install(
+            "models", "_ZN10CStreaming19LoadRequestedModelsEv",
+            0x3b03acu,
+            {0xa9bd7bfdu, 0xa90157f6u, 0xa9024ff4u, 0x910003fdu},
+            reinterpret_cast<void*>(&OnProfileLoadRequestedModels)));
+    const int schedulerModels = RequestedStreamingSchedulerModels();
+    auto* const schedulerCapacity = reinterpret_cast<std::uint32_t*>(
+        g.LoadBase + kRequestModelStreamCapacityOffset);
+    static constexpr std::array<std::uint32_t, 4>
+        kExpectedSchedulerCapacitySequence = {
+            0xf1003b7fu, 0x91000769u, 0x54000128u, 0x79400b4au,
+        };
+    const bool schedulerFingerprint = schedulerModels >= 2 &&
+        schedulerCapacity && std::memcmp(
+            schedulerCapacity, kExpectedSchedulerCapacitySequence.data(),
+            sizeof(kExpectedSchedulerCapacitySequence)) == 0;
+    if (schedulerFingerprint) {
+        g_origProfileRequestModelStream =
+            reinterpret_cast<GameUpdateIntFn>(install(
+                "model_channel", "_ZN10CStreaming18RequestModelStreamEi",
+                kRequestModelStreamOffset,
+                {0xd10203ffu, 0xa9027bfdu, 0xa9036ffcu, 0xa90467fau},
+                reinterpret_cast<void*>(&OnProfileRequestModelStream)));
+    }
+    if (g_origProfileRequestModelStream && schedulerFingerprint) {
+        g_streamingSchedulerLimitedCompare =
+            StreamingSchedulerCompareInstruction(schedulerModels);
+        g_streamingSchedulerCapacityInstruction = schedulerCapacity;
+        const bool activated = SetStreamingSchedulerCapacityInstruction(
+            g_streamingSchedulerLimitedCompare);
+        g_streamingSchedulerPatchActive.store(activated,
+                                              std::memory_order_release);
+        LOGI("[stream.scheduler] requested=%d active=%d retail=%d "
+             "scope=LoadRequestedModels property=%s",
+             schedulerModels, activated ? 1 : 0,
+             kRequestModelStreamRetailModels,
+             kStreamingSchedulerModelsProperty);
+    } else {
+        LOGI("[stream.scheduler] requested=%d active=0 fingerprint=%d "
+             "hook=%d property=%s",
+             schedulerModels, schedulerFingerprint ? 1 : 0,
+             g_origProfileRequestModelStream ? 1 : 0,
+             kStreamingSchedulerModelsProperty);
+    }
+    g_origProfileScriptsProcess = reinterpret_cast<GameUpdateVoidFn>(install(
+        "scripts", "_ZN11CTheScripts7ProcessEv", 0x41233cu,
+        {0xd10243ffu, 0xfd0013eau, 0x6d0323e9u, 0xa9047bfdu},
+        reinterpret_cast<void*>(&OnProfileScriptsProcess)));
+    g_origProfilePathStreaming =
+        reinterpret_cast<GameUpdateSelfBoolFn>(install(
+            "path", "_ZN9CPathFind15UpdateStreamingEb", 0x3fdc28u,
+            {0xd101c3ffu, 0xa9017bfdu, 0xa9026ffcu, 0xa90367fau},
+            reinterpret_cast<void*>(&OnProfilePathStreaming)));
+    g_origProfilePopulationUpdate = reinterpret_cast<GameUpdateBoolFn>(install(
+        "population", "_ZN11CPopulation6UpdateEb", 0x5bf528u,
+        {0xfc1b0feeu, 0x6d00b3edu, 0x6d01abebu, 0x6d02a3e9u},
+        reinterpret_cast<void*>(&OnProfilePopulationUpdate)));
+    g_origProfileWorldProcess = reinterpret_cast<GameUpdateVoidFn>(install(
+        "world", "_ZN6CWorld7ProcessEv", 0x4ccb98u,
+        {0xa9bb7bfdu, 0xa90167fau, 0xa9025ff8u, 0xa90357f6u},
+        reinterpret_cast<void*>(&OnProfileWorldProcess)));
+    g_origProfilePickupsUpdate = reinterpret_cast<GameUpdateVoidFn>(install(
+        "pickups", "_ZN8CPickups6UpdateEv", 0x402ec0u,
+        {0xa9ba7bfdu, 0xf9000bfbu, 0xa90267fau, 0xa9035ff8u},
+        reinterpret_cast<void*>(&OnProfilePickupsUpdate)));
+    g_origProfileCameraProcess = reinterpret_cast<GameUpdateSelfFn>(install(
+        "camera", "_ZN7CCamera7ProcessEv", 0x470e98u,
+        {0xd10603ffu, 0xfd007becu, 0x6d102bebu, 0x6d1123e9u},
+        reinterpret_cast<void*>(&OnProfileCameraProcess)));
+    g_origProfilePlantsUpdate = reinterpret_cast<GameUpdateVectorFn>(install(
+        "plants", "_ZN9CPlantMgr6UpdateERK7CVector", 0x35f898u,
+        {0x6dbc23e9u, 0xa9017bfdu, 0xf90013f5u, 0xa9034ff4u},
+        reinterpret_cast<void*>(&OnProfilePlantsUpdate)));
+    g_origProfileAudioService = reinterpret_cast<GameUpdateSelfFn>(install(
+        "audio", "_ZN12CAudioEngine7ServiceEv", 0x3a8d34u,
+        {0xfc1c0fe8u, 0xa900fbfdu, 0xf9000ff7u, 0xa90257f6u},
+        reinterpret_cast<void*>(&OnProfileAudioService)));
+
+    const int installed = (g_origProfileGameProcess ? 1 : 0) +
+        (g_origProfileStreamingUpdate ? 1 : 0) +
+        (g_origProfileTextureDatabaseUpdate ? 1 : 0) +
+        (g_origProfileTextureDatabasePump ? 1 : 0) +
+        (g_origProfileTextureDatabaseLoad ? 1 : 0) +
+        (g_origProfileTextureDatabaseOpen ? 1 : 0) +
+        (g_origProfileLoadRequestedModels ? 1 : 0) +
+        (g_origProfileRequestModelStream ? 1 : 0) +
+        (g_origProfileScriptsProcess ? 1 : 0) +
+        (g_origProfilePathStreaming ? 1 : 0) +
+        (g_origProfilePopulationUpdate ? 1 : 0) +
+        (g_origProfileWorldProcess ? 1 : 0) +
+        (g_origProfilePickupsUpdate ? 1 : 0) +
+        (g_origProfileCameraProcess ? 1 : 0) +
+        (g_origProfilePlantsUpdate ? 1 : 0) +
+        (g_origProfileAudioService ? 1 : 0);
+    LOGI("[perf.hitch.game] profiler installed=%d/15 threshold=16ms log_cap=8/s",
+         installed);
+    dlclose(gameHandle);
+}
+#endif
+
+void InstallDynamicShadowSupport() {
+    void* const gameHandle = dlopen("libGame.so", RTLD_NOLOAD | RTLD_NOW);
+    if (!gameHandle || !g.LoadBase) {
+        LOGW("[shadow] libGame handle/base unavailable; dynamic-shadow bridge disabled");
+        if (gameHandle) dlclose(gameHandle);
+        return;
+    }
+
+    void* const settings = dlsym(
+        gameHandle, "_ZN14MobileSettings8settingsE");
+    void* const loaded = dlsym(
+        gameHandle, "_ZN14MobileSettings6loadedE");
+    void* const initialize = dlsym(
+        gameHandle, "_ZN14MobileSettings10InitializeEv");
+    void* const set = dlsym(
+        gameHandle, "_ZN14MobileSettings3SetE13MobileSettingi");
+    void* const useAdvanced = dlsym(gameHandle, "_Z18UseAdvancedShadowsi");
+    void* const realTimeUpdate = dlsym(
+        gameHandle, "_ZN22CRealTimeShadowManager6UpdateEv");
+    void* const menuSave = dlsym(gameHandle, "_Z17Menu_SaveSettingsv");
+    void* const storeVehicle = dlsym(
+        gameHandle, "_ZN8CShadows21StoreShadowForVehicleEP8CVehicle12VEH_SHD_TYPE");
+
+    const auto atOffset = [](const void* address, std::uintptr_t offset) {
+        return address && reinterpret_cast<std::uintptr_t>(address) - g.LoadBase == offset;
+    };
+    static constexpr std::uint32_t kInitializeDefaultWords[5] = {
+        0x52800049u, 0x52800c8au, 0x5280002bu, 0xb9001109u, 0xb900d909u,
+    };
+    static constexpr std::uint32_t kSetWords[4] = {
+        0x52800508u, 0xb0002669u, 0xf941e929u, 0xd503201fu,
+    };
+    static constexpr std::uint32_t kUseAdvancedWords[4] = {
+        0x90001288u, 0xf941e908u, 0xb940d908u, 0x7100091fu,
+    };
+    static constexpr std::uint32_t kRealTimeLevelGateWords[2] = {
+        0xb940d928u, 0x34001b68u,
+    };
+    static constexpr std::uint32_t kRenderSceneRouteWords[4] = {
+        0xb940da88u, 0x7100091fu, 0x54000061u, 0x940dabd7u,
+    };
+    static constexpr std::uint32_t kStoreVehiclePrologue[4] = {
+        0xd10343ffu, 0xfd003be8u, 0xa9087bfdu, 0xa90967fau,
+    };
+
+    const bool layoutFingerprint =
+        atOffset(settings, 0x8a7688u) &&
+        atOffset(loaded, 0x8a7c78u) &&
+        atOffset(initialize, 0x36a70cu) &&
+        atOffset(set, 0x36aaa8u) &&
+        atOffset(useAdvanced, 0x5e704cu) &&
+        atOffset(realTimeUpdate, 0x5e5d34u) &&
+        std::memcmp(reinterpret_cast<const void*>(g.LoadBase + 0x36a788u),
+                    kInitializeDefaultWords, sizeof(kInitializeDefaultWords)) == 0 &&
+        std::memcmp(set, kSetWords, sizeof(kSetWords)) == 0 &&
+        std::memcmp(useAdvanced, kUseAdvancedWords,
+                    sizeof(kUseAdvancedWords)) == 0 &&
+        std::memcmp(reinterpret_cast<const void*>(g.LoadBase + 0x5e5d68u),
+                    kRealTimeLevelGateWords,
+                    sizeof(kRealTimeLevelGateWords)) == 0;
+    const bool routeFingerprint = layoutFingerprint && g.RenderScene &&
+        atOffset(reinterpret_cast<const void*>(g.RenderScene), 0x498610u) &&
+        std::memcmp(reinterpret_cast<const void*>(g.LoadBase + 0x4987a8u),
+                    kRenderSceneRouteWords, sizeof(kRenderSceneRouteWords)) == 0;
+    const bool saveFingerprint = atOffset(menuSave, 0x71af48u);
+
+    if (layoutFingerprint) {
+        g_mobileSettingsBase = settings;
+        g_mobileSettingsLoaded = reinterpret_cast<bool*>(loaded);
+        g_mobileShadowLevel = reinterpret_cast<int*>(
+            static_cast<std::uint8_t*>(settings) + 0xd8u);
+        g_mobileSettingsSet = reinterpret_cast<MobileSettingsSetFn>(set);
+        g_menuSaveSettings = saveFingerprint
+            ? reinterpret_cast<MenuSaveSettingsFn>(menuSave) : nullptr;
+        g_dynamicShadowSettingsReady.store(true, std::memory_order_release);
+        g_dynamicShadowDirectRouteReady.store(
+            routeFingerprint, std::memory_order_release);
+        g_dynamicShadowDiagnostics.lastMobileLevel = ReadMobileShadowLevel();
+    }
+
+    bool vehicleFingerprint = layoutFingerprint &&
+        atOffset(storeVehicle, 0x5e707cu) &&
+        std::memcmp(storeVehicle, kStoreVehiclePrologue,
+                    sizeof(kStoreVehiclePrologue)) == 0;
+    if (vehicleFingerprint) {
+        g_origStoreShadowForVehicle =
+            reinterpret_cast<StoreShadowForVehicleFn>(InstallTrampoline(
+                storeVehicle, reinterpret_cast<void*>(&OnStoreShadowForVehicle)));
+    }
+    g_vehicleShadowBudgetHookReady.store(
+        g_origStoreShadowForVehicle != nullptr, std::memory_order_release);
+
+    LOGI("[shadow] retail211 layout=%d route=%d save=%d vehicle_hook=%d "
+         "default=ON mobile_initial=%d setting_off=0xD8 budget=%u",
+         layoutFingerprint ? 1 : 0, routeFingerprint ? 1 : 0,
+         saveFingerprint ? 1 : 0, g_origStoreShadowForVehicle ? 1 : 0,
+         ReadMobileShadowLevel(),
+         kVehicleShadowBudgetPerFrame);
+    dlclose(gameHandle);
+}
+
 // Retail 2.11 RenderQueue layout, proven against the ARM64 constructor and the
 // ProcessAll/ApplyQueued disassembly. The command buffer is linear: producer
 // writes at current, ApplyQueued publishes through published, and the renderer
 // advances read. All pointer mutation remains protected by RenderQueue::Lock.
 constexpr std::size_t kRqBufferStart = 0x410;
 constexpr std::size_t kRqBufferEnd = 0x418;
+constexpr std::size_t kRqBufferCapacity = 0x420;
 constexpr std::size_t kRqFlushRequested = 0x428;
 constexpr std::size_t kRqFinishRequested = 0x429;
 constexpr std::size_t kRqRead = 0x458;
 constexpr std::size_t kRqPublished = 0x460;
 constexpr std::size_t kRqCurrent = 0x468;
 constexpr unsigned int kRqHandlerSlots = 0x410 / sizeof(void*);
+constexpr char kRenderQueueStateCoalesceProperty[] =
+    "debug.savr.rq_state_coalesce";
+constexpr bool kDefaultRenderQueueStateCoalesce = true;
+constexpr unsigned int kRqSetVertexDescriptionCommand = 13u;
+constexpr unsigned int kRqSelectTextureCommand = 24u;
+constexpr unsigned int kRqSetAlphaTestCommand = 39u;
+constexpr unsigned int kRqSwapBuffersCommand = 46u;
+constexpr std::uintptr_t kRqSetVertexDescriptionHandlerOffset = 0x7903a0u;
+constexpr std::uintptr_t kRqSelectTextureHandlerOffset = 0x793a04u;
+constexpr std::uintptr_t kRqSetAlphaTestHandlerOffset = 0x793048u;
+constexpr std::uintptr_t kRqSwapBuffersHandlerOffset = 0x790d8cu;
+constexpr std::size_t kRqVertexDescriptionPayloadBytes = 0x90u;
+constexpr std::size_t kRqSelectTexturePayloadBytes = 0x0cu;
+constexpr std::size_t kRqAlphaTestPayloadBytes = 0x08u;
 constexpr char kRenderQueueCapacityProperty[] =
     "debug.savr.rq_capacity_mib";
-constexpr int kDefaultRenderQueueCapacityMiB = 2;
+// The 32 MiB A/B still filled to 32763 KiB and retained the same 6..10 ms
+// producer-wait clusters as the 8 MiB build. Capacity is therefore not the
+// root cause. Keep the low-memory default while retaining exact 16/32 MiB
+// property A/Bs and use the caller-LR profiler to identify the real flush site.
+constexpr int kDefaultRenderQueueCapacityMiB = 8;
 constexpr std::uintptr_t kRenderQueueConstructorCapacityOffset = 0x78c608u;
 constexpr std::uintptr_t kRenderQueueGlobalOffset = 0xd13a98u;
 constexpr std::uint32_t kRenderQueueRetailCapacityInstruction = 0x52a00201u;
 constexpr std::uint32_t kRenderQueueTwoMiBCapacityInstruction = 0x52a00401u;
+constexpr std::uint32_t kRenderQueueFourMiBCapacityInstruction = 0x52a00801u;
+constexpr std::uint32_t kRenderQueueEightMiBCapacityInstruction = 0x52a01001u;
+constexpr std::uint32_t kRenderQueueSixteenMiBCapacityInstruction = 0x52a02001u;
+constexpr std::uint32_t kRenderQueueThirtyTwoMiBCapacityInstruction = 0x52a04001u;
 
 using RenderQueueProcessAllFn = bool (*)(void* queue);
 using RenderQueueCommandFn = void (*)(char** cursor);
@@ -19734,6 +25058,1034 @@ std::atomic<std::uint64_t> g_rqConcurrentMaxUsedBytes{};
 std::atomic<std::uint64_t> g_rqConcurrentFaults{};
 std::atomic<std::uint64_t> g_rqConcurrentProducerOverlaps{};
 
+// Optional eye-set backing A/B.  Retail owns one std::vector at 410/418/420;
+// never replace that triple because its destructor performs a sized delete and
+// several handlers retain inline QueueData pointers until SetSafe.  Instead we
+// copy one immutable published prefix into private, process-lifetime storage,
+// reset the stock vector for the right eye, and replay the detached generation
+// first on RenderThread.  Two slots are enough: one queued/consuming and one
+// quarantine.  A retired slot is reusable only after both retail SetSafe calls.
+constexpr char kRenderQueueEyeSetBackingProperty[] =
+    "debug.savr.rq_eye_set_backing";
+constexpr bool kDefaultRenderQueueEyeSetBacking = true;
+constexpr unsigned int kRenderQueueEyeSetBackingSlots = 2u;
+constexpr std::uintptr_t kAtomicCompareExchangeByteOffset = 0x7f04e0u;
+constexpr std::uintptr_t kOsSemaphorePostOffset = 0x7d525cu;
+constexpr std::uintptr_t kOsSemaphorePostPltOffset = 0x7f5550u;
+constexpr std::uintptr_t kOsSemaphorePostGotOffset = 0x83f4e8u;
+constexpr std::uintptr_t kRenderQueueStopGlobalOffset = 0xd13ab0u;
+
+enum class RenderQueueEyeSetBackingState : std::uint8_t {
+    Free,
+    Queued,
+    Consuming,
+    Retired,
+    Faulted,
+};
+
+struct RenderQueueEyeSetBackingSlot {
+    char* allocation{};
+    std::size_t allocationBytes{};
+    char* begin{};
+    char* cursor{};
+    char* end{};
+    std::uint64_t generation{};
+    std::uint64_t stereoSequence{};
+    unsigned int eyeSet{};
+    RenderQueueEyeSetBackingState state{
+        RenderQueueEyeSetBackingState::Free};
+};
+
+struct RenderQueueEyeSetBackingCounters {
+    std::atomic<std::uint64_t> attempts{};
+    std::atomic<std::uint64_t> captures{};
+    std::atomic<std::uint64_t> emptyCaptures{};
+    std::atomic<std::uint64_t> copiedBytes{};
+    std::atomic<std::uint64_t> maxCopiedBytes{};
+    std::atomic<std::uint64_t> copyWallUs{};
+    std::atomic<std::uint64_t> cycleBusy{};
+    std::atomic<std::uint64_t> noPendingFinish{};
+    std::atomic<std::uint64_t> layoutRejects{};
+    std::atomic<std::uint64_t> noFreeSlot{};
+    std::atomic<std::uint64_t> flushRejects{};
+    std::atomic<std::uint64_t> ticketsConsumed{};
+    std::atomic<std::uint64_t> ticketCommands{};
+    std::atomic<std::uint64_t> ticketFaults{};
+    std::atomic<std::uint64_t> ticketWaits{};
+    std::atomic<std::uint64_t> ticketWaitWallUs{};
+    std::atomic<std::uint64_t> ticketWaitMaxUs{};
+};
+using OsSemaphorePostFn = void (*)(void* semaphore);
+
+std::array<RenderQueueEyeSetBackingSlot,
+           kRenderQueueEyeSetBackingSlots> g_rqEyeSetBackingSlots{};
+RenderQueueEyeSetBackingCounters g_rqEyeSetBackingCounters{};
+void* g_unusedAtomicCompareExchangeTrampoline{};
+OsSemaphorePostFn g_origOsSemaphorePost{};
+std::atomic<bool> g_rqEyeSetBackingHooksActive{false};
+std::atomic<bool> g_rqEyeSetBackingPoisoned{false};
+std::atomic<bool> g_rqRenderCycleHandshakeReady{false};
+std::atomic<void*> g_rqRenderThreadOwner{};
+std::uint64_t g_rqEyeSetBackingNextGeneration{1u}; // queue mutex protected
+// This word is deliberately not std::atomic: the byte-CAS hook below is
+// process-wide, so its pointer filter must run before any operation that could
+// itself lower to the same helper.  32-bit acquire/release builtins compile to
+// native ldar/stlr on ARM64 and cannot recurse through the byte helper.
+constexpr std::uint32_t kRqCycleActive = 1u << 0;
+constexpr std::uint32_t kRqCycleFlushService = 1u << 1;
+constexpr std::uint32_t kRqCycleFinishService = 1u << 2;
+alignas(4) std::uint32_t g_rqRenderCycleState{};
+alignas(4) std::uint32_t g_rqRenderCycleEpoch{};
+thread_local bool g_rqRenderCycleSawFlush{};
+std::mutex g_rqEyeSetBackingTicketMutex;
+std::condition_variable g_rqEyeSetBackingTicketCv;
+std::atomic<std::uint64_t> g_rqEyeSetBackingCompletedGeneration{};
+
+struct RenderQueueGpuTimerApi {
+    PFNGLGENQUERIESEXTPROC genQueries{};
+    PFNGLBEGINQUERYEXTPROC beginQuery{};
+    PFNGLENDQUERYEXTPROC endQuery{};
+    PFNGLGETQUERYOBJECTUIVEXTPROC getQueryObjectUiv{};
+    PFNGLGETQUERYOBJECTUI64VEXTPROC getQueryObjectUi64v{};
+
+    bool Available() const {
+        return genQueries && beginQuery && endQuery && getQueryObjectUiv &&
+            getQueryObjectUi64v;
+    }
+};
+
+const RenderQueueGpuTimerApi& GetRenderQueueGpuTimerApi() {
+    static const RenderQueueGpuTimerApi api{
+        .genQueries = reinterpret_cast<PFNGLGENQUERIESEXTPROC>(
+            eglGetProcAddress("glGenQueriesEXT")),
+        .beginQuery = reinterpret_cast<PFNGLBEGINQUERYEXTPROC>(
+            eglGetProcAddress("glBeginQueryEXT")),
+        .endQuery = reinterpret_cast<PFNGLENDQUERYEXTPROC>(
+            eglGetProcAddress("glEndQueryEXT")),
+        .getQueryObjectUiv =
+            reinterpret_cast<PFNGLGETQUERYOBJECTUIVEXTPROC>(
+                eglGetProcAddress("glGetQueryObjectuivEXT")),
+        .getQueryObjectUi64v =
+            reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(
+                eglGetProcAddress("glGetQueryObjectui64vEXT")),
+    };
+    return api;
+}
+
+bool GlExtensionPresent(const char* extensions, const char* name) {
+    if (!extensions || !name || *name == '\0') return false;
+    const std::size_t length = std::strlen(name);
+    const char* cursor = extensions;
+    while ((cursor = std::strstr(cursor, name)) != nullptr) {
+        const bool leftBoundary = cursor == extensions || cursor[-1] == ' ';
+        const char right = cursor[length];
+        if (leftBoundary && (right == '\0' || right == ' ')) return true;
+        cursor += length;
+    }
+    return false;
+}
+
+struct RenderQueueGpuQuery {
+    GLuint id{};
+    bool pending{};
+};
+
+struct RenderQueueConsumerWindow {
+    static constexpr std::size_t kGpuQueryCount = 8;
+    static constexpr double kGpuQueryIntervalMs = 13.0;
+
+    EGLContext context{EGL_NO_CONTEXT};
+    bool gpuTimerInitialized{};
+    bool gpuTimerSupported{};
+    std::array<RenderQueueGpuQuery, kGpuQueryCount> gpuQueries{};
+    std::size_t nextGpuQuery{};
+    std::size_t nextGpuPoll{};
+    int activeGpuQuery{-1};
+    double nextGpuQueryStartMs{};
+    std::uint64_t gpuSamples{};
+    std::uint64_t gpuDisjointSamples{};
+    std::uint64_t gpuQueryDrops{};
+    double gpuTotalMs{};
+    double gpuMaxMs{};
+    std::uint64_t gpuControlSamples{};
+    double gpuControlWallMs{};
+    double gpuControlCpuMs{};
+    double gpuControlMaxBlockedMs{};
+    std::uint64_t recycleSamples{};
+    double recycleWallMs{};
+    double recycleCpuMs{};
+    double recycleMaxBlockedMs{};
+
+    double windowStartMs{};
+    std::uint64_t batches{};
+    std::uint64_t commands{};
+    std::uint64_t bytes{};
+    std::uint64_t producerOverlaps{};
+    double wallMs{};
+    double cpuMs{};
+    double lockWallMs{};
+    double maxWallMs{};
+    double maxBlockedMs{};
+    double backlogBeforeBytes{};
+    double backlogAfterBytes{};
+    std::uint64_t maxBacklogBeforeBytes{};
+    std::uint64_t maxBacklogAfterBytes{};
+    std::array<std::uint64_t, kRqHandlerSlots> commandCounts{};
+    std::array<std::uint64_t, kRqHandlerSlots> commandBytes{};
+    std::array<std::uintptr_t, kRqHandlerSlots> commandHandlerOffsets{};
+    std::uint32_t handlerSampleState{0x6d2b79f5u};
+    std::array<std::uint64_t, kRqHandlerSlots> handlerSampleCounts{};
+    std::array<double, kRqHandlerSlots> handlerSampleWallMs{};
+    std::array<double, kRqHandlerSlots> handlerSampleCpuMs{};
+    std::array<double, kRqHandlerSlots> handlerSampleMaxBlockedMs{};
+    std::array<std::uint64_t, 3> coalesceSeen{};
+    std::array<std::uint64_t, 3> coalesceSkipped{};
+};
+
+constexpr char kRenderQueueGpuTimerProperty[] =
+    "debug.savr.rq_gpu_timer";
+
+bool RenderQueueGpuTimerRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = false;
+        if (__system_property_get(kRenderQueueGpuTimerProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[rq.gpu.timer] ignoring invalid %s=%s (valid 0 or 1)",
+                      kRenderQueueGpuTimerProperty, text);
+        }
+        LOGI("[rq.gpu.timer] requested=%d property=%s",
+             value ? 1 : 0, kRenderQueueGpuTimerProperty);
+        return value;
+    }();
+    return requested;
+}
+
+RenderQueueConsumerWindow& RenderQueueConsumerTelemetry() {
+    static thread_local RenderQueueConsumerWindow telemetry{};
+    return telemetry;
+}
+
+bool RenderQueueStateCoalesceRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = kDefaultRenderQueueStateCoalesce;
+        if (__system_property_get(
+                kRenderQueueStateCoalesceProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[rq.coalesce] ignoring invalid %s=%s (valid 0 or 1)",
+                      kRenderQueueStateCoalesceProperty, text);
+        }
+        return value;
+    }();
+    return requested;
+}
+
+struct RenderQueueBatchStateCache {
+    bool vertexDescriptionValid{};
+    std::array<std::uint8_t, kRqVertexDescriptionPayloadBytes>
+        vertexDescription{};
+    struct TextureSlot {
+        bool valid{};
+        std::uintptr_t texture{};
+    };
+    std::array<TextureSlot, 16> textures{};
+    bool alphaTestValid{};
+    std::array<std::uint8_t, kRqAlphaTestPayloadBytes> alphaTest{};
+};
+
+std::uintptr_t RenderQueueHandlerOffset(RenderQueueCommandFn handler) {
+    const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(handler);
+    return g.LoadBase && address >= g.LoadBase ? address - g.LoadBase : 0u;
+}
+
+void InvalidateRenderQueueStateCacheForCommand(
+        unsigned int command, std::uintptr_t handlerOffset,
+        RenderQueueBatchStateCache& cache) {
+    if (handlerOffset == 0x790974u || handlerOffset == 0x790cf0u ||
+        handlerOffset == 0x7934c0u) {
+        cache = {};
+        return;
+    }
+    // Vertex-buffer selection/CPU-data commands change the base consumed by
+    // rqSetVertexDescription even when its 0x90-byte descriptor is identical.
+    if (command < kRqSetVertexDescriptionCommand) {
+        cache.vertexDescriptionValid = false;
+    }
+    // Texture resource mutation can change the GL name stored at texture+0x30.
+    // Invalidate all slots for the exact retail texture-handler interval, while
+    // leaving rqSelectTexture itself eligible for coalescing below.
+    if (handlerOffset >= 0x793850u && handlerOffset <= 0x793c74u &&
+        handlerOffset != kRqSelectTextureHandlerOffset) {
+        for (auto& slot : cache.textures) slot.valid = false;
+    }
+}
+
+bool TryCoalesceRenderQueueStateCommand(
+        unsigned int command, RenderQueueCommandFn handler,
+        char*& cursor, const char* snapshotEnd,
+        RenderQueueBatchStateCache& cache,
+        RenderQueueConsumerWindow& telemetry) {
+    if (!RenderQueueStateCoalesceRequested()) return false;
+    const std::uintptr_t handlerOffset = RenderQueueHandlerOffset(handler);
+    InvalidateRenderQueueStateCacheForCommand(command, handlerOffset, cache);
+
+    if (command == kRqSetVertexDescriptionCommand &&
+        handlerOffset == kRqSetVertexDescriptionHandlerOffset) {
+        if (snapshotEnd - cursor <
+                static_cast<std::ptrdiff_t>(kRqVertexDescriptionPayloadBytes)) {
+            return false;
+        }
+        ++telemetry.coalesceSeen[0];
+        if (cache.vertexDescriptionValid &&
+            std::memcmp(cache.vertexDescription.data(), cursor,
+                        kRqVertexDescriptionPayloadBytes) == 0) {
+            cursor += kRqVertexDescriptionPayloadBytes;
+            ++telemetry.coalesceSkipped[0];
+            return true;
+        }
+        std::memcpy(cache.vertexDescription.data(), cursor,
+                    kRqVertexDescriptionPayloadBytes);
+        cache.vertexDescriptionValid = true;
+        return false;
+    }
+
+    if (command == kRqSelectTextureCommand &&
+        handlerOffset == kRqSelectTextureHandlerOffset) {
+        if (snapshotEnd - cursor <
+                static_cast<std::ptrdiff_t>(kRqSelectTexturePayloadBytes)) {
+            return false;
+        }
+        std::uintptr_t texture = 0u;
+        std::uint32_t stage = 0u;
+        std::memcpy(&texture, cursor, sizeof(texture));
+        std::memcpy(&stage, cursor + sizeof(texture), sizeof(stage));
+        if (stage >= cache.textures.size()) return false;
+        ++telemetry.coalesceSeen[1];
+        auto& slot = cache.textures[stage];
+        if (slot.valid && slot.texture == texture) {
+            cursor += kRqSelectTexturePayloadBytes;
+            ++telemetry.coalesceSkipped[1];
+            return true;
+        }
+        slot.valid = true;
+        slot.texture = texture;
+        return false;
+    }
+
+    if (command == kRqSetAlphaTestCommand &&
+        handlerOffset == kRqSetAlphaTestHandlerOffset) {
+        if (snapshotEnd - cursor <
+                static_cast<std::ptrdiff_t>(kRqAlphaTestPayloadBytes)) {
+            return false;
+        }
+        ++telemetry.coalesceSeen[2];
+        if (cache.alphaTestValid &&
+            std::memcmp(cache.alphaTest.data(), cursor,
+                        kRqAlphaTestPayloadBytes) == 0) {
+            cursor += kRqAlphaTestPayloadBytes;
+            ++telemetry.coalesceSkipped[2];
+            return true;
+        }
+        std::memcpy(cache.alphaTest.data(), cursor,
+                    kRqAlphaTestPayloadBytes);
+        cache.alphaTestValid = true;
+    }
+    return false;
+}
+
+struct RenderQueueSchedulerSnapshot {
+    bool valid{};
+    std::uint64_t runtimeNs{};
+    std::uint64_t runqueueNs{};
+    std::uint64_t slices{};
+    std::uint64_t voluntarySwitches{};
+    std::uint64_t involuntarySwitches{};
+};
+
+struct RenderQueueSchedulerWindow {
+    pid_t tid{};
+    bool previousValid{};
+    RenderQueueSchedulerSnapshot previous{};
+};
+
+RenderQueueSchedulerWindow& RenderQueueSchedulerTelemetry() {
+    static thread_local RenderQueueSchedulerWindow telemetry{};
+    return telemetry;
+}
+
+bool ReadRenderQueueSchedulerSnapshot(pid_t tid,
+                                      RenderQueueSchedulerSnapshot& snapshot) {
+    if (tid <= 0) return false;
+    char path[96]{};
+    std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", tid);
+    FILE* file = std::fopen(path, "r");
+    if (!file) return false;
+    unsigned long long runtimeNs = 0;
+    unsigned long long runqueueNs = 0;
+    unsigned long long slices = 0;
+    const bool schedRead = std::fscanf(file, "%llu %llu %llu", &runtimeNs,
+                                       &runqueueNs, &slices) == 3;
+    std::fclose(file);
+    if (!schedRead) return false;
+
+    snapshot = {};
+    snapshot.valid = true;
+    snapshot.runtimeNs = runtimeNs;
+    snapshot.runqueueNs = runqueueNs;
+    snapshot.slices = slices;
+
+    std::snprintf(path, sizeof(path), "/proc/self/task/%d/status", tid);
+    file = std::fopen(path, "r");
+    if (!file) return true;
+    char line[160]{};
+    while (std::fgets(line, sizeof(line), file)) {
+        unsigned long long value = 0;
+        if (std::sscanf(line, "voluntary_ctxt_switches: %llu", &value) == 1) {
+            snapshot.voluntarySwitches = value;
+        } else if (std::sscanf(
+                       line, "nonvoluntary_ctxt_switches: %llu", &value) == 1) {
+            snapshot.involuntarySwitches = value;
+        }
+    }
+    std::fclose(file);
+    return true;
+}
+
+long long ReadRenderQueueFrequency(const char* path) {
+    FILE* file = std::fopen(path, "r");
+    if (!file) return -1;
+    long long value = -1;
+    if (std::fscanf(file, "%lld", &value) != 1) value = -1;
+    std::fclose(file);
+    return value;
+}
+
+void ReportRenderQueueScheduler(double elapsedMs) {
+    RenderQueueSchedulerWindow& telemetry = RenderQueueSchedulerTelemetry();
+    if (telemetry.tid <= 0) telemetry.tid = gettid();
+    RenderQueueSchedulerSnapshot current{};
+    if (!ReadRenderQueueSchedulerSnapshot(telemetry.tid, current)) {
+        LOGW("[rq.sched] tid=%d snapshot=0", telemetry.tid);
+        telemetry.previousValid = false;
+        return;
+    }
+
+    const int core = sched_getcpu();
+    char cpuPath[128]{};
+    std::snprintf(cpuPath, sizeof(cpuPath),
+                  "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",
+                  std::max(0, core));
+    const long long cpuKHz = core >= 0
+        ? ReadRenderQueueFrequency(cpuPath) : -1;
+    const long long gpuHz = ReadRenderQueueFrequency(
+        "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq");
+
+    if (!telemetry.previousValid) {
+        LOGI("[rq.sched] tid=%d core=%d baseline=1 cpu_mhz=%.1f gpu_mhz=%.1f",
+             telemetry.tid, core,
+             cpuKHz >= 0 ? static_cast<double>(cpuKHz) / 1000.0 : -1.0,
+             gpuHz >= 0 ? static_cast<double>(gpuHz) / 1000000.0 : -1.0);
+    } else {
+        const auto delta = [](std::uint64_t now, std::uint64_t before) {
+            return now >= before ? now - before : 0u;
+        };
+        const double runtimeMs = static_cast<double>(delta(
+            current.runtimeNs, telemetry.previous.runtimeNs)) / 1000000.0;
+        const double runqueueMs = static_cast<double>(delta(
+            current.runqueueNs, telemetry.previous.runqueueNs)) / 1000000.0;
+        const double unaccountedMs = std::max(
+            0.0, elapsedMs - runtimeMs - runqueueMs);
+        LOGI("[rq.sched] tid=%d core=%d elapsed=%.1f "
+             "run/runq/sleep=%.1f/%.1f/%.1fms pct=%.1f/%.1f/%.1f "
+             "ctx=v/nv=%llu/%llu slices=%llu cpu_mhz=%.1f gpu_mhz=%.1f",
+             telemetry.tid, core, elapsedMs, runtimeMs, runqueueMs,
+             unaccountedMs,
+             runtimeMs * 100.0 / std::max(1.0, elapsedMs),
+             runqueueMs * 100.0 / std::max(1.0, elapsedMs),
+             unaccountedMs * 100.0 / std::max(1.0, elapsedMs),
+             static_cast<unsigned long long>(delta(
+                 current.voluntarySwitches,
+                 telemetry.previous.voluntarySwitches)),
+             static_cast<unsigned long long>(delta(
+                 current.involuntarySwitches,
+                 telemetry.previous.involuntarySwitches)),
+             static_cast<unsigned long long>(delta(
+                 current.slices, telemetry.previous.slices)),
+             cpuKHz >= 0 ? static_cast<double>(cpuKHz) / 1000.0 : -1.0,
+             gpuHz >= 0 ? static_cast<double>(gpuHz) / 1000000.0 : -1.0);
+    }
+    telemetry.previous = current;
+    telemetry.previousValid = true;
+}
+
+void InitializeRenderQueueGpuTimer(RenderQueueConsumerWindow& telemetry) {
+    const EGLContext context = eglGetCurrentContext();
+    if (telemetry.gpuTimerInitialized && telemetry.context == context) return;
+
+    // Queries belong to the consumer's current GLES context. On a context
+    // replacement abandon the tiny old ring rather than deleting names in the
+    // wrong context. No synchronous result read or GPU wait is ever issued.
+    telemetry.context = context;
+    telemetry.gpuTimerInitialized = true;
+    telemetry.gpuTimerSupported = false;
+    telemetry.gpuQueries = {};
+    telemetry.nextGpuQuery = 0;
+    telemetry.nextGpuPoll = 0;
+    telemetry.activeGpuQuery = -1;
+    telemetry.nextGpuQueryStartMs = 0.0;
+    if (!RenderQueueGpuTimerRequested()) return;
+    if (context == EGL_NO_CONTEXT) return;
+
+    const char* const extensions = reinterpret_cast<const char*>(
+        glGetString(GL_EXTENSIONS));
+    const RenderQueueGpuTimerApi& api = GetRenderQueueGpuTimerApi();
+    if (!api.Available() ||
+        !GlExtensionPresent(extensions, "GL_EXT_disjoint_timer_query")) {
+        return;
+    }
+
+    std::array<GLuint, RenderQueueConsumerWindow::kGpuQueryCount> ids{};
+    api.genQueries(static_cast<GLsizei>(ids.size()), ids.data());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        telemetry.gpuQueries[i].id = ids[i];
+    }
+    telemetry.gpuTimerSupported = std::all_of(
+        ids.begin(), ids.end(), [](GLuint id) { return id != 0u; });
+}
+
+void PollRenderQueueGpuTimers(RenderQueueConsumerWindow& telemetry) {
+    InitializeRenderQueueGpuTimer(telemetry);
+    if (!telemetry.gpuTimerSupported) return;
+
+    const RenderQueueGpuTimerApi& api = GetRenderQueueGpuTimerApi();
+    // Poll at most one oldest pending result per consumer batch. Availability
+    // checks are nonblocking, but walking the whole ring every batch would add
+    // avoidable driver traffic to the thread being measured.
+    for (std::size_t offset = 0; offset < telemetry.gpuQueries.size(); ++offset) {
+        const std::size_t index =
+            (telemetry.nextGpuPoll + offset) % telemetry.gpuQueries.size();
+        RenderQueueGpuQuery& query = telemetry.gpuQueries[index];
+        if (!query.pending) continue;
+        GLuint available = GL_FALSE;
+        api.getQueryObjectUiv(query.id, GL_QUERY_RESULT_AVAILABLE_EXT,
+                              &available);
+        if (available != GL_TRUE) return;
+
+        GLint disjoint = GL_FALSE;
+        glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+        GLuint64EXT elapsedNs = 0;
+        api.getQueryObjectUi64v(query.id, GL_QUERY_RESULT_EXT, &elapsedNs);
+        query.pending = false;
+        telemetry.nextGpuPoll = (index + 1u) % telemetry.gpuQueries.size();
+        if (disjoint != GL_FALSE) {
+            ++telemetry.gpuDisjointSamples;
+            return;
+        }
+        const double elapsedMs = static_cast<double>(elapsedNs) / 1000000.0;
+        telemetry.gpuTotalMs += elapsedMs;
+        telemetry.gpuMaxMs = std::max(telemetry.gpuMaxMs, elapsedMs);
+        ++telemetry.gpuSamples;
+        return;
+    }
+}
+
+void RecordRenderQueueControlTiming(
+        std::uint64_t& samples, double& wallTotalMs, double& cpuTotalMs,
+        double& maxBlockedMs, double wallStartMs, double cpuStartMs) {
+    const double wallMs = std::max(0.0, NowMs() - wallStartMs);
+    const double cpuMs = std::max(0.0, perf::ThreadCpuMs() - cpuStartMs);
+    ++samples;
+    wallTotalMs += wallMs;
+    cpuTotalMs += cpuMs;
+    maxBlockedMs = std::max(
+        maxBlockedMs, std::max(0.0, wallMs - cpuMs));
+}
+
+void BeginRenderQueueGpuTimer(RenderQueueConsumerWindow& telemetry) {
+    // Keep the normal player path entirely free of timer-query polling and
+    // timestamp work. On tile-based Adreno GPUs even asynchronous elapsed-time
+    // queries can occasionally force a tile/driver synchronization. OpenXR's
+    // compositor GPU timing remains available while this diagnostic is off.
+    if (!RenderQueueGpuTimerRequested()) return;
+    // ProcessAll can run 500-900 times per second. A GL timer around every tiny
+    // batch perturbs the driver we are measuring even when the profiler panel is
+    // hidden. One representative sample per display period retains useful GPU
+    // telemetry while removing almost all begin/end/query traffic.
+    const double nowMs = NowMs();
+    if (nowMs < telemetry.nextGpuQueryStartMs) return;
+    telemetry.nextGpuQueryStartMs = nowMs +
+        RenderQueueConsumerWindow::kGpuQueryIntervalMs;
+    const double controlWallStartMs = NowMs();
+    const double controlCpuStartMs = perf::ThreadCpuMs();
+    const auto recordControl = [&]() {
+        RecordRenderQueueControlTiming(
+            telemetry.gpuControlSamples, telemetry.gpuControlWallMs,
+            telemetry.gpuControlCpuMs, telemetry.gpuControlMaxBlockedMs,
+            controlWallStartMs, controlCpuStartMs);
+    };
+    PollRenderQueueGpuTimers(telemetry);
+    if (!telemetry.gpuTimerSupported || telemetry.activeGpuQuery >= 0) {
+        recordControl();
+        return;
+    }
+
+    for (std::size_t offset = 0; offset < telemetry.gpuQueries.size(); ++offset) {
+        const std::size_t index =
+            (telemetry.nextGpuQuery + offset) % telemetry.gpuQueries.size();
+        RenderQueueGpuQuery& query = telemetry.gpuQueries[index];
+        if (query.pending || query.id == 0u) continue;
+        GetRenderQueueGpuTimerApi().beginQuery(GL_TIME_ELAPSED_EXT, query.id);
+        telemetry.activeGpuQuery = static_cast<int>(index);
+        telemetry.nextGpuQuery = (index + 1u) % telemetry.gpuQueries.size();
+        recordControl();
+        return;
+    }
+    ++telemetry.gpuQueryDrops;
+    recordControl();
+}
+
+void EndRenderQueueGpuTimer(RenderQueueConsumerWindow& telemetry) {
+    if (!telemetry.gpuTimerSupported || telemetry.activeGpuQuery < 0) return;
+    const double controlWallStartMs = NowMs();
+    const double controlCpuStartMs = perf::ThreadCpuMs();
+    GetRenderQueueGpuTimerApi().endQuery(GL_TIME_ELAPSED_EXT);
+    telemetry.gpuQueries[static_cast<std::size_t>(
+        telemetry.activeGpuQuery)].pending = true;
+    telemetry.activeGpuQuery = -1;
+    RecordRenderQueueControlTiming(
+        telemetry.gpuControlSamples, telemetry.gpuControlWallMs,
+        telemetry.gpuControlCpuMs, telemetry.gpuControlMaxBlockedMs,
+        controlWallStartMs, controlCpuStartMs);
+}
+
+int PendingRenderQueueGpuTimers(const RenderQueueConsumerWindow& telemetry) {
+    return static_cast<int>(std::count_if(
+        telemetry.gpuQueries.begin(), telemetry.gpuQueries.end(),
+        [](const RenderQueueGpuQuery& query) { return query.pending; }));
+}
+
+std::array<int, 5> TopRenderQueueCommands(
+        const std::array<std::uint64_t, kRqHandlerSlots>& metric) {
+    std::array<int, 5> top{-1, -1, -1, -1, -1};
+    for (unsigned int command = 0; command < kRqHandlerSlots; ++command) {
+        if (metric[command] == 0u) continue;
+        for (std::size_t rank = 0; rank < top.size(); ++rank) {
+            if (top[rank] >= 0 && metric[command] <=
+                    metric[static_cast<unsigned int>(top[rank])]) {
+                continue;
+            }
+            for (std::size_t shift = top.size() - 1u; shift > rank; --shift) {
+                top[shift] = top[shift - 1u];
+            }
+            top[rank] = static_cast<int>(command);
+            break;
+        }
+    }
+    return top;
+}
+
+unsigned int RenderQueueCommandId(const std::array<int, 5>& top,
+                                  std::size_t rank) {
+    return top[rank] >= 0 ? static_cast<unsigned int>(top[rank]) : 0u;
+}
+
+std::uint64_t RenderQueueCommandMetric(
+        const std::array<std::uint64_t, kRqHandlerSlots>& metric,
+        const std::array<int, 5>& top, std::size_t rank) {
+    return top[rank] >= 0
+        ? metric[static_cast<unsigned int>(top[rank])] : 0u;
+}
+
+std::uintptr_t RenderQueueCommandHandlerOffset(
+        const RenderQueueConsumerWindow& telemetry,
+        const std::array<int, 5>& top, std::size_t rank) {
+    return top[rank] >= 0
+        ? telemetry.commandHandlerOffsets[
+              static_cast<unsigned int>(top[rank])] : 0u;
+}
+
+double RenderQueueHandlerSampleAverage(
+        const RenderQueueConsumerWindow& telemetry,
+        const std::array<double, kRqHandlerSlots>& metric,
+        unsigned int command) {
+    if (command >= kRqHandlerSlots ||
+        telemetry.handlerSampleCounts[command] == 0u) {
+        return 0.0;
+    }
+    return metric[command] / static_cast<double>(
+        telemetry.handlerSampleCounts[command]);
+}
+
+bool RenderQueueHandlerIsHot(unsigned int command) {
+    return command == 13u || command == 14u || command == 17u ||
+        command == 24u || command == 39u;
+}
+
+constexpr char kRenderQueueDeepHandlerProfileProperty[] =
+    "debug.savr.rq_handler_profile";
+
+bool RenderQueueDeepHandlerProfileRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = false;
+        if (__system_property_get(
+                kRenderQueueDeepHandlerProfileProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[rq.handler] ignoring invalid %s=%s (valid 0 or 1)",
+                      kRenderQueueDeepHandlerProfileProperty, text);
+        }
+        return value;
+    }();
+    return requested;
+}
+
+double RenderQueueHandlerSampleWeight(unsigned int command) {
+    if (command == 3u || command == 46u) return 1.0;
+    return RenderQueueHandlerIsHot(command) ? 64.0 : 4.0;
+}
+
+double RenderQueueHandlerEstimatedBlockedMs(
+        const RenderQueueConsumerWindow& telemetry, unsigned int command) {
+    if (command >= kRqHandlerSlots) return 0.0;
+    return std::max(
+        0.0,
+        telemetry.handlerSampleWallMs[command] -
+            telemetry.handlerSampleCpuMs[command]) *
+        RenderQueueHandlerSampleWeight(command);
+}
+
+std::array<int, 8> TopRenderQueueBlockedHandlers(
+        const RenderQueueConsumerWindow& telemetry) {
+    std::array<int, 8> top{-1, -1, -1, -1, -1, -1, -1, -1};
+    for (unsigned int command = 0; command < kRqHandlerSlots; ++command) {
+        if (telemetry.handlerSampleCounts[command] == 0u) continue;
+        const double value = RenderQueueHandlerEstimatedBlockedMs(
+            telemetry, command);
+        for (std::size_t rank = 0; rank < top.size(); ++rank) {
+            if (top[rank] >= 0 && value <=
+                    RenderQueueHandlerEstimatedBlockedMs(
+                        telemetry, static_cast<unsigned int>(top[rank]))) {
+                continue;
+            }
+            for (std::size_t shift = top.size() - 1u; shift > rank; --shift) {
+                top[shift] = top[shift - 1u];
+            }
+            top[rank] = static_cast<int>(command);
+            break;
+        }
+    }
+    return top;
+}
+
+void LogRenderQueueBlockedHandler(
+        const RenderQueueConsumerWindow& telemetry, std::size_t rank,
+        int command) {
+    if (command < 0) {
+        return;
+    }
+    const unsigned int id = static_cast<unsigned int>(command);
+    LOGI("[rq.handler.top] rank=%zu policy=swap46_all/deep_property "
+         "id=%u off=%llx n=%llu wall/cpu/block/max="
+         "%.4f/%.4f/%.4f/%.4f est_block_ms=%.3f",
+         rank,
+         id,
+         static_cast<unsigned long long>(
+             telemetry.commandHandlerOffsets[id]),
+         static_cast<unsigned long long>(
+             telemetry.handlerSampleCounts[id]),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, id),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleCpuMs, id),
+         std::max(0.0,
+             RenderQueueHandlerSampleAverage(
+                 telemetry, telemetry.handlerSampleWallMs, id) -
+             RenderQueueHandlerSampleAverage(
+                 telemetry, telemetry.handlerSampleCpuMs, id)),
+         telemetry.handlerSampleMaxBlockedMs[id],
+         RenderQueueHandlerEstimatedBlockedMs(telemetry, id));
+}
+
+void RecordRenderQueueConsumerBatch(
+        double wallMs, double cpuMs, double lockWallMs,
+        std::uint64_t commands, std::uint64_t bytes,
+        std::uint64_t backlogBeforeBytes, std::uint64_t backlogAfterBytes,
+        bool producerOverlap) {
+    RenderQueueConsumerWindow& telemetry = RenderQueueConsumerTelemetry();
+    const double nowMs = NowMs();
+    if (telemetry.windowStartMs <= 0.0) telemetry.windowStartMs = nowMs;
+    ++telemetry.batches;
+    telemetry.commands += commands;
+    telemetry.bytes += bytes;
+    telemetry.producerOverlaps += producerOverlap ? 1u : 0u;
+    telemetry.wallMs += wallMs;
+    telemetry.cpuMs += cpuMs;
+    telemetry.lockWallMs += lockWallMs;
+    telemetry.maxWallMs = std::max(telemetry.maxWallMs, wallMs);
+    telemetry.maxBlockedMs = std::max(
+        telemetry.maxBlockedMs, std::max(0.0, wallMs - cpuMs));
+    telemetry.backlogBeforeBytes += static_cast<double>(backlogBeforeBytes);
+    telemetry.backlogAfterBytes += static_cast<double>(backlogAfterBytes);
+    telemetry.maxBacklogBeforeBytes = std::max(
+        telemetry.maxBacklogBeforeBytes, backlogBeforeBytes);
+    telemetry.maxBacklogAfterBytes = std::max(
+        telemetry.maxBacklogAfterBytes, backlogAfterBytes);
+
+    const double elapsedMs = nowMs - telemetry.windowStartMs;
+    if (elapsedMs < 1000.0 || telemetry.batches == 0u) return;
+
+    const double batches = static_cast<double>(telemetry.batches);
+    const double blockedMs = std::max(0.0, telemetry.wallMs - telemetry.cpuMs);
+    LOGI("[rq.consume] hz=%.2f batches=%llu cmd_avg=%.1f kb_avg=%.1f "
+         "wall/cpu/block_avg=%.3f/%.3f/%.3f max_wall/block=%.3f/%.3f "
+         "lock_avg=%.3f backlog_pre/post_avg_kb=%.1f/%.1f "
+         "backlog_pre/post_max_kb=%llu/%llu overlap=%llu "
+         "gpu=%d gpu_ms_avg/max=%.3f/%.3f gpu_n/disjoint/drop/pending=%llu/%llu/%llu/%d",
+         batches * 1000.0 / std::max(1.0, elapsedMs),
+         static_cast<unsigned long long>(telemetry.batches),
+         static_cast<double>(telemetry.commands) / batches,
+         static_cast<double>(telemetry.bytes) / batches / 1024.0,
+         telemetry.wallMs / batches, telemetry.cpuMs / batches,
+         blockedMs / batches, telemetry.maxWallMs,
+         telemetry.maxBlockedMs, telemetry.lockWallMs / batches,
+         telemetry.backlogBeforeBytes / batches / 1024.0,
+         telemetry.backlogAfterBytes / batches / 1024.0,
+         static_cast<unsigned long long>(
+             telemetry.maxBacklogBeforeBytes / 1024u),
+         static_cast<unsigned long long>(
+             telemetry.maxBacklogAfterBytes / 1024u),
+         static_cast<unsigned long long>(telemetry.producerOverlaps),
+         telemetry.gpuTimerSupported ? 1 : 0,
+         telemetry.gpuSamples != 0u
+             ? telemetry.gpuTotalMs / static_cast<double>(telemetry.gpuSamples)
+             : 0.0,
+         telemetry.gpuMaxMs,
+         static_cast<unsigned long long>(telemetry.gpuSamples),
+         static_cast<unsigned long long>(telemetry.gpuDisjointSamples),
+         static_cast<unsigned long long>(telemetry.gpuQueryDrops),
+         PendingRenderQueueGpuTimers(telemetry));
+
+    const std::array<int, 5> topBytes = TopRenderQueueCommands(
+        telemetry.commandBytes);
+    const std::array<int, 5> topCounts = TopRenderQueueCommands(
+        telemetry.commandCounts);
+    LOGI("[rq.commands] bytes=id@off:count/kib "
+         "%u@%llx:%llu/%llu %u@%llx:%llu/%llu %u@%llx:%llu/%llu "
+         "%u@%llx:%llu/%llu %u@%llx:%llu/%llu; "
+         "counts=id@off:count/kib "
+         "%u@%llx:%llu/%llu %u@%llx:%llu/%llu %u@%llx:%llu/%llu "
+         "%u@%llx:%llu/%llu %u@%llx:%llu/%llu",
+         RenderQueueCommandId(topBytes, 0),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topBytes, 0)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topBytes, 0)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topBytes, 0) / 1024u),
+         RenderQueueCommandId(topBytes, 1),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topBytes, 1)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topBytes, 1)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topBytes, 1) / 1024u),
+         RenderQueueCommandId(topBytes, 2),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topBytes, 2)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topBytes, 2)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topBytes, 2) / 1024u),
+         RenderQueueCommandId(topBytes, 3),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topBytes, 3)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topBytes, 3)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topBytes, 3) / 1024u),
+         RenderQueueCommandId(topBytes, 4),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topBytes, 4)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topBytes, 4)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topBytes, 4) / 1024u),
+         RenderQueueCommandId(topCounts, 0),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topCounts, 0)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topCounts, 0)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topCounts, 0) / 1024u),
+         RenderQueueCommandId(topCounts, 1),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topCounts, 1)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topCounts, 1)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topCounts, 1) / 1024u),
+         RenderQueueCommandId(topCounts, 2),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topCounts, 2)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topCounts, 2)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topCounts, 2) / 1024u),
+         RenderQueueCommandId(topCounts, 3),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topCounts, 3)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topCounts, 3)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topCounts, 3) / 1024u),
+         RenderQueueCommandId(topCounts, 4),
+         static_cast<unsigned long long>(RenderQueueCommandHandlerOffset(
+             telemetry, topCounts, 4)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandCounts, topCounts, 4)),
+         static_cast<unsigned long long>(RenderQueueCommandMetric(
+             telemetry.commandBytes, topCounts, 4) / 1024u));
+
+    // Swap command 46 remains cheap enough to time on every frame. Deep
+    // per-handler timing is opt-in because its clocks otherwise run tens of
+    // thousands of times per second in the retail command stream.
+    LOGI("[rq.handler] policy=swap46_all/deep_property deep=%d "
+         "id:n:w/c/b/max "
+         "3:%llu:%.4f/%.4f/%.4f/%.4f "
+         "13:%llu:%.4f/%.4f/%.4f/%.4f "
+         "14:%llu:%.4f/%.4f/%.4f/%.4f "
+         "17:%llu:%.4f/%.4f/%.4f/%.4f "
+         "24:%llu:%.4f/%.4f/%.4f/%.4f "
+         "39:%llu:%.4f/%.4f/%.4f/%.4f",
+         RenderQueueDeepHandlerProfileRequested() ? 1 : 0,
+         static_cast<unsigned long long>(telemetry.handlerSampleCounts[3]),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 3),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleCpuMs, 3),
+         std::max(0.0, RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 3) -
+             RenderQueueHandlerSampleAverage(
+                 telemetry, telemetry.handlerSampleCpuMs, 3)),
+         telemetry.handlerSampleMaxBlockedMs[3],
+         static_cast<unsigned long long>(telemetry.handlerSampleCounts[13]),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 13),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleCpuMs, 13),
+         std::max(0.0, RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 13) -
+             RenderQueueHandlerSampleAverage(
+                 telemetry, telemetry.handlerSampleCpuMs, 13)),
+         telemetry.handlerSampleMaxBlockedMs[13],
+         static_cast<unsigned long long>(telemetry.handlerSampleCounts[14]),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 14),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleCpuMs, 14),
+         std::max(0.0, RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 14) -
+             RenderQueueHandlerSampleAverage(
+                 telemetry, telemetry.handlerSampleCpuMs, 14)),
+         telemetry.handlerSampleMaxBlockedMs[14],
+         static_cast<unsigned long long>(telemetry.handlerSampleCounts[17]),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 17),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleCpuMs, 17),
+         std::max(0.0, RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 17) -
+             RenderQueueHandlerSampleAverage(
+                 telemetry, telemetry.handlerSampleCpuMs, 17)),
+         telemetry.handlerSampleMaxBlockedMs[17],
+         static_cast<unsigned long long>(telemetry.handlerSampleCounts[24]),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 24),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleCpuMs, 24),
+         std::max(0.0, RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 24) -
+             RenderQueueHandlerSampleAverage(
+                 telemetry, telemetry.handlerSampleCpuMs, 24)),
+         telemetry.handlerSampleMaxBlockedMs[24],
+         static_cast<unsigned long long>(telemetry.handlerSampleCounts[39]),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 39),
+         RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleCpuMs, 39),
+         std::max(0.0, RenderQueueHandlerSampleAverage(
+             telemetry, telemetry.handlerSampleWallMs, 39) -
+             RenderQueueHandlerSampleAverage(
+                 telemetry, telemetry.handlerSampleCpuMs, 39)),
+         telemetry.handlerSampleMaxBlockedMs[39]);
+    const std::array<int, 8> topBlocked = TopRenderQueueBlockedHandlers(
+        telemetry);
+    for (std::size_t rank = 0; rank < topBlocked.size(); ++rank) {
+        LogRenderQueueBlockedHandler(telemetry, rank, topBlocked[rank]);
+    }
+    const auto controlAverage = [](double total, std::uint64_t count) {
+        return count != 0u ? total / static_cast<double>(count) : 0.0;
+    };
+    LOGI("[rq.control] gpu n=%llu wall/cpu/block/max="
+         "%.4f/%.4f/%.4f/%.4f recycle n=%llu wall/cpu/block/max="
+         "%.4f/%.4f/%.4f/%.4f",
+         static_cast<unsigned long long>(telemetry.gpuControlSamples),
+         controlAverage(
+             telemetry.gpuControlWallMs, telemetry.gpuControlSamples),
+         controlAverage(
+             telemetry.gpuControlCpuMs, telemetry.gpuControlSamples),
+         std::max(0.0,
+             controlAverage(
+                 telemetry.gpuControlWallMs, telemetry.gpuControlSamples) -
+             controlAverage(
+                 telemetry.gpuControlCpuMs, telemetry.gpuControlSamples)),
+         telemetry.gpuControlMaxBlockedMs,
+         static_cast<unsigned long long>(telemetry.recycleSamples),
+         controlAverage(telemetry.recycleWallMs, telemetry.recycleSamples),
+         controlAverage(telemetry.recycleCpuMs, telemetry.recycleSamples),
+         std::max(0.0,
+             controlAverage(
+                 telemetry.recycleWallMs, telemetry.recycleSamples) -
+             controlAverage(
+                 telemetry.recycleCpuMs, telemetry.recycleSamples)),
+         telemetry.recycleMaxBlockedMs);
+    LOGI("[rq.coalesce] active=%d vertex seen/skip=%llu/%llu "
+         "texture=%llu/%llu alpha=%llu/%llu",
+         RenderQueueStateCoalesceRequested() ? 1 : 0,
+         static_cast<unsigned long long>(telemetry.coalesceSeen[0]),
+         static_cast<unsigned long long>(telemetry.coalesceSkipped[0]),
+         static_cast<unsigned long long>(telemetry.coalesceSeen[1]),
+         static_cast<unsigned long long>(telemetry.coalesceSkipped[1]),
+         static_cast<unsigned long long>(telemetry.coalesceSeen[2]),
+         static_cast<unsigned long long>(telemetry.coalesceSkipped[2]));
+    ReportRenderQueueScheduler(elapsedMs);
+
+    const EGLContext context = telemetry.context;
+    const bool gpuTimerInitialized = telemetry.gpuTimerInitialized;
+    const bool gpuTimerSupported = telemetry.gpuTimerSupported;
+    const auto gpuQueries = telemetry.gpuQueries;
+    const std::size_t nextGpuQuery = telemetry.nextGpuQuery;
+    const std::size_t nextGpuPoll = telemetry.nextGpuPoll;
+    const int activeGpuQuery = telemetry.activeGpuQuery;
+    const double nextGpuQueryStartMs = telemetry.nextGpuQueryStartMs;
+    const std::uint32_t handlerSampleState = telemetry.handlerSampleState;
+    telemetry = {};
+    telemetry.context = context;
+    telemetry.gpuTimerInitialized = gpuTimerInitialized;
+    telemetry.gpuTimerSupported = gpuTimerSupported;
+    telemetry.gpuQueries = gpuQueries;
+    telemetry.nextGpuQuery = nextGpuQuery;
+    telemetry.nextGpuPoll = nextGpuPoll;
+    telemetry.activeGpuQuery = activeGpuQuery;
+    telemetry.nextGpuQueryStartMs = nextGpuQueryStartMs;
+    telemetry.handlerSampleState = handlerSampleState;
+    telemetry.windowStartMs = nowMs;
+}
+
 // Retail 2.11 routes every queue semaphore wait through one fingerprinted PLT
 // slot.  Finish uses the semaphore global at +0x10 from renderQueue, while
 // producer flush/capacity waits use +0x08.  Hooking this GOT entry avoids the
@@ -19744,6 +26096,23 @@ constexpr std::uintptr_t kOsSemaphoreWaitGotOffset = 0x83f4f8u;
 constexpr std::uintptr_t kRqProducerSemaphoreGlobalOffset = 0xd13aa0u;
 constexpr std::uintptr_t kRqFinishSemaphoreGlobalOffset = 0xd13aa8u;
 constexpr std::uintptr_t kRqSizedFlushReturnOffset = 0x78d3acu;
+constexpr std::uintptr_t kRqFlushSymbolOffset = 0x78cf60u;
+constexpr std::uintptr_t kRqFlushPltOffset = 0x7f6f10u;
+constexpr std::uintptr_t kRqFlushGotOffset = 0x8401c8u;
+constexpr std::uintptr_t kTextureUploadMipFlushReturnOffset = 0x794e90u;
+constexpr char kTextureUploadBatchProperty[] =
+    "debug.savr.texture_upload_batch";
+// Deferring UploadMip's synchronous retail Flush across texture lifetimes can
+// expose an object before all of its mips are complete. Runtime evidence was
+// unambiguous: large deferred batches coincided with blue traffic lights and
+// trees. Keep the experiment available only as an explicit property A/B;
+// correctness defaults to the exact retail per-mip synchronization contract.
+constexpr bool kDefaultTextureUploadBatch = false;
+// Retail UploadMip can issue 40..96 synchronous Flush calls in one frame.
+// Keep a bounded emergency drain even though ApplyQueued independently retains
+// its exact end-of-buffer backpressure.  This is a safety ceiling, not the
+// normal batching cadence.
+constexpr unsigned int kTextureUploadBatchEmergencyLimit = 128u;
 constexpr std::uintptr_t kRqFinishSymbolOffset = 0x78cf78u;
 constexpr std::uintptr_t kRqFinishPltOffset = 0x813490u;
 constexpr std::uintptr_t kRqFinishGotOffset = 0x84e488u;
@@ -19751,10 +26120,48 @@ constexpr std::uintptr_t kRqFinishCallerReturnOffset = 0x778478u;
 constexpr char kRenderQueueFinishDeferProperty[] =
     "debug.savr.rq_defer_finish";
 constexpr bool kDefaultRenderQueueFinishDefer = true;
+constexpr char kRenderQueueFinishEyeOverlapProperty[] =
+    "debug.savr.rq_finish_eye_overlap";
+constexpr bool kDefaultRenderQueueFinishEyeOverlap = true;
+constexpr char kRenderQueueFinishEyeSetOverlapProperty[] =
+    "debug.savr.rq_finish_eye_set_overlap";
+// Extending the proven left-eye overlap through the right eye is a bounded,
+// same-frame experiment. Keep the public default on the accepted after-left
+// drain point; a device property enables the A/B without changing retail
+// fallback or widening any lifetime into a later game frame.
+constexpr bool kDefaultRenderQueueFinishEyeSetOverlap = false;
 using OsSemaphoreWaitFn = void (*)(void* semaphore);
+using RenderQueueFlushFn = void (*)(void* queue);
 using RenderQueueFinishFn = void (*)(void* queue);
+using TextureDatabaseLoadInstanceFn = void* (*)(void* entry,
+                                                 const void* listing);
+using RwOpenGLRasterUnlockFn = int (*)(void* instance, void* raster,
+                                       int accessMode);
 OsSemaphoreWaitFn g_origOsSemaphoreWait{};
+RenderQueueFlushFn g_retailRenderQueueFlush{};
 RenderQueueFinishFn g_origRenderQueueFinish{};
+TextureDatabaseLoadInstanceFn g_origTextureDatabaseLoadInstance{};
+RwOpenGLRasterUnlockFn g_origRwOpenGLRasterUnlock{};
+std::atomic<bool> g_textureUploadBatchHookActive{false};
+std::atomic<std::uint64_t> g_textureUploadBatchDeferredTotal{};
+std::atomic<std::uint64_t> g_textureUploadBatchDrainTotal{};
+std::atomic<std::uint64_t> g_textureUploadBatchFaults{};
+std::atomic<std::uint64_t> g_textureUploadBatchScopes{};
+
+struct TextureUploadBatchState {
+    void* queue{};
+    unsigned int deferredCalls{};
+    bool draining{};
+};
+
+thread_local TextureUploadBatchState g_textureUploadBatchState{};
+thread_local unsigned int g_textureLoadInstanceDepth{};
+thread_local unsigned int g_textureRasterUnlockDepth{};
+
+bool TextureUploadTransactionActive() {
+    return g_textureLoadInstanceDepth != 0u ||
+        g_textureRasterUnlockDepth != 0u;
+}
 
 struct DeferredRenderQueueFinishState {
     bool pending{};
@@ -19792,6 +26199,43 @@ struct RenderQueueWaitTiming {
     double wallMs{};
     double cpuMs{};
 };
+
+void RecordRenderQueueUnsizedCaller(
+        EnginePreProfile& profile, std::uintptr_t returnAddress,
+        EnginePreStage stage, const RenderQueueWaitTiming& timing) {
+    std::uintptr_t offset = 0;
+    if (g.LoadBase && returnAddress >= g.LoadBase) {
+        const std::uintptr_t candidate = returnAddress - g.LoadBase;
+        if (candidate < 0x02000000u) offset = candidate;
+    }
+
+    EnginePreProfile::RqUnsizedCaller* slot = nullptr;
+    for (auto& caller : profile.rqUnsizedCallers) {
+        if (caller.calls > 0 && caller.offset == offset) {
+            slot = &caller;
+            break;
+        }
+        if (!slot && caller.calls == 0) slot = &caller;
+    }
+    if (!slot || (slot->calls > 0 && slot->offset != offset)) {
+        ++profile.rqUnsizedCallerOverflowCalls;
+        profile.rqUnsizedCallerOverflowWallMs += timing.wallMs;
+        profile.rqUnsizedCallerOverflowCpuMs += timing.cpuMs;
+        return;
+    }
+
+    if (slot->calls == 0) slot->offset = offset;
+    ++slot->calls;
+    slot->wallMs += timing.wallMs;
+    slot->cpuMs += timing.cpuMs;
+    slot->maxWallMs = std::max(slot->maxWallMs, timing.wallMs);
+    switch (stage) {
+    case EnginePreStage::BeforeMainScan: ++slot->beforeScanCalls; break;
+    case EnginePreStage::MainScan: ++slot->mainScanCalls; break;
+    case EnginePreStage::AfterMainScan: ++slot->afterScanCalls; break;
+    case EnginePreStage::Inactive: break;
+    }
+}
 
 RenderQueueWaitTiming PerformProfiledRenderQueueWait(
         void* semaphore, bool isFinish, EnginePreStage stage,
@@ -20015,6 +26459,173 @@ void AcknowledgeDeferredRenderQueueFinishFaults(int reportedFaults) {
     g_deferredRenderQueueFinishFaultsReported += acknowledged;
 }
 
+bool TextureUploadBatchRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = kDefaultTextureUploadBatch;
+        if (__system_property_get(kTextureUploadBatchProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[rq.texture] ignoring invalid %s=%s (valid 0 or 1)",
+                      kTextureUploadBatchProperty, text);
+        }
+        return value;
+    }();
+    return requested;
+}
+
+void DrainBatchedTextureUploads(const char* reason) {
+    TextureUploadBatchState& state = g_textureUploadBatchState;
+    if (state.deferredCalls == 0u || state.draining) return;
+
+    void* const queue = state.queue;
+    const unsigned int deferred = state.deferredCalls;
+    state.draining = true;
+    state.queue = nullptr;
+    state.deferredCalls = 0u;
+
+    const bool queueCurrent = queue && g.RenderQueue_global &&
+        queue == *g.RenderQueue_global;
+    if (!g_retailRenderQueueFlush || !queueCurrent) {
+        const std::uint64_t faults = g_textureUploadBatchFaults.fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+        state.draining = false;
+        LOGE("[rq.texture] drain failed reason=%s deferred=%u queue=%p "
+             "current=%p flush=%p faults=%llu",
+             reason ? reason : "unknown", deferred, queue,
+             g.RenderQueue_global ? *g.RenderQueue_global : nullptr,
+             reinterpret_cast<void*>(g_retailRenderQueueFlush),
+             static_cast<unsigned long long>(faults));
+        return;
+    }
+
+    const double wallStartMs = NowMs();
+    const double cpuStartMs = perf::ThreadCpuMs();
+    g_retailRenderQueueFlush(queue);
+    const double wallMs = std::max(0.0, NowMs() - wallStartMs);
+    const double cpuMs = std::max(0.0, perf::ThreadCpuMs() - cpuStartMs);
+    const double blockedMs = std::max(0.0, wallMs - cpuMs);
+    const std::uint64_t drainTotal = g_textureUploadBatchDrainTotal.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    state.draining = false;
+
+    // Keep ordinary gameplay quiet while preserving every slow drain and a
+    // sparse health pulse for acceptance captures.
+    if (blockedMs >= 1.5 || drainTotal == 1u || (drainTotal & 127u) == 0u) {
+        LOGI("[rq.texture] drain reason=%s deferred=%u W/CPU/block="
+             "%.3f/%.3f/%.3f totals scope/deferred/drain/fault="
+             "%llu/%llu/%llu/%llu",
+             reason ? reason : "unknown", deferred,
+             wallMs, cpuMs, blockedMs,
+             static_cast<unsigned long long>(
+                 g_textureUploadBatchScopes.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_textureUploadBatchDeferredTotal.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(drainTotal),
+             static_cast<unsigned long long>(
+                 g_textureUploadBatchFaults.load(std::memory_order_relaxed)));
+    }
+}
+
+void* OnTextureDatabaseLoadInstance(void* entry, const void* listing) {
+    if (!g_origTextureDatabaseLoadInstance) return nullptr;
+
+    // TextureListingContainer owns the decoded source pixels used by every
+    // UploadMip below CreateRaster.  Its caller destroys that container only
+    // after LoadInstance returns, so this is the narrow lifetime in which
+    // several mip commands may safely share one queue drain.  Never allow a
+    // batch to escape this wrapper: the returned RwTexture is not exposed to
+    // the caller until all queued mips have completed.
+    const bool scoped =
+        g_textureUploadBatchHookActive.load(std::memory_order_acquire) &&
+        EnginePreProfileOwnedByCurrentThread() &&
+        g_stereoActive.load(std::memory_order_relaxed) &&
+        g_renderQueueConcurrencyHookActive.load(std::memory_order_acquire) &&
+        g_rqConcurrentFaults.load(std::memory_order_relaxed) == 0u;
+    if (!scoped) return g_origTextureDatabaseLoadInstance(entry, listing);
+
+    if (!TextureUploadTransactionActive()) {
+        DrainBatchedTextureUploads("texture_scope_entry");
+        g_textureUploadBatchScopes.fetch_add(1u, std::memory_order_relaxed);
+    }
+    ++g_textureLoadInstanceDepth;
+    void* const texture = g_origTextureDatabaseLoadInstance(entry, listing);
+    --g_textureLoadInstanceDepth;
+    if (!TextureUploadTransactionActive()) {
+        DrainBatchedTextureUploads("texture_complete");
+    }
+    return texture;
+}
+
+int OnRwOpenGLRasterUnlock(void* instance, void* raster, int accessMode) {
+    if (!g_origRwOpenGLRasterUnlock) return 0;
+
+    // Retail RasterUnlock uploads every generated mip through ES2Texture and
+    // Flushes after each one. QueueDataAligned has already copied the source
+    // bytes before each Flush, while the raster lock buffer remains alive until
+    // this function returns. One final drain is therefore the exact safe
+    // publication boundary for the whole raster, just like LoadInstance is for
+    // a TXD texture.
+    const bool scoped =
+        g_textureUploadBatchHookActive.load(std::memory_order_acquire) &&
+        EnginePreProfileOwnedByCurrentThread() &&
+        g_stereoActive.load(std::memory_order_relaxed) &&
+        g_renderQueueConcurrencyHookActive.load(std::memory_order_acquire) &&
+        g_rqConcurrentFaults.load(std::memory_order_relaxed) == 0u;
+    if (!scoped) return g_origRwOpenGLRasterUnlock(instance, raster, accessMode);
+
+    if (!TextureUploadTransactionActive()) {
+        DrainBatchedTextureUploads("raster_scope_entry");
+        g_textureUploadBatchScopes.fetch_add(1u, std::memory_order_relaxed);
+    }
+    ++g_textureRasterUnlockDepth;
+    const int result = g_origRwOpenGLRasterUnlock(instance, raster, accessMode);
+    --g_textureRasterUnlockDepth;
+    if (!TextureUploadTransactionActive()) {
+        DrainBatchedTextureUploads("raster_complete");
+    }
+    return result;
+}
+
+void OnTextureUploadMipFlush(void* queue) {
+    if (!g_retailRenderQueueFlush) return;
+
+    TextureUploadBatchState& state = g_textureUploadBatchState;
+    const std::uintptr_t returnAddress = reinterpret_cast<std::uintptr_t>(
+        __builtin_extract_return_addr(__builtin_return_address(0)));
+    const bool exactUploadMipCaller = g.LoadBase &&
+        returnAddress == g.LoadBase + kTextureUploadMipFlushReturnOffset;
+    const bool queueCurrent = queue && g.RenderQueue_global &&
+        queue == *g.RenderQueue_global;
+    const bool eligible =
+        exactUploadMipCaller &&
+        g_textureUploadBatchHookActive.load(std::memory_order_acquire) &&
+        EnginePreProfileOwnedByCurrentThread() &&
+        g_stereoActive.load(std::memory_order_relaxed) &&
+        g_renderQueueConcurrencyHookActive.load(std::memory_order_acquire) &&
+        g_rqConcurrentFaults.load(std::memory_order_relaxed) == 0u &&
+        TextureUploadTransactionActive() &&
+        queueCurrent && !state.draining;
+    if (!eligible) {
+        // A lifecycle transition must never strand a prior scoped batch.
+        DrainBatchedTextureUploads("scope_exit");
+        g_retailRenderQueueFlush(queue);
+        return;
+    }
+
+    if (state.deferredCalls != 0u && state.queue != queue) {
+        DrainBatchedTextureUploads("queue_change");
+    }
+    state.queue = queue;
+    ++state.deferredCalls;
+    g_textureUploadBatchDeferredTotal.fetch_add(1u,
+                                                 std::memory_order_relaxed);
+    if (state.deferredCalls >= kTextureUploadBatchEmergencyLimit) {
+        DrainBatchedTextureUploads("emergency_limit");
+    }
+}
+
 void OnOsSemaphoreWait(void* semaphore) {
     if (!g_origOsSemaphoreWait) return;
 
@@ -20048,6 +26659,7 @@ void OnOsSemaphoreWait(void* semaphore) {
     const EnginePreStage stage = profile.stage;
     const std::uintptr_t returnAddress = reinterpret_cast<std::uintptr_t>(
         __builtin_extract_return_addr(__builtin_return_address(0)));
+    bool unsizedProducerWait = false;
     if (isProducer) {
         if (g.LoadBase &&
             returnAddress == g.LoadBase + kRqSizedFlushReturnOffset) {
@@ -20057,9 +26669,15 @@ void OnOsSemaphoreWait(void* semaphore) {
             // semaphore and preserve their caller LR.  This bucket means exact
             // "unsized producer wait" without a racy cursor read.
             ++profile.rqNearEndFlushCalls;
+            unsizedProducerWait = true;
         }
     }
-    PerformProfiledRenderQueueWait(semaphore, isFinish, stage, profile);
+    const RenderQueueWaitTiming timing = PerformProfiledRenderQueueWait(
+        semaphore, isFinish, stage, profile);
+    if (unsizedProducerWait) {
+        RecordRenderQueueUnsizedCaller(
+            profile, returnAddress, stage, timing);
+    }
 }
 
 bool RenderQueueFinishDeferRequested() {
@@ -20071,6 +26689,60 @@ bool RenderQueueFinishDeferRequested() {
             else if (std::strcmp(text, "1") == 0) value = true;
             else LOGW("[rq.defer] ignoring invalid %s=%s (valid 0 or 1)",
                       kRenderQueueFinishDeferProperty, text);
+        }
+        return value;
+    }();
+    return requested;
+}
+
+bool RenderQueueFinishEyeOverlapRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = kDefaultRenderQueueFinishEyeOverlap;
+        if (__system_property_get(
+                kRenderQueueFinishEyeOverlapProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[rq.defer] ignoring invalid %s=%s (valid 0 or 1)",
+                      kRenderQueueFinishEyeOverlapProperty, text);
+        }
+        LOGI("[rq.defer] eye_overlap=%d property=%s",
+             value ? 1 : 0, kRenderQueueFinishEyeOverlapProperty);
+        return value;
+    }();
+    return requested;
+}
+
+bool RenderQueueFinishEyeSetOverlapRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = kDefaultRenderQueueFinishEyeSetOverlap;
+        if (__system_property_get(
+                kRenderQueueFinishEyeSetOverlapProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[rq.defer] ignoring invalid %s=%s (valid 0 or 1)",
+                      kRenderQueueFinishEyeSetOverlapProperty, text);
+        }
+        LOGI("[rq.defer] eye_set_overlap=%d drain_point=%s property=%s",
+             value ? 1 : 0, value ? "after_both" : "after_left",
+             kRenderQueueFinishEyeSetOverlapProperty);
+        return value;
+    }();
+    return requested;
+}
+
+bool RenderQueueEyeSetBackingRequested() {
+    static const bool requested = [] {
+        char text[PROP_VALUE_MAX]{};
+        bool value = kDefaultRenderQueueEyeSetBacking;
+        if (__system_property_get(
+                kRenderQueueEyeSetBackingProperty, text) > 0) {
+            if (std::strcmp(text, "0") == 0) value = false;
+            else if (std::strcmp(text, "1") == 0) value = true;
+            else LOGW("[rq.eyeset.backing] ignoring invalid %s=%s "
+                      "(valid 0 or 1)",
+                      kRenderQueueEyeSetBackingProperty, text);
         }
         return value;
     }();
@@ -20177,6 +26849,96 @@ bool InstallRenderQueueWaitProfileHook() {
         LOGW("[rq.wait] disabled; engine_pre queue attribution unavailable");
     }
     return active;
+}
+
+bool InstallTextureUploadBatchHook() {
+    g_textureUploadBatchHookActive.store(false, std::memory_order_release);
+    const bool requested = TextureUploadBatchRequested();
+    g_retailRenderQueueFlush = g.LoadBase
+        ? reinterpret_cast<RenderQueueFlushFn>(
+              g.LoadBase + kRqFlushSymbolOffset)
+        : nullptr;
+    g_origTextureDatabaseLoadInstance = nullptr;
+    g_origRwOpenGLRasterUnlock = nullptr;
+
+    static constexpr std::uint32_t kExpectedUploadTail[5] = {
+        0x910043e1u, 0x9401881bu, 0xf94002a0u,
+        0x94018821u, 0x910043e0u,
+    };
+    static constexpr std::uint32_t kExpectedFlushBody[6] = {
+        0x52800028u, 0x9110a009u, 0x089ffd28u,
+        0xf0002c28u, 0xf9455100u, 0x1401a17fu,
+    };
+    static constexpr std::uint32_t kExpectedFlushPlt[4] = {
+        0xd0000250u, 0xf940e611u, 0x91072210u, 0xd61f0220u,
+    };
+    static constexpr std::uint32_t kExpectedLoadInstance[4] = {
+        0xa9be7bfdu, 0xa9014ff4u, 0x910003fdu, 0xaa0003f3u,
+    };
+    static constexpr std::uint32_t kExpectedRasterUnlock[4] = {
+        0xd10203ffu, 0xfd0013e8u, 0xa902fbfdu, 0xf9001ffbu,
+    };
+    constexpr std::uintptr_t kLoadInstanceOffset = 0x795318u;
+    constexpr std::uintptr_t kRasterUnlockOffset = 0x775074u;
+    void* const loadInstanceTarget = requested && g.LoadBase
+        ? reinterpret_cast<void*>(g.LoadBase + kLoadInstanceOffset)
+        : nullptr;
+    void* const rasterUnlockTarget = requested && g.LoadBase
+        ? reinterpret_cast<void*>(g.LoadBase + kRasterUnlockOffset)
+        : nullptr;
+    bool fingerprint = requested && g.LoadBase &&
+        g_retailRenderQueueFlush &&
+        g_renderQueueConcurrencyHookActive.load(std::memory_order_acquire) &&
+        g_renderQueueWaitProfileHookActive.load(std::memory_order_acquire);
+    if (fingerprint) {
+        fingerprint = std::memcmp(
+                reinterpret_cast<const void*>(
+                    g.LoadBase + kTextureUploadMipFlushReturnOffset - 0x10u),
+                kExpectedUploadTail, sizeof(kExpectedUploadTail)) == 0 &&
+            std::memcmp(reinterpret_cast<const void*>(g_retailRenderQueueFlush),
+                        kExpectedFlushBody, sizeof(kExpectedFlushBody)) == 0 &&
+            std::memcmp(loadInstanceTarget, kExpectedLoadInstance,
+                        sizeof(kExpectedLoadInstance)) == 0 &&
+            std::memcmp(rasterUnlockTarget, kExpectedRasterUnlock,
+                        sizeof(kExpectedRasterUnlock)) == 0;
+    }
+    if (fingerprint) {
+        g_origTextureDatabaseLoadInstance =
+            reinterpret_cast<TextureDatabaseLoadInstanceFn>(InstallTrampoline(
+                loadInstanceTarget,
+                reinterpret_cast<void*>(&OnTextureDatabaseLoadInstance)));
+        g_origRwOpenGLRasterUnlock =
+            reinterpret_cast<RwOpenGLRasterUnlockFn>(InstallTrampoline(
+                rasterUnlockTarget,
+                reinterpret_cast<void*>(&OnRwOpenGLRasterUnlock)));
+    }
+    const bool active = fingerprint && g_origTextureDatabaseLoadInstance &&
+        g_origRwOpenGLRasterUnlock &&
+        InstallRetailGotHook(
+        "RenderQueue UploadMip batch", kRqFlushSymbolOffset,
+        kRqFlushPltOffset, kRqFlushGotOffset, kExpectedFlushPlt,
+        reinterpret_cast<void*>(g_retailRenderQueueFlush),
+        reinterpret_cast<void*>(&OnTextureUploadMipFlush));
+
+    g_textureUploadBatchHookActive.store(active, std::memory_order_release);
+    LOGI("[rq.texture] requested=%d active=%d fingerprint=%d "
+         "caller_lr=0x%llx flush/plt/got=0x%llx/0x%llx/0x%llx "
+         "limit=%u load_instance=0x%llx raster_unlock=0x%llx "
+         "scope=one_texture_or_raster property=%s",
+         requested ? 1 : 0, active ? 1 : 0, fingerprint ? 1 : 0,
+         static_cast<unsigned long long>(
+             kTextureUploadMipFlushReturnOffset),
+         static_cast<unsigned long long>(kRqFlushSymbolOffset),
+         static_cast<unsigned long long>(kRqFlushPltOffset),
+         static_cast<unsigned long long>(kRqFlushGotOffset),
+         kTextureUploadBatchEmergencyLimit,
+         static_cast<unsigned long long>(kLoadInstanceOffset),
+         static_cast<unsigned long long>(kRasterUnlockOffset),
+         kTextureUploadBatchProperty);
+    if (requested && !active) {
+        LOGW("[rq.texture] disabled; retail per-mip Flush retained exactly");
+    }
+    return !requested || active;
 }
 
 bool InstallRenderQueueFinishDeferHook() {
@@ -20299,10 +27061,12 @@ int ConfiguredRenderQueueCapacityMiB() {
             char* end = nullptr;
             const long parsed = std::strtol(text, &end, 10);
             if (end != text && end != nullptr && *end == '\0' &&
-                (parsed == 1 || parsed == 2)) {
+                (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8 ||
+                 parsed == 16 || parsed == 32)) {
                 value = static_cast<int>(parsed);
             } else {
-                LOGW("[rq.capacity] ignoring invalid %s=%s (valid 1 or 2)",
+                LOGW("[rq.capacity] ignoring invalid %s=%s "
+                     "(valid 1, 2, 4, 8, 16 or 32)",
                      kRenderQueueCapacityProperty, text);
             }
         }
@@ -20351,6 +27115,16 @@ bool InstallRenderQueueCapacityPatch() {
         return false;
     }
 
+    const std::uint32_t requestedInstruction = requestedMiB == 32
+        ? kRenderQueueThirtyTwoMiBCapacityInstruction
+        : requestedMiB == 16
+            ? kRenderQueueSixteenMiBCapacityInstruction
+            : requestedMiB == 8
+                ? kRenderQueueEightMiBCapacityInstruction
+                : requestedMiB == 4
+                    ? kRenderQueueFourMiBCapacityInstruction
+                    : kRenderQueueTwoMiBCapacityInstruction;
+
     const long rawPageSize = sysconf(_SC_PAGESIZE);
     if (rawPageSize <= 0) {
         LOGW("[rq.capacity] active=0 invalid page size");
@@ -20368,11 +27142,11 @@ bool InstallRenderQueueCapacityPatch() {
 
     std::uint32_t expected = kRenderQueueRetailCapacityInstruction;
     const bool swapped = __atomic_compare_exchange_n(
-        instruction, &expected, kRenderQueueTwoMiBCapacityInstruction, false,
+        instruction, &expected, requestedInstruction, false,
         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     const bool readbackOk = swapped &&
         __atomic_load_n(instruction, __ATOMIC_ACQUIRE) ==
-            kRenderQueueTwoMiBCapacityInstruction;
+            requestedInstruction;
     if (readbackOk) {
         __builtin___clear_cache(reinterpret_cast<char*>(instruction),
                                 reinterpret_cast<char*>(instruction + 1));
@@ -20392,8 +27166,7 @@ bool InstallRenderQueueCapacityPatch() {
     if (!rxRestored) {
         // The instruction page is still writable, so restore the retail
         // constructor before retrying RX. Do not leave a half-installed mode.
-        std::uint32_t rollbackExpected =
-            kRenderQueueTwoMiBCapacityInstruction;
+        std::uint32_t rollbackExpected = requestedInstruction;
         const bool rolledBack = __atomic_compare_exchange_n(
             instruction, &rollbackExpected,
             kRenderQueueRetailCapacityInstruction, false,
@@ -20411,9 +27184,476 @@ bool InstallRenderQueueCapacityPatch() {
     }
 
     LOGI("[rq.capacity] requested_mib=%d active=1 fingerprint=1 "
-         "atomic=1 rx=1 capacity_kib=2048 property=%s",
-         requestedMiB, kRenderQueueCapacityProperty);
+         "atomic=1 rx=1 capacity_kib=%d property=%s",
+         requestedMiB, requestedMiB * 1024,
+         kRenderQueueCapacityProperty);
     return true;
+}
+
+void UpdateRenderQueueEyeSetBackingMaxCopied(std::uint64_t bytes) {
+    std::uint64_t previous =
+        g_rqEyeSetBackingCounters.maxCopiedBytes.load(
+            std::memory_order_relaxed);
+    while (bytes > previous &&
+           !g_rqEyeSetBackingCounters.maxCopiedBytes.compare_exchange_weak(
+               previous, bytes, std::memory_order_relaxed)) {
+    }
+}
+
+void UpdateRenderQueueEyeSetBackingMaxWait(std::uint64_t waitUs) {
+    std::uint64_t previous =
+        g_rqEyeSetBackingCounters.ticketWaitMaxUs.load(
+            std::memory_order_relaxed);
+    while (waitUs > previous &&
+           !g_rqEyeSetBackingCounters.ticketWaitMaxUs.compare_exchange_weak(
+               previous, waitUs, std::memory_order_relaxed)) {
+    }
+}
+
+std::uint32_t RenderQueueCycleState() {
+    return __atomic_load_n(&g_rqRenderCycleState, __ATOMIC_ACQUIRE);
+}
+
+void RenderQueueCycleBegin(void* queue) {
+    if (!g_rqEyeSetBackingHooksActive.load(std::memory_order_acquire) ||
+        !queue || !g.RenderQueue_global || queue != *g.RenderQueue_global) {
+        return;
+    }
+    void* const thread = __builtin_thread_pointer();
+    void* expected = nullptr;
+    if (!g_rqRenderThreadOwner.compare_exchange_strong(
+            expected, thread, std::memory_order_acq_rel,
+            std::memory_order_acquire) && expected != thread) {
+        g_rqEyeSetBackingPoisoned.store(true, std::memory_order_release);
+        return;
+    }
+    if (RenderQueueCycleState() == 0u) {
+        __atomic_add_fetch(&g_rqRenderCycleEpoch, 1u, __ATOMIC_RELAXED);
+    }
+    __atomic_fetch_or(&g_rqRenderCycleState, kRqCycleActive,
+                      __ATOMIC_RELEASE);
+}
+
+void RenderQueueCycleCompleteService(std::uint32_t serviceBit) {
+    const std::uint32_t previous = __atomic_fetch_and(
+        &g_rqRenderCycleState, ~serviceBit, __ATOMIC_ACQ_REL);
+    const std::uint32_t remaining = previous & ~serviceBit;
+    if ((remaining & (kRqCycleFlushService | kRqCycleFinishService)) == 0u) {
+        __atomic_fetch_and(&g_rqRenderCycleState, ~kRqCycleActive,
+                           __ATOMIC_RELEASE);
+        g_rqRenderCycleHandshakeReady.store(true, std::memory_order_release);
+    }
+}
+
+bool DrainRenderQueueEyeSetBackingBeforeService(void* queue);
+
+bool RenderQueueStopRequested() {
+    if (!g.LoadBase) return true;
+    auto* const stop = reinterpret_cast<std::uint8_t*>(
+        g.LoadBase + kRenderQueueStopGlobalOffset);
+    return __atomic_load_n(stop, __ATOMIC_ACQUIRE) != 0u;
+}
+
+void DrainRenderQueueEyeSetBackingOrFailStop(void* queue) {
+    if (DrainRenderQueueEyeSetBackingBeforeService(queue)) return;
+    // ResetLocked has already transferred ownership of the detached bytes.
+    // A malformed generation has no safe retail fallback.  Quarantine it and
+    // hold the service edge until process shutdown rather than publishing a
+    // semaphore token that would permit unsafe texture/resource reuse.
+    g_rqEyeSetBackingPoisoned.store(true, std::memory_order_release);
+    while (!RenderQueueStopRequested()) usleep(1000);
+}
+
+// The retail byte helper begins with PC-relative dispatch instructions, so a
+// generic memcpy trampoline cannot safely be called.  Reproduce its
+// compare-exchange contract directly with an ARM64 acquire/release LL/SC loop;
+// InstallTrampoline is used only to redirect the retail entry to our wrapper.
+std::uint8_t RetailCompareExchangeByteDirect(
+        std::uint8_t expected, std::uint8_t desired,
+        std::uint8_t* address) {
+#if defined(__aarch64__)
+    std::uint32_t observed = 0u;
+    std::uint32_t status = 0u;
+    asm volatile(
+        "1:\n"
+        "ldaxrb %w0, [%2]\n"
+        "cmp %w0, %w3\n"
+        "b.ne 2f\n"
+        "stlxrb %w1, %w4, [%2]\n"
+        "cbnz %w1, 1b\n"
+        "2:\n"
+        : "=&r"(observed), "=&r"(status)
+        : "r"(address), "r"(static_cast<std::uint32_t>(expected)),
+          "r"(static_cast<std::uint32_t>(desired))
+        : "cc", "memory");
+    return static_cast<std::uint8_t>(observed);
+#else
+    return __atomic_compare_exchange_n(
+        address, &expected, desired, false,
+        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? expected : expected;
+#endif
+}
+
+std::uint8_t OnRenderQueueAtomicCompareExchangeByte(
+        std::uint8_t expected, std::uint8_t desired,
+        std::uint8_t* address) {
+    // Pointer-filter first.  This function globally intercepts the retail
+    // byte-CAS helper, so no std::atomic operation may occur before unrelated
+    // callers have tail-called the original helper.
+    const std::uint8_t observed =
+        RetailCompareExchangeByteDirect(expected, desired, address);
+    void* const queue = g.RenderQueue_global ? *g.RenderQueue_global : nullptr;
+    if (!queue || (address != reinterpret_cast<std::uint8_t*>(queue) +
+                                  kRqFlushRequested &&
+                   address != reinterpret_cast<std::uint8_t*>(queue) +
+                                  kRqFinishRequested)) {
+        return observed;
+    }
+    if (!g_rqEyeSetBackingHooksActive.load(std::memory_order_acquire))
+        return observed;
+
+    if (address == reinterpret_cast<std::uint8_t*>(queue) +
+                       kRqFlushRequested) {
+        g_rqRenderCycleSawFlush = observed == expected && expected == 1u;
+        if (g_rqRenderCycleSawFlush) {
+            __atomic_fetch_or(&g_rqRenderCycleState,
+                              kRqCycleActive | kRqCycleFlushService,
+                              __ATOMIC_RELEASE);
+            DrainRenderQueueEyeSetBackingOrFailStop(queue);
+        }
+        return observed;
+    }
+
+    const bool finishService = observed == expected && expected == 1u;
+    if (finishService) {
+        __atomic_fetch_or(&g_rqRenderCycleState,
+                          kRqCycleActive | kRqCycleFinishService,
+                          __ATOMIC_RELEASE);
+        DrainRenderQueueEyeSetBackingOrFailStop(queue);
+    } else if (!g_rqRenderCycleSawFlush &&
+               (RenderQueueCycleState() &
+                (kRqCycleFlushService | kRqCycleFinishService)) == 0u) {
+        __atomic_fetch_and(&g_rqRenderCycleState, ~kRqCycleActive,
+                           __ATOMIC_RELEASE);
+        g_rqRenderCycleHandshakeReady.store(true,
+                                             std::memory_order_release);
+    }
+    g_rqRenderCycleSawFlush = false;
+    return observed;
+}
+
+void OnRenderQueueSemaphorePost(void* semaphore) {
+    if (!g_origOsSemaphorePost) return;
+    void* const producerSemaphore = LoadRetailPointerGlobal(
+        kRqProducerSemaphoreGlobalOffset);
+    void* const finishSemaphore = LoadRetailPointerGlobal(
+        kRqFinishSemaphoreGlobalOffset);
+    const bool producerService = semaphore && semaphore == producerSemaphore;
+    const bool finishService = semaphore && semaphore == finishSemaphore;
+    // Gate the token itself.  A successful retail flag CAS drains once before
+    // direct Flush/ProcessAll; this second check closes the final interval up
+    // to the externally visible semaphore edge.
+    if ((producerService || finishService) &&
+        g_rqEyeSetBackingHooksActive.load(std::memory_order_acquire) &&
+        !RenderQueueStopRequested()) {
+        void* const queue = g.RenderQueue_global
+            ? *g.RenderQueue_global : nullptr;
+        DrainRenderQueueEyeSetBackingOrFailStop(queue);
+    }
+    g_origOsSemaphorePost(semaphore);
+
+    // The matching Post is the first point at which a successful old=1 CAS is
+    // externally serviced.  Clear the guard only after the token is visible.
+    if (producerService) {
+        RenderQueueCycleCompleteService(kRqCycleFlushService);
+    } else if (finishService) {
+        RenderQueueCycleCompleteService(kRqCycleFinishService);
+    }
+}
+
+bool CaptureRenderQueueEyeSetBacking(std::uint64_t stereoSequence,
+                                     unsigned int eyeSet,
+                                     std::uint64_t* generationOut) {
+    if (generationOut) *generationOut = 0u;
+    g_rqEyeSetBackingCounters.attempts.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (!g_rqEyeSetBackingHooksActive.load(std::memory_order_acquire) ||
+        g_rqEyeSetBackingPoisoned.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!g_rqRenderCycleHandshakeReady.load(std::memory_order_acquire)) {
+        g_rqEyeSetBackingCounters.cycleBusy.fetch_add(
+            1u, std::memory_order_relaxed);
+        return false;
+    }
+    if (!HasDeferredRenderQueueFinishPending()) {
+        g_rqEyeSetBackingCounters.noPendingFinish.fetch_add(
+            1u, std::memory_order_relaxed);
+        return false;
+    }
+    if (!g.OS_CanGameRender || !g.OS_CanGameRender()) {
+        g_rqEyeSetBackingCounters.layoutRejects.fetch_add(
+            1u, std::memory_order_relaxed);
+        return false;
+    }
+    if (RenderQueueCycleState() != 0u) {
+        g_rqEyeSetBackingCounters.cycleBusy.fetch_add(
+            1u, std::memory_order_relaxed);
+        return false;
+    }
+
+    void* const queue = g.RenderQueue_global ? *g.RenderQueue_global : nullptr;
+    if (!queue || !g.RenderQueue_Lock || !g.RenderQueue_Unlock ||
+        !g.RenderQueue_ResetLocked || !g.RQIndexBuffer_SetSafe ||
+        !g.RQVertexBuffer_SetSafe) {
+        g_rqEyeSetBackingCounters.layoutRejects.fetch_add(
+            1u, std::memory_order_relaxed);
+        return false;
+    }
+
+    g.RenderQueue_Lock(queue);
+    if (RenderQueueCycleState() != 0u) {
+        g.RenderQueue_Unlock(queue);
+        g_rqEyeSetBackingCounters.cycleBusy.fetch_add(
+            1u, std::memory_order_relaxed);
+        return false;
+    }
+
+    char* const bufferStart = RenderQueueField<char*>(queue, kRqBufferStart);
+    char* const bufferEnd = RenderQueueField<char*>(queue, kRqBufferEnd);
+    char* const bufferCapacity =
+        RenderQueueField<char*>(queue, kRqBufferCapacity);
+    char* const read = RenderQueueField<char*>(queue, kRqRead);
+    char* const published = RenderQueueField<char*>(queue, kRqPublished);
+    char* const current = RenderQueueField<char*>(queue, kRqCurrent);
+    const bool flushRequested =
+        RenderQueueField<std::uint8_t>(queue, kRqFlushRequested) != 0u;
+    const bool layoutValid = bufferStart && bufferEnd &&
+        bufferEnd == bufferCapacity && bufferStart <= read &&
+        read <= published && published == current && current <= bufferEnd;
+    if (!layoutValid || flushRequested) {
+        g.RenderQueue_Unlock(queue);
+        (flushRequested ? g_rqEyeSetBackingCounters.flushRejects
+                        : g_rqEyeSetBackingCounters.layoutRejects)
+            .fetch_add(1u, std::memory_order_relaxed);
+        return false;
+    }
+
+    const std::size_t bytes = static_cast<std::size_t>(published - read);
+    const double copyWallStartMs = NowMs();
+
+    // Protect any cursor-derived pointer in the stock buffer, and protect a
+    // previously consumed private slot before allowing it to become Free.
+    g.RQIndexBuffer_SetSafe();
+    g.RQVertexBuffer_SetSafe();
+    for (auto& slot : g_rqEyeSetBackingSlots) {
+        if (slot.state == RenderQueueEyeSetBackingState::Retired) {
+            slot.state = RenderQueueEyeSetBackingState::Free;
+            slot.begin = slot.cursor = slot.end = nullptr;
+        }
+    }
+
+    RenderQueueEyeSetBackingSlot* destination = nullptr;
+    std::uint64_t capturedGeneration = 0u;
+    if (bytes != 0u) {
+        for (auto& slot : g_rqEyeSetBackingSlots) {
+            if (slot.state == RenderQueueEyeSetBackingState::Free &&
+                slot.allocation && bytes + 8u <= slot.allocationBytes) {
+                destination = &slot;
+                break;
+            }
+        }
+        if (!destination) {
+            g.RenderQueue_Unlock(queue);
+            g_rqEyeSetBackingCounters.noFreeSlot.fetch_add(
+                1u, std::memory_order_relaxed);
+            return false;
+        }
+
+        const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(
+            destination->allocation);
+        const std::uintptr_t sourceMod =
+            reinterpret_cast<std::uintptr_t>(read) & 7u;
+        const std::uintptr_t offset = (sourceMod - (raw & 7u)) & 7u;
+        char* const copiedBegin = destination->allocation + offset;
+        std::memcpy(copiedBegin, read, bytes);
+        destination->begin = copiedBegin;
+        destination->cursor = copiedBegin;
+        destination->end = copiedBegin + bytes;
+        destination->generation = g_rqEyeSetBackingNextGeneration++;
+        capturedGeneration = destination->generation;
+        destination->stereoSequence = stereoSequence;
+        destination->eyeSet = eyeSet;
+        destination->state = RenderQueueEyeSetBackingState::Queued;
+    }
+
+    g.RenderQueue_ResetLocked(queue);
+    g.RenderQueue_Unlock(queue);
+    if (generationOut) *generationOut = capturedGeneration;
+
+    const std::uint64_t copyWallUs = static_cast<std::uint64_t>(std::max(
+        0.0, (NowMs() - copyWallStartMs) * 1000.0));
+    g_rqEyeSetBackingCounters.captures.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_rqEyeSetBackingCounters.copiedBytes.fetch_add(
+        bytes, std::memory_order_relaxed);
+    g_rqEyeSetBackingCounters.copyWallUs.fetch_add(
+        copyWallUs, std::memory_order_relaxed);
+    if (bytes == 0u) {
+        g_rqEyeSetBackingCounters.emptyCaptures.fetch_add(
+            1u, std::memory_order_relaxed);
+    } else {
+        UpdateRenderQueueEyeSetBackingMaxCopied(bytes);
+    }
+
+    const std::uint64_t captures =
+        g_rqEyeSetBackingCounters.captures.load(std::memory_order_relaxed);
+    if (captures == 1u || (captures & 127u) == 0u || copyWallUs >= 1000u) {
+        LOGI("[rq.eyeset.backing] capture=%llu seq/set=%llu/%u "
+             "bytes/copy_us=%zu/%llu total_bytes/max=%llu/%llu "
+             "attempt/busy/no_finish/layout/no_slot/flush="
+             "%llu/%llu/%llu/%llu/%llu/%llu",
+             static_cast<unsigned long long>(captures),
+             static_cast<unsigned long long>(stereoSequence), eyeSet,
+             bytes, static_cast<unsigned long long>(copyWallUs),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.copiedBytes.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.maxCopiedBytes.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.attempts.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.cycleBusy.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.noPendingFinish.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.layoutRejects.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.noFreeSlot.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.flushRejects.load(
+                     std::memory_order_relaxed)));
+    }
+    return true;
+}
+
+void WaitRenderQueueEyeSetBackingTicket(std::uint64_t generation) {
+    if (generation == 0u) return;
+    const double waitStartMs = NowMs();
+    {
+        std::unique_lock<std::mutex> ticketLock(
+            g_rqEyeSetBackingTicketMutex);
+        g_rqEyeSetBackingTicketCv.wait(ticketLock, [generation] {
+            return g_rqEyeSetBackingCompletedGeneration.load(
+                       std::memory_order_acquire) >= generation;
+        });
+    }
+    const std::uint64_t waitUs = static_cast<std::uint64_t>(std::max(
+        0.0, (NowMs() - waitStartMs) * 1000.0));
+    const std::uint64_t waits =
+        g_rqEyeSetBackingCounters.ticketWaits.fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+    g_rqEyeSetBackingCounters.ticketWaitWallUs.fetch_add(
+        waitUs, std::memory_order_relaxed);
+    UpdateRenderQueueEyeSetBackingMaxWait(waitUs);
+    if (waits == 1u || (waits & 127u) == 0u || waitUs >= 1000u) {
+        LOGI("[rq.eyeset.ticket] waits=%llu generation=%llu "
+             "wait_us/max/total=%llu/%llu/%llu",
+             static_cast<unsigned long long>(waits),
+             static_cast<unsigned long long>(generation),
+             static_cast<unsigned long long>(waitUs),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.ticketWaitMaxUs.load(
+                     std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 g_rqEyeSetBackingCounters.ticketWaitWallUs.load(
+                     std::memory_order_relaxed)));
+    }
+}
+
+bool InstallRenderQueueEyeSetBackingHooks() {
+    g_rqEyeSetBackingHooksActive.store(false, std::memory_order_release);
+    g_rqRenderCycleHandshakeReady.store(false, std::memory_order_release);
+    __atomic_store_n(&g_rqRenderCycleState, 0u, __ATOMIC_RELEASE);
+    const bool requested = RenderQueueEyeSetBackingRequested();
+    if (!requested) {
+        LOGI("[rq.eyeset.backing] requested=0 active=0 property=%s",
+             kRenderQueueEyeSetBackingProperty);
+        return true;
+    }
+
+    const std::size_t capacityBytes = static_cast<std::size_t>(
+        ConfiguredRenderQueueCapacityMiB()) * 1024u * 1024u;
+    bool allocated = true;
+    for (auto& slot : g_rqEyeSetBackingSlots) {
+        if (!slot.allocation) {
+            slot.allocationBytes = capacityBytes + 8u;
+            slot.allocation = static_cast<char*>(
+                std::malloc(slot.allocationBytes));
+        }
+        allocated = allocated && slot.allocation != nullptr &&
+            slot.allocationBytes >= capacityBytes + 8u;
+    }
+
+    static constexpr std::uint32_t kAtomicHelperFingerprint[4] = {
+        0xd503245fu, 0xd0002950u, 0x3968c210u, 0x34000070u,
+    };
+    static constexpr std::uint32_t kPostPltFingerprint[4] = {
+        0xd0000250u, 0xf9427611u, 0x9113a210u, 0xd61f0220u,
+    };
+    void* const atomicTarget = g.LoadBase
+        ? reinterpret_cast<void*>(g.LoadBase +
+                                  kAtomicCompareExchangeByteOffset)
+        : nullptr;
+    bool fingerprint = allocated && atomicTarget &&
+        g.RenderQueue_global && g_origRenderQueueProcessAll &&
+        g_origRenderQueueFinish && g_origOsSemaphoreWait &&
+        g_renderQueueConcurrencyHookActive.load(std::memory_order_acquire) &&
+        g_renderQueueFinishDeferActive.load(std::memory_order_acquire) &&
+        std::memcmp(atomicTarget, kAtomicHelperFingerprint,
+                    sizeof(kAtomicHelperFingerprint)) == 0;
+
+    if (fingerprint) {
+        // The returned trampoline contains PC-relative retail instructions and
+        // is intentionally never executed; the wrapper uses the direct LL/SC
+        // implementation above.  Its non-null value proves only that the
+        // entry redirection was installed.
+        g_unusedAtomicCompareExchangeTrampoline = InstallTrampoline(
+            atomicTarget,
+            reinterpret_cast<void*>(&OnRenderQueueAtomicCompareExchangeByte));
+        g_origOsSemaphorePost = reinterpret_cast<OsSemaphorePostFn>(
+            g.LoadBase + kOsSemaphorePostOffset);
+    }
+    const bool postHook = fingerprint &&
+        g_unusedAtomicCompareExchangeTrampoline && g_origOsSemaphorePost &&
+        InstallRetailGotHook(
+            "RenderQueue eye-set service Post", kOsSemaphorePostOffset,
+            kOsSemaphorePostPltOffset, kOsSemaphorePostGotOffset,
+            kPostPltFingerprint,
+            reinterpret_cast<void*>(g_origOsSemaphorePost),
+            reinterpret_cast<void*>(&OnRenderQueueSemaphorePost));
+    const bool active = postHook &&
+        g_unusedAtomicCompareExchangeTrampoline;
+    g_rqEyeSetBackingHooksActive.store(active, std::memory_order_release);
+    LOGI("[rq.eyeset.backing] requested=1 active=%d fingerprint=%d "
+         "slots=%u slot_mib=%d allocation=%d cycle_guard=cas+post "
+         "retire=set_safe property=%s",
+         active ? 1 : 0, fingerprint ? 1 : 0,
+         kRenderQueueEyeSetBackingSlots,
+         ConfiguredRenderQueueCapacityMiB(), allocated ? 1 : 0,
+         kRenderQueueEyeSetBackingProperty);
+    if (!active) {
+        g_rqEyeSetBackingPoisoned.store(true, std::memory_order_release);
+        LOGW("[rq.eyeset.backing] disabled; accepted after-left path retained");
+    }
+    return !requested || active;
 }
 
 bool RenderQueueNeedsIdleRecycle(char* bufferStart, char* bufferEnd,
@@ -20439,6 +27679,281 @@ bool RenderQueueNeedsIdleRecycle(char* bufferStart, char* bufferEnd,
     return remaining < recycleGuard;
 }
 
+struct RenderQueueEyeSetDrainResult {
+    std::uint64_t commands{};
+    std::uint64_t bytes{};
+    bool fault{};
+    bool stopped{};
+};
+
+RenderQueueEyeSetDrainResult DrainRenderQueueEyeSetBackingTickets(
+        void* queue) {
+    RenderQueueEyeSetDrainResult total{};
+    if (!g_rqEyeSetBackingHooksActive.load(std::memory_order_acquire) ||
+        !queue || !g.RenderQueue_Lock || !g.RenderQueue_Unlock) {
+        return total;
+    }
+
+    for (;;) {
+        g.RenderQueue_Lock(queue);
+        RenderQueueEyeSetBackingSlot* selected = nullptr;
+        for (auto& slot : g_rqEyeSetBackingSlots) {
+            if (slot.state != RenderQueueEyeSetBackingState::Queued)
+                continue;
+            if (!selected || slot.generation < selected->generation)
+                selected = &slot;
+        }
+        if (!selected) {
+            g.RenderQueue_Unlock(queue);
+            break;
+        }
+        selected->state = RenderQueueEyeSetBackingState::Consuming;
+        char* cursor = selected->cursor;
+        char* const rangeStart = cursor;
+        char* const snapshotEnd = selected->end;
+        const std::uint64_t generation = selected->generation;
+        const std::uint64_t stereoSequence = selected->stereoSequence;
+        const unsigned int eyeSet = selected->eyeSet;
+        const std::uintptr_t allocationAddress =
+            reinterpret_cast<std::uintptr_t>(selected->allocation);
+        const std::uintptr_t allocationEndAddress = allocationAddress +
+            selected->allocationBytes;
+        const std::uintptr_t beginAddress =
+            reinterpret_cast<std::uintptr_t>(selected->begin);
+        const std::uintptr_t cursorAddress =
+            reinterpret_cast<std::uintptr_t>(cursor);
+        const std::uintptr_t endAddress =
+            reinterpret_cast<std::uintptr_t>(snapshotEnd);
+        const bool allocationRangeValid = selected->allocation &&
+            selected->allocationBytes != 0u &&
+            allocationEndAddress >= allocationAddress;
+        const bool slotLayoutValid = allocationRangeValid &&
+            selected->begin && cursor && snapshotEnd &&
+            allocationAddress <= beginAddress && beginAddress <= cursorAddress &&
+            cursorAddress <= endAddress && endAddress <= allocationEndAddress;
+        g.RenderQueue_Unlock(queue);
+
+        RenderQueueConsumerWindow& consumerTelemetry =
+            RenderQueueConsumerTelemetry();
+        const double batchWallStartMs = NowMs();
+        const double batchCpuStartMs = perf::ThreadCpuMs();
+        const bool deepHandlerProfile =
+            RenderQueueDeepHandlerProfileRequested();
+        RenderQueueBatchStateCache stateCache{};
+        std::uint64_t commands = 0u;
+        bool commandFault = !slotLayoutValid;
+        bool stopped = false;
+        BeginRenderQueueGpuTimer(consumerTelemetry);
+        while (!commandFault && cursor < snapshotEnd) {
+            if (!g.OS_CanGameRender || !g.OS_CanGameRender()) {
+                stopped = true;
+                break;
+            }
+            if (snapshotEnd - cursor < 4) {
+                commandFault = true;
+                break;
+            }
+
+            char* const commandStart = cursor;
+            std::uint16_t command = 0;
+            std::memcpy(&command, cursor, sizeof(command));
+            cursor += 4;
+            if (command >= kRqHandlerSlots) {
+                cursor = commandStart;
+                commandFault = true;
+                break;
+            }
+            const auto handler =
+                reinterpret_cast<RenderQueueCommandFn*>(queue)[command];
+            if (!handler) {
+                cursor = commandStart;
+                commandFault = true;
+                break;
+            }
+            const std::uintptr_t handlerAddress =
+                reinterpret_cast<std::uintptr_t>(handler);
+            const std::uintptr_t handlerOffset =
+                g.LoadBase && handlerAddress >= g.LoadBase
+                ? handlerAddress - g.LoadBase : handlerAddress;
+            const bool exactRetailSwap =
+                command == kRqSwapBuffersCommand &&
+                handlerOffset == kRqSwapBuffersHandlerOffset;
+            if (deepHandlerProfile) {
+                consumerTelemetry.handlerSampleState =
+                    consumerTelemetry.handlerSampleState * 1664525u +
+                    1013904223u;
+            }
+            const bool sampleHandler = command == 46u ||
+                (deepHandlerProfile && (command == 3u ||
+                    (RenderQueueHandlerIsHot(command)
+                        ? (consumerTelemetry.handlerSampleState >> 26u) == 0u
+                        : (consumerTelemetry.handlerSampleState >> 30u) == 0u)));
+            const double handlerWallStartMs = sampleHandler ? NowMs() : 0.0;
+            const double handlerCpuStartMs = sampleHandler
+                ? perf::ThreadCpuMs() : 0.0;
+            const bool coalesced = TryCoalesceRenderQueueStateCommand(
+                command, handler, cursor, snapshotEnd, stateCache,
+                consumerTelemetry);
+            if (!coalesced) {
+                const bool replacedByFence = exactRetailSwap &&
+                    xr::TryPublishStereoProducerFenceFromRenderQueue();
+                if (!replacedByFence) {
+                    handler(&cursor);
+                    if (exactRetailSwap)
+                        xr::NotifyStereoRetailSwapCompletedFromRenderQueue();
+                }
+            }
+            if (sampleHandler && !coalesced) {
+                const double handlerWallMs = std::max(
+                    0.0, NowMs() - handlerWallStartMs);
+                const double handlerCpuMs = std::max(
+                    0.0, perf::ThreadCpuMs() - handlerCpuStartMs);
+                ++consumerTelemetry.handlerSampleCounts[command];
+                consumerTelemetry.handlerSampleWallMs[command] +=
+                    handlerWallMs;
+                consumerTelemetry.handlerSampleCpuMs[command] += handlerCpuMs;
+                consumerTelemetry.handlerSampleMaxBlockedMs[command] =
+                    std::max(
+                        consumerTelemetry.handlerSampleMaxBlockedMs[command],
+                        std::max(0.0, handlerWallMs - handlerCpuMs));
+            }
+            const std::uintptr_t updatedCursorAddress =
+                reinterpret_cast<std::uintptr_t>(cursor);
+            if (updatedCursorAddress <
+                    reinterpret_cast<std::uintptr_t>(commandStart) ||
+                updatedCursorAddress > endAddress) {
+                cursor = commandStart;
+                commandFault = true;
+                break;
+            }
+            ++consumerTelemetry.commandCounts[command];
+            consumerTelemetry.commandBytes[command] +=
+                static_cast<std::uint64_t>(cursor - commandStart);
+            if (consumerTelemetry.commandHandlerOffsets[command] == 0u) {
+                consumerTelemetry.commandHandlerOffsets[command] =
+                    handlerOffset;
+            }
+            ++commands;
+        }
+        EndRenderQueueGpuTimer(consumerTelemetry);
+        const std::uint64_t consumedBytes = slotLayoutValid
+            ? static_cast<std::uint64_t>(cursor - rangeStart) : 0u;
+        g.RenderQueue_Lock(queue);
+        const bool identityValid = slotLayoutValid &&
+            selected->state == RenderQueueEyeSetBackingState::Consuming &&
+            selected->generation == generation &&
+            selected->cursor == rangeStart &&
+            reinterpret_cast<std::uintptr_t>(cursor) >=
+                reinterpret_cast<std::uintptr_t>(rangeStart) &&
+            reinterpret_cast<std::uintptr_t>(cursor) <=
+                reinterpret_cast<std::uintptr_t>(selected->end);
+        if (!identityValid) commandFault = true;
+        bool retiredGeneration = false;
+        if (commandFault) {
+            selected->state = RenderQueueEyeSetBackingState::Faulted;
+            g_rqEyeSetBackingPoisoned.store(true, std::memory_order_release);
+        } else {
+            selected->cursor = cursor;
+            if (cursor == selected->end) {
+                selected->state = RenderQueueEyeSetBackingState::Retired;
+                retiredGeneration = true;
+            } else {
+                // OS pause is resumable.  Keep this exact generation at the
+                // head of FIFO and never allow its storage to be reused.
+                selected->state = RenderQueueEyeSetBackingState::Queued;
+            }
+        }
+        g.RenderQueue_Unlock(queue);
+
+        if (retiredGeneration) {
+            {
+                std::lock_guard<std::mutex> ticketLock(
+                    g_rqEyeSetBackingTicketMutex);
+                g_rqEyeSetBackingCompletedGeneration.store(
+                    generation, std::memory_order_release);
+            }
+            g_rqEyeSetBackingTicketCv.notify_all();
+        }
+
+        total.commands += commands;
+        total.bytes += consumedBytes;
+        total.fault = total.fault || commandFault;
+        total.stopped = total.stopped || stopped;
+        g_rqConcurrentBatches.fetch_add(1u, std::memory_order_relaxed);
+        g_rqConcurrentCommands.fetch_add(commands, std::memory_order_relaxed);
+        g_rqEyeSetBackingCounters.ticketCommands.fetch_add(
+            commands, std::memory_order_relaxed);
+        if (cursor == snapshotEnd && !commandFault) {
+            const std::uint64_t retired =
+                g_rqEyeSetBackingCounters.ticketsConsumed.fetch_add(
+                    1u, std::memory_order_relaxed) + 1u;
+            if (retired == 1u || (retired & 127u) == 0u) {
+                LOGI("[rq.eyeset.backing] retired=%llu gen/seq/set="
+                     "%llu/%llu/%u commands/bytes=%llu/%llu cycle_epoch=%u",
+                     static_cast<unsigned long long>(retired),
+                     static_cast<unsigned long long>(generation),
+                     static_cast<unsigned long long>(stereoSequence), eyeSet,
+                     static_cast<unsigned long long>(commands),
+                     static_cast<unsigned long long>(consumedBytes),
+                     __atomic_load_n(&g_rqRenderCycleEpoch,
+                                     __ATOMIC_RELAXED));
+            }
+        }
+        if (commandFault) {
+            const std::uint64_t faults =
+                g_rqEyeSetBackingCounters.ticketFaults.fetch_add(
+                    1u, std::memory_order_relaxed) + 1u;
+            g_rqConcurrentFaults.fetch_add(1u, std::memory_order_relaxed);
+            LOGE("[rq.eyeset.backing] FAULT quarantine=1 gen/seq/set="
+                 "%llu/%llu/%u cursor/end=%p/%p faults=%llu",
+                 static_cast<unsigned long long>(generation),
+                 static_cast<unsigned long long>(stereoSequence), eyeSet,
+                 static_cast<void*>(cursor), static_cast<void*>(snapshotEnd),
+                 static_cast<unsigned long long>(faults));
+        }
+        RecordRenderQueueConsumerBatch(
+            std::max(0.0, NowMs() - batchWallStartMs),
+            std::max(0.0, perf::ThreadCpuMs() - batchCpuStartMs),
+            0.0, commands, consumedBytes, consumedBytes, 0u, false);
+        if (commandFault || stopped) break;
+    }
+    return total;
+}
+
+bool DrainRenderQueueEyeSetBackingBeforeService(void* queue) {
+    if (!g_rqEyeSetBackingHooksActive.load(std::memory_order_acquire))
+        return true;
+    if (!queue || !g.RenderQueue_Lock || !g.RenderQueue_Unlock)
+        return false;
+
+    for (;;) {
+        if (RenderQueueStopRequested()) return false;
+        const RenderQueueEyeSetDrainResult drained =
+            DrainRenderQueueEyeSetBackingTickets(queue);
+        if (drained.fault) return false;
+
+        bool unretired = false;
+        bool faulted = false;
+        g.RenderQueue_Lock(queue);
+        for (const auto& slot : g_rqEyeSetBackingSlots) {
+            unretired = unretired ||
+                slot.state == RenderQueueEyeSetBackingState::Queued ||
+                slot.state == RenderQueueEyeSetBackingState::Consuming ||
+                slot.state == RenderQueueEyeSetBackingState::Faulted;
+            faulted = faulted ||
+                slot.state == RenderQueueEyeSetBackingState::Faulted;
+        }
+        g.RenderQueue_Unlock(queue);
+        if (faulted) return false;
+        if (!unretired) return true;
+
+        // Match retail RunThread's OS_CanGameRender pause discipline.  The
+        // service flag and semaphore remain closed while a detached generation
+        // is paused; process shutdown breaks the loop via the retail stop byte.
+        usleep(drained.stopped ? 10000u : 1000u);
+    }
+}
+
 bool OnRenderQueueProcessAll(void* queue) {
     if (!queue || !g.RenderQueue_Lock || !g.RenderQueue_Unlock ||
         !g.RenderQueue_ResetLocked || !g.RQIndexBuffer_SetSafe ||
@@ -20447,7 +27962,21 @@ bool OnRenderQueueProcessAll(void* queue) {
             ? g_origRenderQueueProcessAll(queue) : false;
     }
 
+    // Keep capture closed not merely while handlers execute, but through the
+    // following retail flush/finish flag exchanges.  The byte-CAS/Post hooks
+    // release this cycle only after any direct RunThread service is complete.
+    RenderQueueCycleBegin(queue);
+    const RenderQueueEyeSetDrainResult backingDrain =
+        DrainRenderQueueEyeSetBackingTickets(queue);
+    if (backingDrain.fault || backingDrain.stopped) {
+        return backingDrain.commands != 0u;
+    }
+
+    const double batchWallStartMs = NowMs();
+    const double batchCpuStartMs = perf::ThreadCpuMs();
+    const double firstLockStartMs = NowMs();
     g.RenderQueue_Lock(queue);
+    double lockWallMs = std::max(0.0, NowMs() - firstLockStartMs);
     char* const bufferStart = RenderQueueField<char*>(queue, kRqBufferStart);
     char* const bufferEnd = RenderQueueField<char*>(queue, kRqBufferEnd);
     char* const read = RenderQueueField<char*>(queue, kRqRead);
@@ -20466,8 +27995,9 @@ bool OnRenderQueueProcessAll(void* queue) {
         if (faults == 1) {
             LOGE("[rq.concurrent] invalid queue layout; falling back to retail");
         }
-        return g_origRenderQueueProcessAll
+        const bool retail = g_origRenderQueueProcessAll
             ? g_origRenderQueueProcessAll(queue) : false;
+        return retail || backingDrain.commands != 0u;
     }
     UpdateRenderQueueMaxUsed(static_cast<std::uint64_t>(
         current - bufferStart));
@@ -20478,18 +28008,28 @@ bool OnRenderQueueProcessAll(void* queue) {
         // the same buffer is already safe to recycle without blocking GameThread.
         if (!flushRequested && published == current && read > bufferStart &&
             RenderQueueNeedsIdleRecycle(bufferStart, bufferEnd, current)) {
+            RenderQueueConsumerWindow& recycleTelemetry =
+                RenderQueueConsumerTelemetry();
+            const double recycleWallStartMs = NowMs();
+            const double recycleCpuStartMs = perf::ThreadCpuMs();
             g.RQIndexBuffer_SetSafe();
             g.RQVertexBuffer_SetSafe();
             g.RenderQueue_ResetLocked(queue);
+            RecordRenderQueueControlTiming(
+                recycleTelemetry.recycleSamples,
+                recycleTelemetry.recycleWallMs,
+                recycleTelemetry.recycleCpuMs,
+                recycleTelemetry.recycleMaxBlockedMs,
+                recycleWallStartMs, recycleCpuStartMs);
             g_rqConcurrentResets.fetch_add(1, std::memory_order_relaxed);
         }
         g.RenderQueue_Unlock(queue);
-        return false;
+        return backingDrain.commands != 0u;
     }
 
     if (!g.OS_CanGameRender()) {
         g.RenderQueue_Unlock(queue);
-        return false;
+        return backingDrain.commands != 0u;
     }
 
     // The published range is immutable: GameThread can only append after it.
@@ -20497,9 +28037,19 @@ bool OnRenderQueueProcessAll(void* queue) {
     // finally run concurrently instead of taking turns around every command.
     char* cursor = read;
     char* const snapshotEnd = published;
-    UpdateRenderQueueMaxBatch(static_cast<std::uint64_t>(snapshotEnd - cursor));
+    const std::uint64_t batchBytes = static_cast<std::uint64_t>(
+        snapshotEnd - cursor);
+    const std::uint64_t backlogBeforeBytes = static_cast<std::uint64_t>(
+        current - cursor);
+    UpdateRenderQueueMaxBatch(batchBytes);
     g.RenderQueue_Unlock(queue);
 
+    RenderQueueConsumerWindow& consumerTelemetry =
+        RenderQueueConsumerTelemetry();
+    BeginRenderQueueGpuTimer(consumerTelemetry);
+    const bool deepHandlerProfile =
+        RenderQueueDeepHandlerProfileRequested();
+    RenderQueueBatchStateCache stateCache{};
     std::uint64_t commands = 0;
     bool commandFault = false;
     while (cursor < snapshotEnd) {
@@ -20524,16 +28074,71 @@ bool OnRenderQueueProcessAll(void* queue) {
             commandFault = true;
             break;
         }
-        handler(&cursor);
+        const std::uintptr_t handlerAddress =
+            reinterpret_cast<std::uintptr_t>(handler);
+        const std::uintptr_t handlerOffset =
+            g.LoadBase && handlerAddress >= g.LoadBase
+            ? handlerAddress - g.LoadBase : handlerAddress;
+        const bool exactRetailSwap =
+            command == kRqSwapBuffersCommand &&
+            handlerOffset == kRqSwapBuffersHandlerOffset;
+        // Keep only the once-per-frame swap timing on by default. The broader
+        // LCG sampler is available through debug.savr.rq_handler_profile=1 for
+        // targeted captures, without charging every normal gameplay frame.
+        if (deepHandlerProfile) {
+            consumerTelemetry.handlerSampleState =
+                consumerTelemetry.handlerSampleState * 1664525u + 1013904223u;
+        }
+        const bool sampleHandler = command == 46u ||
+            (deepHandlerProfile && (command == 3u ||
+                (RenderQueueHandlerIsHot(command)
+                    ? (consumerTelemetry.handlerSampleState >> 26u) == 0u
+                    : (consumerTelemetry.handlerSampleState >> 30u) == 0u)));
+        const double handlerWallStartMs = sampleHandler ? NowMs() : 0.0;
+        const double handlerCpuStartMs = sampleHandler
+            ? perf::ThreadCpuMs() : 0.0;
+        const bool coalesced = TryCoalesceRenderQueueStateCommand(
+            command, handler, cursor, snapshotEnd, stateCache,
+            consumerTelemetry);
+        if (!coalesced) {
+            const bool replacedByFence = exactRetailSwap &&
+                xr::TryPublishStereoProducerFenceFromRenderQueue();
+            if (!replacedByFence) {
+                handler(&cursor);
+                if (exactRetailSwap)
+                    xr::NotifyStereoRetailSwapCompletedFromRenderQueue();
+            }
+        }
+        if (sampleHandler && !coalesced) {
+            const double handlerWallMs = std::max(
+                0.0, NowMs() - handlerWallStartMs);
+            const double handlerCpuMs = std::max(
+                0.0, perf::ThreadCpuMs() - handlerCpuStartMs);
+            ++consumerTelemetry.handlerSampleCounts[command];
+            consumerTelemetry.handlerSampleWallMs[command] += handlerWallMs;
+            consumerTelemetry.handlerSampleCpuMs[command] += handlerCpuMs;
+            consumerTelemetry.handlerSampleMaxBlockedMs[command] = std::max(
+                consumerTelemetry.handlerSampleMaxBlockedMs[command],
+                std::max(0.0, handlerWallMs - handlerCpuMs));
+        }
         if (cursor < commandStart || cursor > snapshotEnd) {
             cursor = commandStart;
             commandFault = true;
             break;
         }
+        ++consumerTelemetry.commandCounts[command];
+        consumerTelemetry.commandBytes[command] +=
+            static_cast<std::uint64_t>(cursor - commandStart);
+        if (consumerTelemetry.commandHandlerOffsets[command] == 0u) {
+            consumerTelemetry.commandHandlerOffsets[command] =
+                handlerOffset;
+        }
         ++commands;
     }
-
+    EndRenderQueueGpuTimer(consumerTelemetry);
+    const double secondLockStartMs = NowMs();
     g.RenderQueue_Lock(queue);
+    lockWallMs += std::max(0.0, NowMs() - secondLockStartMs);
     char*& sharedRead = RenderQueueField<char*>(queue, kRqRead);
     if (sharedRead != read) {
         commandFault = true;
@@ -20547,20 +28152,38 @@ bool OnRenderQueueProcessAll(void* queue) {
         RenderQueueField<char*>(queue, kRqCurrent);
     const bool sharedFlushRequested =
         RenderQueueField<std::uint8_t>(queue, kRqFlushRequested) != 0;
-    if (sharedPublished != published || sharedCurrent != current) {
+    const bool producerOverlap =
+        sharedPublished != published || sharedCurrent != current;
+    if (producerOverlap) {
         g_rqConcurrentProducerOverlaps.fetch_add(
             1, std::memory_order_relaxed);
     }
+    const std::uint64_t backlogAfterBytes = sharedCurrent >= cursor
+        ? static_cast<std::uint64_t>(sharedCurrent - cursor) : 0u;
     if (!commandFault && !sharedFlushRequested &&
         cursor == sharedPublished && sharedPublished == sharedCurrent &&
         cursor > bufferStart && RenderQueueNeedsIdleRecycle(
             bufferStart, bufferEnd, const_cast<char*>(sharedCurrent))) {
+        const double recycleWallStartMs = NowMs();
+        const double recycleCpuStartMs = perf::ThreadCpuMs();
         g.RQIndexBuffer_SetSafe();
         g.RQVertexBuffer_SetSafe();
         g.RenderQueue_ResetLocked(queue);
+        RecordRenderQueueControlTiming(
+            consumerTelemetry.recycleSamples,
+            consumerTelemetry.recycleWallMs,
+            consumerTelemetry.recycleCpuMs,
+            consumerTelemetry.recycleMaxBlockedMs,
+            recycleWallStartMs, recycleCpuStartMs);
         g_rqConcurrentResets.fetch_add(1, std::memory_order_relaxed);
     }
     g.RenderQueue_Unlock(queue);
+
+    RecordRenderQueueConsumerBatch(
+        std::max(0.0, NowMs() - batchWallStartMs),
+        std::max(0.0, perf::ThreadCpuMs() - batchCpuStartMs),
+        lockWallMs, commands, batchBytes, backlogBeforeBytes,
+        backlogAfterBytes, producerOverlap);
 
     g_rqConcurrentBatches.fetch_add(1, std::memory_order_relaxed);
     g_rqConcurrentCommands.fetch_add(commands, std::memory_order_relaxed);
@@ -20593,7 +28216,7 @@ bool OnRenderQueueProcessAll(void* queue) {
              static_cast<unsigned long long>(
                  g_rqConcurrentFaults.load(std::memory_order_relaxed)));
     }
-    return commands != 0;
+    return commands != 0 || backingDrain.commands != 0u;
 }
 
 bool InstallRenderQueueConcurrencyHook() {
@@ -20948,9 +28571,65 @@ bool InstallTrafficShell() {
 
 void BeginGameFrameTelemetry(double callbackStartMonoMs,
                              double callbackStartCpuMs) {
+    BeginDynamicShadowFrame();
+#ifdef SAVR_DEV
+    const int textureCompletionLimit = RequestedTextureStreamingCompletions();
+    if (textureCompletionLimit > 0) {
+        const int feedbackBudgetUs = RequestedTextureStreamingBudgetUs();
+        const double feedbackBudgetMs =
+            static_cast<double>(feedbackBudgetUs) / 1000.0;
+        if (feedbackBudgetUs > 0) {
+            if (!g_textureStreamingFeedbackInitialised) {
+                g_textureStreamingFeedbackCreditMs = feedbackBudgetMs;
+                g_textureStreamingFeedbackInitialised = true;
+            } else {
+                // Cap credit at one quantum.  Idle time therefore cannot bank
+                // enough credit to publish a burst of textures later.
+                g_textureStreamingFeedbackCreditMs = std::min(
+                    feedbackBudgetMs,
+                    g_textureStreamingFeedbackCreditMs + feedbackBudgetMs);
+            }
+        } else {
+            g_textureStreamingFeedbackCreditMs = 0.0;
+            g_textureStreamingFeedbackInitialised = false;
+        }
+        g_textureStreamingCompletionsThisFrame = 0u;
+        const std::uint64_t frame =
+            g_textureStreamingCompletionFrames.fetch_add(
+                1u, std::memory_order_relaxed) + 1u;
+        if (frame == 1u || (frame & 255u) == 0u) {
+            LOGI("[stream.texture.frame] active=1 limit=%d budget_us=%d "
+                 "credit/ewma/last/max_ms=%.3f/%.3f/%.3f/%.3f frames=%llu "
+                 "completed=%llu deferred_pending=%llu feedback_skips=%llu "
+                 "properties=%s/%s",
+                 textureCompletionLimit, feedbackBudgetUs,
+                 g_textureStreamingFeedbackCreditMs,
+                 g_textureStreamingCompletionWallEwmaMs,
+                 static_cast<double>(
+                     g_textureStreamingLastCompletionWallUs.load(
+                         std::memory_order_relaxed)) / 1000.0,
+                 static_cast<double>(
+                     g_textureStreamingMaxCompletionWallUs.load(
+                         std::memory_order_relaxed)) / 1000.0,
+                 static_cast<unsigned long long>(frame),
+                 static_cast<unsigned long long>(
+                     g_textureStreamingCompleted.load(
+                         std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     g_textureStreamingDeferred.load(
+                         std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     g_textureStreamingFeedbackDeferredFrames.load(
+                         std::memory_order_relaxed)),
+                 kTextureStreamingCompletionsProperty,
+                 kTextureStreamingBudgetUsProperty);
+        }
+    }
+#endif
     // Begin and consume/end run on the intercepted GameThread.  Publish the
     // owner only after resetting every field so a foreign semaphore caller can
     // never observe a half-initialised profile.
+    DrainBatchedTextureUploads("begin_recovery");
     DrainDeferredRenderQueueFinish(
         DeferredFinishDrainReason::BeginRecovery);
     g_enginePreProfileActive.store(false, std::memory_order_release);
@@ -20981,6 +28660,7 @@ void EndGameFrameTelemetry() {
             __builtin_thread_pointer()) {
         return;
     }
+    DrainBatchedTextureUploads("frame_end");
     DrainDeferredRenderQueueFinish(DeferredFinishDrainReason::FrameEnd);
     g_enginePreProfileActive.store(false, std::memory_order_release);
     g_enginePreProfile.stage = EnginePreStage::Inactive;
@@ -20993,6 +28673,22 @@ int GetRenderScalePercent() {
     return static_cast<int>(kEyeRenderScales[index] * 100.0f + 0.5f);
 }
 
+int GetActiveRenderScalePercent() {
+    EnsureGraphicsSettingsLoaded();
+    const int index = ClampRenderScaleIndex(
+        g_appliedRenderScaleIndex.load(std::memory_order_acquire));
+    return static_cast<int>(kEyeRenderScales[index] * 100.0f + 0.5f);
+}
+
+bool RenderScaleChangePending() {
+    EnsureGraphicsSettingsLoaded();
+    const int requested = ClampRenderScaleIndex(
+        g_requestedRenderScaleIndex.load(std::memory_order_acquire));
+    const int applied = ClampRenderScaleIndex(
+        g_appliedRenderScaleIndex.load(std::memory_order_acquire));
+    return requested != applied;
+}
+
 void AdjustRenderScale(int direction) {
     EnsureGraphicsSettingsLoaded();
     if (direction == 0) return;
@@ -21003,8 +28699,10 @@ void AdjustRenderScale(int direction) {
         if (g_requestedRenderScaleIndex.compare_exchange_weak(
                 current, desired, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
-            LOGI("[stereo] render scale requested: %d%%",
-                 static_cast<int>(kEyeRenderScales[desired] * 100.0f + 0.5f));
+            SaveGraphicsSettings();
+            LOGI("[stereo] render scale saved: %d%% active=%d%% applying=1",
+                 static_cast<int>(kEyeRenderScales[desired] * 100.0f + 0.5f),
+                 GetActiveRenderScalePercent());
             return;
         }
     }
@@ -21017,6 +28715,63 @@ int GetGraphicsDistanceSettingCount() {
 bool AreNeonSignsEnabled() {
     EnsureGraphicsSettingsLoaded();
     return g_neonSignsEnabled.load(std::memory_order_acquire);
+}
+
+bool AreWorldEffectsEnabled() {
+    EnsureGraphicsSettingsLoaded();
+    return g_worldEffectsEnabled.load(std::memory_order_acquire);
+}
+
+bool AreDynamicShadowsEnabled() {
+    EnsureGraphicsSettingsLoaded();
+    return CurrentShadowMode() != kShadowModeOff;
+}
+
+int GetDynamicShadowMode() {
+    EnsureGraphicsSettingsLoaded();
+    return CurrentShadowMode();
+}
+
+const char* GetDynamicShadowModeName() {
+    EnsureGraphicsSettingsLoaded();
+    return ShadowModeName(CurrentShadowMode());
+}
+
+void SetDynamicShadowModeInternal(int mode) {
+    mode = ClampShadowMode(mode);
+    if (g_dynamicShadowMode.exchange(mode, std::memory_order_acq_rel) == mode)
+        return;
+    ApplyDynamicShadowPreference();
+    SaveGraphicsSettings();
+    LOGI("[shadow] menu mode=%s mobile=%d route=%d vehicle_hook=%d",
+         ShadowModeName(mode), ReadMobileShadowLevel(),
+         g_dynamicShadowDirectRouteReady.load(std::memory_order_acquire) ? 1 : 0,
+         g_vehicleShadowBudgetHookReady.load(std::memory_order_acquire) ? 1 : 0);
+}
+
+void AdjustDynamicShadowMode(int direction) {
+    EnsureGraphicsSettingsLoaded();
+    if (direction == 0) return;
+    const int current = CurrentShadowMode();
+    const int delta = direction < 0 ? -1 : 1;
+    SetDynamicShadowModeInternal(
+        (current + delta + kShadowModeCount) % kShadowModeCount);
+}
+
+void SetDynamicShadowsEnabled(bool enabled) {
+    EnsureGraphicsSettingsLoaded();
+    SetDynamicShadowModeInternal(
+        enabled ? kDefaultShadowMode : kShadowModeOff);
+}
+
+void SetWorldEffectsEnabled(bool enabled) {
+    EnsureGraphicsSettingsLoaded();
+    if (g_worldEffectsEnabled.exchange(enabled, std::memory_order_acq_rel) ==
+        enabled) {
+        return;
+    }
+    SaveGraphicsSettings();
+    LOGI("[graphics.effects] enabled=%d", enabled ? 1 : 0);
 }
 
 void SetNeonSignsEnabled(bool enabled) {
@@ -21034,16 +28789,6 @@ bool IsColorGradingEnabled() {
     return g_colorGradingEnabled.load(std::memory_order_acquire);
 }
 
-void SetColorGradingEnabled(bool enabled) {
-    EnsureGraphicsSettingsLoaded();
-    if (g_colorGradingEnabled.exchange(enabled, std::memory_order_acq_rel) ==
-        enabled) {
-        return;
-    }
-    SaveGraphicsSettings();
-    LOGI("[graphics.grade] enabled=%d", enabled ? 1 : 0);
-}
-
 bool IsHdWeaponsEnabled() {
     EnsureGraphicsSettingsLoaded();
     return g_hdWeaponsEnabled.load(std::memory_order_acquire);
@@ -21059,6 +28804,16 @@ void SetHdWeaponsEnabled(bool enabled) {
     LOGI("[hdweapons] enabled=%d (applies on next start)", enabled ? 1 : 0);
 }
 
+void SetColorGradingEnabled(bool enabled) {
+    EnsureGraphicsSettingsLoaded();
+    if (g_colorGradingEnabled.exchange(enabled, std::memory_order_acq_rel) ==
+        enabled) {
+        return;
+    }
+    SaveGraphicsSettings();
+    LOGI("[graphics.grade] enabled=%d", enabled ? 1 : 0);
+}
+
 const char* GetGraphicsDistanceSettingName(int field) {
     if (field < 0 || field >= GFXDIST_COUNT) return "UNKNOWN";
     return kGraphicsDistanceSpecs[field].label;
@@ -21066,6 +28821,11 @@ const char* GetGraphicsDistanceSettingName(int field) {
 
 int GetGraphicsDistanceSettingMeters(int field) {
     return GraphicsDistanceMetresInternal(field);
+}
+
+bool GraphicsDistanceSettingUsesRetail(int field) {
+    return field == GFXDIST_FLIGHT_DISTANCE &&
+        GraphicsDistanceMetresInternal(field) == 0;
 }
 
 bool GraphicsDistanceSettingNeedsRestart(int field) {
@@ -21099,8 +28859,11 @@ void ResetGraphicsDefaults() {
     EnsureGraphicsSettingsLoaded();
     g_requestedRenderScaleIndex.store(
         kDefaultRenderScaleIndex, std::memory_order_release);
+    g_worldEffectsEnabled.store(true, std::memory_order_release);
     g_neonSignsEnabled.store(true, std::memory_order_release);
     g_colorGradingEnabled.store(true, std::memory_order_release);
+    g_dynamicShadowMode.store(kDefaultShadowMode, std::memory_order_release);
+    ApplyDynamicShadowPreference();
     g_hdWeaponsEnabled.store(false, std::memory_order_release);
     for (int i = 0; i < GFXDIST_COUNT; ++i) {
         g_graphicsDistanceChoice[i].store(
@@ -21108,7 +28871,8 @@ void ResetGraphicsDefaults() {
             std::memory_order_release);
     }
     SaveGraphicsSettings();
-    LOGI("[graphics.settings] defaults restored scale=110%% neon=1 trees=300m");
+    LOGI("[graphics.settings] defaults restored scale=100%% effects=1 neon=1 "
+         "grade=1 shadows=%s trees=300m", ShadowModeName(kDefaultShadowMode));
 }
 
 bool IsStereoActive() {
@@ -21129,6 +28893,17 @@ void RefreshStereoGate() {
 
 bool IsMobileMenuOpen() {
     return MobileMenuOpen();
+}
+
+bool ParachuteWeaponInteractionBlocked() {
+    return g_hideWeaponsForChuteDeploy.load(std::memory_order_acquire);
+}
+
+void SetStereoBaseSize(int width,int height) {
+    if (width<=0 || height<=0) return;
+    g_stereoBaseW.store(width,std::memory_order_release);
+    g_stereoBaseH.store(height,std::memory_order_release);
+    LOGI("[surface] flat frontend separated from stereo base %dx%d",width,height);
 }
 
 bool IsTrafficShellActive() {
@@ -21273,6 +29048,40 @@ void RequestRecenter() {
     LOGI("[locomotion] recenter requested");
 }
 
+bool CutsceneCameraControlsActive() {
+    const bool active = CutsceneCameraControlsActiveInternal();
+    RefreshCutsceneCameraState();
+    return active;
+}
+
+int GetCutsceneCameraCount() {
+    RefreshCutsceneCameraState();
+    if (!CutsceneCameraControlsActiveInternal()) return 0;
+    void* actors[kMaxCutsceneCameraActors]{};
+    return StageCutsceneCameraActors(actors, kMaxCutsceneCameraActors) + 1;
+}
+
+void CycleCutsceneCamera() {
+    RefreshCutsceneCameraState();
+    const int cameras = GetCutsceneCameraCount();
+    if (cameras <= 0) return;
+    g_cutsceneCameraIndex = (EffectiveCutsceneCameraIndex() + 1) % cameras;
+    RefreshCutsceneCameraState();
+    LOGI("[cutscene.camera] cycle scene=%s camera=%d/%d",
+         g_cutsceneCameraScene, g_cutsceneCameraIndex, cameras - 1);
+}
+
+void RememberCutsceneCamera() {
+    RefreshCutsceneCameraState();
+    if (!CutsceneCameraControlsActiveInternal() ||
+        g_cutsceneCameraScene[0] == '\0') return;
+    g_cutsceneCameraIndex = EffectiveCutsceneCameraIndex();
+    locomotion::RememberCutsceneCamera(g_cutsceneCameraScene,
+                                        g_cutsceneCameraIndex);
+    LOGI("[cutscene.camera] remembered scene=%s camera=%d",
+         g_cutsceneCameraScene, g_cutsceneCameraIndex);
+}
+
 bool Install() {
     // Resolve-thread I/O: keep the first RenderScene hook free of settings-file
     // access even when the Graphics page has never been opened.
@@ -21289,13 +29098,22 @@ bool Install() {
     }
     LOGI("[vr] head-tracked camera hook installed on CopyCameraMatrixToRWCam");
 
+    // Bind the user-facing shadow toggle to MobileSettings entry 5 and install
+    // the fingerprinted eight-vehicle budget before the first gameplay frame.
+    InstallDynamicShadowSupport();
+
     // Give the producer a bounded second-frame cushion before the retail queue
     // object exists, then fix producer/consumer serialization. Both changes
     // are fingerprint-guarded and fail closed to the retail queue.
     InstallRenderQueueCapacityPatch();
     InstallRenderQueueConcurrencyHook();
     InstallRenderQueueWaitProfileHook();
+    InstallTextureUploadBatchHook();
     InstallRenderQueueFinishDeferHook();
+    InstallRenderQueueEyeSetBackingHooks();
+#ifdef SAVR_DEV
+    InstallGameUpdateHitchProfiler();
+#endif
 
     // Keep real ambient vehicles alive through a bounded, native VLO range.
     // Failure is intentionally non-fatal: every guard leaves stock traffic in

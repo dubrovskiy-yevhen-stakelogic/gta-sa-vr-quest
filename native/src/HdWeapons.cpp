@@ -74,10 +74,6 @@ bool PayloadPresent() {
     const int txtRc = stat(kTexDbListing, &st);
     const int txtErr = errno;
     const bool ok = imgRc == 0 && txtRc == 0;
-    // Throttled diagnostic while the payload is not visible: the file manager /
-    // adb (shell view) can show the files while the game process (app view)
-    // still cannot stat them. errno pinpoints why -- ENOENT = wrong path / the
-    // app's view does not have them, EACCES = directory traversal / permission.
     if (!ok) {
         static int logged = 0;
         if (logged < 5) {
@@ -203,7 +199,14 @@ void Apply() {
         return;
     }
     g_loadingOurDb.store(true, std::memory_order_relaxed);
-    void* db = g.TextureDatabaseRuntime_Load("hdweapons", false, 0);
+    // The optional database has only 89 entries and is registered during the
+    // startup/loading window.  Loading it lazily caused the first appearance
+    // of each weapon to decode PNGs synchronously on the GameThread (11-42 ms
+    // per texture, with several often landing in one frame).  Preload this
+    // small database once here; the large retail gta3/txd databases retain
+    // their original streaming policy and the 128 MiTex cache keeps the HD
+    // set resident afterwards.
+    void* db = g.TextureDatabaseRuntime_Load("hdweapons", true, 0);
     g_loadingOurDb.store(false, std::memory_order_relaxed);
     if (db == nullptr) {
         LOGE("[hdweapons] texture database load failed");
@@ -356,13 +359,8 @@ void Apply() {
 }  // namespace
 
 bool Available() {
-    // Re-check until the payload appears, then latch true. The game is almost
-    // always launched at least once BEFORE the HD models are installed, and on
-    // Quest the process survives taking the headset off (it only pauses), so a
-    // one-shot cache would stay "no files" for the whole session even after the
-    // files are pushed -- the menu would keep showing < NO FILES > until a full
-    // force-quit. Re-stat only while not-yet-found (cheap), then it is a pure
-    // atomic read.
+    // Re-check until the payload appears, then latch it for the process. This
+    // supports installing the optional files while GTA is paused in the Quest.
     static std::atomic<bool> present{false};
     if (!present.load(std::memory_order_relaxed) && PayloadPresent())
         present.store(true, std::memory_order_relaxed);

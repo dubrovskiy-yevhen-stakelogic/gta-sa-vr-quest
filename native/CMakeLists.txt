@@ -1,11 +1,21 @@
 cmake_minimum_required(VERSION 3.22)
 project(savr LANGUAGES CXX ASM)
 
-# Developer builds keep full logging, the FPS panel chord and the full
-# 4-digit build version on screen. Player/kit builds leave this OFF.
+# SAVR_DEV keeps the diagnostic hooks used by the current Quest performance
+# baseline. The player overlay still starts hidden; direct CMake audits may
+# leave this OFF to verify the non-diagnostic configuration.
 option(SAVR_DEV "Developer build: logging, FPS panel, full version" OFF)
 if(SAVR_DEV)
     add_compile_definitions(SAVR_DEV=1)
+endif()
+
+# Keep the producer-backpressure implementation available in normal builds.
+# Its runtime property remains opt-in, so an ordinary player run pays no
+# atomic traffic while diagnostics can still enable it without rebuilding.
+option(SAVR_EXPERIMENTAL_BACKPRESSURE
+    "Experimental XR-to-GameThread stereo producer backpressure" ON)
+if(SAVR_EXPERIMENTAL_BACKPRESSURE)
+    add_compile_definitions(SAVR_EXPERIMENTAL_BACKPRESSURE=1)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -40,6 +50,8 @@ set_target_properties(openxr_loader PROPERTIES
 
 add_library(savr SHARED
     src/main.cpp
+    src/AircraftHlod.cpp
+    src/AircraftHlodData.S
     src/Appearance.cpp
     src/Symbols.cpp
     src/SetupMapDrawDistanceBridge.S
@@ -53,17 +65,29 @@ add_library(savr SHARED
     src/Driving.cpp
     src/GestureMove.cpp
     src/GraphicsEffects.cpp
+    src/Basketball.cpp
+    src/MapZoom.cpp
+    src/BrainDiag.cpp
     src/HdWeapons.cpp
     src/Holster.cpp
     src/Melee.cpp
     src/PerfTelemetry.cpp
     src/PhysicalWeapon.cpp
+    src/Pickups.cpp
     src/ScopeAim.cpp
     src/Throwable.cpp
     src/TrafficCensus.cpp
     src/Weapon.cpp
     src/Calib.cpp
 )
+
+# `.incbin` inputs are invisible to Ninja's assembler dependency scan.  Make
+# the generated pack an explicit dependency so changing/simplifying the HLOD
+# cannot silently leave yesterday's bytes embedded in a freshly linked .so.
+set(AIRCRAFT_HLOD_PACK
+    "${CMAKE_BINARY_DIR}/../aircraft-hlod-global/aircraft.hlod")
+set_property(SOURCE src/AircraftHlodData.S PROPERTY OBJECT_DEPENDS
+    "${AIRCRAFT_HLOD_PACK}")
 
 target_include_directories(savr PRIVATE src ${OPENXR_DIR}/include)
 

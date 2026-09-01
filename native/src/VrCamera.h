@@ -38,6 +38,13 @@ void RefreshStereoGate();
 // is up, read from gMobileMenu's authoritative fields. The input pump uses it
 // to hold the game's user pause for the whole pause-menu visit.
 bool IsMobileMenuOpen();
+// True during freefall before the deploy widget confirms the canopy. Physical
+// weapon/throwable grabs are blocked while the deploy ring owns both hands.
+bool ParachuteWeaponInteractionBlocked();
+
+// Preserve the OpenXR-recommended per-eye raster size when the engine's flat
+// SurfaceTexture uses a separate landscape size for Android menus/cutscenes.
+void SetStereoBaseSize(int width, int height);
 
 // Current HMD yaw relative to the recentered LOCAL origin. Bicycle MOTION mode
 // uses it as the steering input, matching the PC GTA SA VR implementation.
@@ -84,11 +91,28 @@ bool WorldPointToTracking(const float worldPoint[3], float trackingPoint[3]);
 // Invalidate the yaw/position origin; the next live HMD pose becomes neutral.
 void RequestRecenter();
 
-// Quest-safe eye render scale. The menu edits a small persisted set of
-// percentages; the render hook allocates a complete replacement ring and only
-// switches once every new RenderWare texture is ready.
+// Vice City-style cutscene camera selector. During a stereo story/scripted
+// scene R3 cycles director/actor cameras and L3 persists the current choice for
+// that scene. The input layer calls these only on the GameThread.
+bool CutsceneCameraControlsActive();
+int  GetCutsceneCameraCount();
+void CycleCutsceneCamera();
+void RememberCutsceneCamera();
+
+// Quest-safe eye render scale. The requested percentage is persisted
+// immediately while a complete replacement stereo ring is prepared in the
+// background and switched atomically once every texture is ready.
 int  GetRenderScalePercent();
+int  GetActiveRenderScalePercent();
+bool RenderScaleChangePending();
 void AdjustRenderScale(int direction);
+bool AreWorldEffectsEnabled();
+void SetWorldEffectsEnabled(bool enabled);
+int  GetDynamicShadowMode();
+const char* GetDynamicShadowModeName();
+void AdjustDynamicShadowMode(int direction);
+bool AreDynamicShadowsEnabled();
+void SetDynamicShadowsEnabled(bool enabled);
 bool AreNeonSignsEnabled();
 void SetNeonSignsEnabled(bool enabled);
 bool IsColorGradingEnabled();
@@ -98,6 +122,7 @@ void SetHdWeaponsEnabled(bool enabled);
 int  GetGraphicsDistanceSettingCount();
 const char* GetGraphicsDistanceSettingName(int field);
 int  GetGraphicsDistanceSettingMeters(int field);
+bool GraphicsDistanceSettingUsesRetail(int field);
 bool GraphicsDistanceSettingNeedsRestart(int field);
 void AdjustGraphicsDistanceSetting(int field, int direction);
 void ResetGraphicsDefaults();

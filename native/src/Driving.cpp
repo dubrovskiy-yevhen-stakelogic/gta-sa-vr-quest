@@ -92,7 +92,9 @@ void MultiplyQuaternion(const float a[4],const float b[4],float output[4]) {
 constexpr int kDefaults[F_COUNT] = {
     0, 0, 15, 0, 15,
     0, 15, 0, 15,
-    0, 48, 43, 18, 30, 30, 82
+    0, 48, 43, 18, 30, 30, 82,
+    0, 15, 0, 15, 0, 15,
+    0, 0, 0, 0, 0, 0
 };
 // Temporary known-good baseline.  The vehicle camera and basic R2/L2/stick
 // controls must be proven independently before the physical wheel is allowed
@@ -139,7 +141,9 @@ std::atomic<int> g_value[F_COUNT] = {
     0, 15, 0, 15,
     0, 48, 43, 18, 30, 30, 82,
     // plane seat D/H, boat seat D/H, immersive boat seat D/H
-    0, 15, 0, 15, 0, 15
+    0, 15, 0, 15, 0, 15,
+    // bike/car-immersive/bike-immersive/plane/boat/boat-immersive side
+    0, 0, 0, 0, 0, 0
 };
 std::atomic<bool> g_wheelVisible{true};
 std::atomic<bool> g_highlights{true};
@@ -148,6 +152,24 @@ std::atomic<bool> g_bikeHorizonLocked{true};
 std::atomic<int> g_bikeVisualLeanPercent{50};
 std::atomic<bool> g_keepRiderOnFlips{false};
 std::atomic<bool> g_hideInteriorGlass{true};
+std::atomic<bool> g_drivebyImmersive{false};
+// Car camera motion: default LEVEL (comfort); FULL TILT throws the view with
+// the car body over hills, jumps and rolls for players who dislike the
+// stabilised horizon.
+std::atomic<bool> g_carCameraTilt{false};
+// MOTION steering (Vice City port, verbatim curve): the chosen hand's
+// aim-pose yaw against a reference captured on the first throttle press.
+// +-30 deg maps to half steering (fine control), 30..90 deg to the rest;
+// 3 deg deadzone. GameThread-only except the atomic output.
+std::atomic<float> g_motionSteering{0.0f};
+std::atomic<int>   g_motionHand{1};
+void* g_motionVehicle = nullptr;
+bool  g_motionRefValid = false;
+float g_motionRefHeading = 0.0f;
+std::atomic<bool> g_motionEngaged{false};
+// Boat camera motion, same semantics for appearance-4 hulls: LEVEL keeps
+// the stabilised horizon, WITH BOAT throws the view with the hull.
+std::atomic<bool> g_boatCameraTilt{false};
 std::atomic<bool> g_inputBlocked{false};
 std::atomic<bool> g_menuPreview{false};
 std::atomic<int> g_menuCalibrationHand{-1};
@@ -156,6 +178,10 @@ std::atomic<int> g_activeVehicleModel{-1};
 std::atomic<int> g_activeBikeAccelerator{BIKE_ACCEL_HOLD_TRIGGER};
 std::atomic<bool> g_radioButtonDown{false};
 std::atomic<bool> g_radioChangeJustPressed{false};
+std::atomic<bool> g_radioPrevJustPressed{false};
+// Station-name toast (player request: visible radio navigation).
+double g_radioToastUntil = 0.0;
+int    g_radioLastStation = -999;
 
 std::mutex g_stateMutex;
 WheelVisualState g_visual{};
@@ -219,6 +245,7 @@ float g_bicycleTriggerPulse{};
 double g_bicycleTriggerPreviousTime{};
 
 struct ModelCalibration {
+    int seatSide[MODE_COUNT]{};
     int seatForward[MODE_COUNT]{};
     int seatHeight[MODE_COUNT]{};
     int control[2][CONTROL_FIELD_COUNT]{};
@@ -230,9 +257,9 @@ int ClampWheelCalibration(int field, int value) {
     switch (field) {
         case WHEEL_CAL_SIDE:
         case WHEEL_CAL_FORWARD:
-        case WHEEL_CAL_HEIGHT:  return std::clamp(value, -60, 60);   // cm
-        case WHEEL_CAL_RADIUS:  return std::clamp(value, -20, 25);   // cm
-        default:                return std::clamp(value, -120, 120); // half-deg
+        case WHEEL_CAL_HEIGHT:  return std::clamp(value, -500, 500);  // cm
+        case WHEEL_CAL_RADIUS:  return std::clamp(value, -100, 200);  // cm delta
+        default:                return std::clamp(value, -1440, 1440);// half-deg
     }
 }
 std::mutex g_modelMutex;
@@ -240,26 +267,47 @@ std::map<int, ModelCalibration> g_modelCalibration;
 
 int ClampField(int field, int value) {
     switch (field) {
-        case F_SIDE:           return std::clamp(value, -100, 100);
-        case F_DISTANCE:       return std::clamp(value, -100, 100);
-        case F_HEIGHT:         return std::clamp(value, -100, 150);
-        case F_BIKE_SEAT_DISTANCE:return std::clamp(value, -100, 100);
-        case F_BIKE_SEAT_HEIGHT:return std::clamp(value, -100, 150);
+        case F_SIDE:
+        case F_BIKE_SEAT_SIDE:
+        case F_IMMERSIVE_CAR_SEAT_SIDE:
+        case F_IMMERSIVE_BIKE_SEAT_SIDE:
+        case F_PLANE_SEAT_SIDE:
+        case F_BOAT_SEAT_SIDE:
+        case F_IMMERSIVE_BOAT_SEAT_SIDE:
+        case F_DISTANCE:
+        case F_HEIGHT:
+        case F_BIKE_SEAT_DISTANCE:
+        case F_BIKE_SEAT_HEIGHT:
         case F_IMMERSIVE_CAR_SEAT_DISTANCE:
         case F_IMMERSIVE_BIKE_SEAT_DISTANCE:
-            return std::clamp(value, -100, 100);
         case F_IMMERSIVE_CAR_SEAT_HEIGHT:
         case F_IMMERSIVE_BIKE_SEAT_HEIGHT:
-            return std::clamp(value, -100, 150);
-        case F_WHEEL_SIDE:     return std::clamp(value, -100, 100);
-        case F_WHEEL_DISTANCE: return std::clamp(value, 10, 120);
-        case F_WHEEL_HEIGHT:   return std::clamp(value, -30, 120);
-        case F_WHEEL_RADIUS:   return std::clamp(value, 8, 40);
-        case F_BIKE_HALF_WIDTH:return std::clamp(value, 16, 55);
-        case F_BIKE_DISTANCE:  return std::clamp(value, -20, 100);
-        case F_BIKE_HEIGHT:    return std::clamp(value, 30, 140);
+        case F_PLANE_SEAT_DISTANCE:
+        case F_PLANE_SEAT_HEIGHT:
+        case F_BOAT_SEAT_DISTANCE:
+        case F_BOAT_SEAT_HEIGHT:
+        case F_IMMERSIVE_BOAT_SEAT_DISTANCE:
+        case F_IMMERSIVE_BOAT_SEAT_HEIGHT:
+        case F_WHEEL_SIDE:
+        case F_WHEEL_DISTANCE:
+        case F_WHEEL_HEIGHT:
+        case F_BIKE_DISTANCE:
+        case F_BIKE_HEIGHT:
+            return std::clamp(value, -500, 500);
+        case F_WHEEL_RADIUS:   return std::clamp(value, 1, 200);
+        case F_BIKE_HALF_WIDTH:return std::clamp(value, 1, 200);
         default:               return 0;
     }
+}
+
+int GlobalSeatSideField(int vehicleType, int mode) {
+    const bool immersive = mode == MODE_IMMERSIVE;
+    if (vehicleType == VEHICLE_BIKE)
+        return immersive ? F_IMMERSIVE_BIKE_SEAT_SIDE : F_BIKE_SEAT_SIDE;
+    if (vehicleType == VEHICLE_PLANE) return F_PLANE_SEAT_SIDE;
+    if (vehicleType == VEHICLE_BOAT)
+        return immersive ? F_IMMERSIVE_BOAT_SEAT_SIDE : F_BOAT_SEAT_SIDE;
+    return immersive ? F_IMMERSIVE_CAR_SEAT_SIDE : F_SIDE;
 }
 
 int GlobalSeatField(int vehicleType, int mode, bool height) {
@@ -285,12 +333,13 @@ int GlobalSeatField(int vehicleType, int mode, bool height) {
 }
 
 int ClampModelSeat(bool height, int value) {
-    return std::clamp(value, -100, height ? 150 : 100);
+    (void)height;
+    return std::clamp(value, -500, 500);
 }
 
 int ClampControlValue(int field, int value) {
-    return std::clamp(value, field >= CONTROL_ROT_X ? -720 : -300,
-                             field >= CONTROL_ROT_X ?  720 :  300);
+    return std::clamp(value, field >= CONTROL_ROT_X ? -2880 : -2000,
+                             field >= CONTROL_ROT_X ?  2880 :  2000);
 }
 
 void Save() {
@@ -315,27 +364,39 @@ void Save() {
                  g_value[F_PLANE_SEAT_DISTANCE].load());
     std::fprintf(file, "PlaneSeatHeightCm=%d\n",
                  g_value[F_PLANE_SEAT_HEIGHT].load());
+    std::fprintf(file, "PlaneSeatSideCm=%d\n",
+                 g_value[F_PLANE_SEAT_SIDE].load());
     std::fprintf(file, "BoatSeatDistanceCm=%d\n",
                  g_value[F_BOAT_SEAT_DISTANCE].load());
     std::fprintf(file, "BoatSeatHeightCm=%d\n",
                  g_value[F_BOAT_SEAT_HEIGHT].load());
+    std::fprintf(file, "BoatSeatSideCm=%d\n",
+                 g_value[F_BOAT_SEAT_SIDE].load());
     std::fprintf(file, "ImmersiveBoatSeatDistanceCm=%d\n",
                  g_value[F_IMMERSIVE_BOAT_SEAT_DISTANCE].load());
     std::fprintf(file, "ImmersiveBoatSeatHeightCm=%d\n",
                  g_value[F_IMMERSIVE_BOAT_SEAT_HEIGHT].load());
+    std::fprintf(file, "ImmersiveBoatSeatSideCm=%d\n",
+                 g_value[F_IMMERSIVE_BOAT_SEAT_SIDE].load());
     std::fprintf(file, "DefaultSeatSideCm=%d\n", g_value[F_SIDE].load());
     std::fprintf(file, "DefaultSeatDistanceCm=%d\n", g_value[F_DISTANCE].load());
     std::fprintf(file, "DefaultSeatHeightCm=%d\n", g_value[F_HEIGHT].load());
     std::fprintf(file, "DefaultBikeSeatDistanceCm=%d\n", g_value[F_BIKE_SEAT_DISTANCE].load());
     std::fprintf(file, "DefaultBikeSeatHeightCm=%d\n", g_value[F_BIKE_SEAT_HEIGHT].load());
+    std::fprintf(file, "DefaultBikeSeatSideCm=%d\n",
+                 g_value[F_BIKE_SEAT_SIDE].load());
     std::fprintf(file, "ImmersiveCarSeatDistanceCm=%d\n",
                  g_value[F_IMMERSIVE_CAR_SEAT_DISTANCE].load());
     std::fprintf(file, "ImmersiveCarSeatHeightCm=%d\n",
                  g_value[F_IMMERSIVE_CAR_SEAT_HEIGHT].load());
+    std::fprintf(file, "ImmersiveCarSeatSideCm=%d\n",
+                 g_value[F_IMMERSIVE_CAR_SEAT_SIDE].load());
     std::fprintf(file, "ImmersiveBikeSeatDistanceCm=%d\n",
                  g_value[F_IMMERSIVE_BIKE_SEAT_DISTANCE].load());
     std::fprintf(file, "ImmersiveBikeSeatHeightCm=%d\n",
                  g_value[F_IMMERSIVE_BIKE_SEAT_HEIGHT].load());
+    std::fprintf(file, "ImmersiveBikeSeatSideCm=%d\n",
+                 g_value[F_IMMERSIVE_BIKE_SEAT_SIDE].load());
     std::fprintf(file, "WheelCenterSideCm=%d\n", g_value[F_WHEEL_SIDE].load());
     std::fprintf(file, "WheelCenterDistanceCm=%d\n", g_value[F_WHEEL_DISTANCE].load());
     std::fprintf(file, "WheelCenterHeightCm=%d\n", g_value[F_WHEEL_HEIGHT].load());
@@ -354,6 +415,13 @@ void Save() {
                  g_keepRiderOnFlips.load()?1:0);
     std::fprintf(file, "HideInteriorGlass=%d\n",
                  g_hideInteriorGlass.load()?1:0);
+    std::fprintf(file, "DrivebyImmersive=%d\n",
+                 g_drivebyImmersive.load()?1:0);
+    std::fprintf(file, "CarCameraTilt=%d\n",
+                 g_carCameraTilt.load()?1:0);
+    std::fprintf(file, "MotionSteeringHand=%d\n", g_motionHand.load());
+    std::fprintf(file, "BoatCameraTilt=%d\n",
+                 g_boatCameraTilt.load()?1:0);
     {
         static const char* const controlKeys[CONTROL_FIELD_COUNT] = {
             "OffsetX", "OffsetY", "OffsetZ",
@@ -364,6 +432,8 @@ void Save() {
             const int model = entry.first;
             const ModelCalibration& calibration = entry.second;
             for (int mode = 0; mode < MODE_COUNT; ++mode) {
+                std::fprintf(file, "ModelSeat.%d.%d.SideCm=%d\n",
+                             model, mode, calibration.seatSide[mode]);
                 std::fprintf(file, "ModelSeat.%d.%d.ForwardCm=%d\n",
                              model, mode, calibration.seatForward[mode]);
                 std::fprintf(file, "ModelSeat.%d.%d.HeightCm=%d\n",
@@ -396,6 +466,10 @@ void Load() {
     int bikeLockHorizon = 1, bikeVisualLeanPercent = 50;
     int keepRiderOnFlips = 0;
     int hideInteriorGlass = 1;
+    int drivebyImmersive = 0;
+    int carCameraTilt = 0;
+    int motionHand = 1;
+    int boatCameraTilt = 0;
     if (FILE* file = std::fopen(kPath, "r")) {
         char line[128];
         while (std::fgets(line, sizeof(line), file)) {
@@ -427,40 +501,53 @@ void Load() {
             else if (std::sscanf(line, "BoatCameraView=%d", &value)==1)
                 g_boatView.store(std::clamp(value,0,VIEW_MODE_COUNT-1));
             else if (std::sscanf(line, "BoatDrivingType=%d", &value)==1)
-                g_boatMode.store(std::clamp(value,0,MODE_COUNT-1));
+                g_boatMode.store(value == MODE_IMMERSIVE ? MODE_IMMERSIVE
+                                                         : MODE_DEFAULT);
             else if (std::sscanf(line, "PlaneDrivingType=%d", &value)==1)
-                g_planeMode.store(std::clamp(value,0,MODE_COUNT-1));
+                g_planeMode.store(value == MODE_IMMERSIVE ? MODE_IMMERSIVE
+                                                          : MODE_DEFAULT);
             else if (std::sscanf(line, "YokeSensitivityPercent=%d", &value)==1)
                 g_yokeSensitivity.store(std::clamp(value,25,200));
             else if (std::sscanf(line, "PlaneSeatDistanceCm=%d", &value)==1)
                 values[F_PLANE_SEAT_DISTANCE]=value;
             else if (std::sscanf(line, "PlaneSeatHeightCm=%d", &value)==1)
                 values[F_PLANE_SEAT_HEIGHT]=value;
+            else if (std::sscanf(line, "PlaneSeatSideCm=%d", &value)==1)
+                values[F_PLANE_SEAT_SIDE]=value;
             else if (std::sscanf(line, "BoatSeatDistanceCm=%d", &value)==1)
                 values[F_BOAT_SEAT_DISTANCE]=value;
             else if (std::sscanf(line, "BoatSeatHeightCm=%d", &value)==1)
                 values[F_BOAT_SEAT_HEIGHT]=value;
+            else if (std::sscanf(line, "BoatSeatSideCm=%d", &value)==1)
+                values[F_BOAT_SEAT_SIDE]=value;
             else if (std::sscanf(line, "ImmersiveBoatSeatDistanceCm=%d", &value)==1)
                 values[F_IMMERSIVE_BOAT_SEAT_DISTANCE]=value;
             else if (std::sscanf(line, "ImmersiveBoatSeatHeightCm=%d", &value)==1)
                 values[F_IMMERSIVE_BOAT_SEAT_HEIGHT]=value;
+            else if (std::sscanf(line, "ImmersiveBoatSeatSideCm=%d", &value)==1)
+                values[F_IMMERSIVE_BOAT_SEAT_SIDE]=value;
             else if (std::sscanf(line, "DefaultSeatSideCm=%d", &value)==1) values[F_SIDE]=value;
             else if (std::sscanf(line, "DefaultSeatDistanceCm=%d", &value)==1) values[F_DISTANCE]=value;
             else if (std::sscanf(line, "DefaultSeatHeightCm=%d", &value)==1) values[F_HEIGHT]=value;
             else if (std::sscanf(line, "DefaultBikeSeatDistanceCm=%d", &value)==1) values[F_BIKE_SEAT_DISTANCE]=value;
             else if (std::sscanf(line, "DefaultBikeSeatHeightCm=%d", &value)==1) values[F_BIKE_SEAT_HEIGHT]=value;
+            else if (std::sscanf(line, "DefaultBikeSeatSideCm=%d", &value)==1) values[F_BIKE_SEAT_SIDE]=value;
             else if (std::sscanf(line, "ImmersiveCarSeatDistanceCm=%d", &value)==1) {
                 values[F_IMMERSIVE_CAR_SEAT_DISTANCE]=value; immersiveCarSeatSeen=true;
             }
             else if (std::sscanf(line, "ImmersiveCarSeatHeightCm=%d", &value)==1) {
                 values[F_IMMERSIVE_CAR_SEAT_HEIGHT]=value; immersiveCarSeatSeen=true;
             }
+            else if (std::sscanf(line, "ImmersiveCarSeatSideCm=%d", &value)==1)
+                values[F_IMMERSIVE_CAR_SEAT_SIDE]=value;
             else if (std::sscanf(line, "ImmersiveBikeSeatDistanceCm=%d", &value)==1) {
                 values[F_IMMERSIVE_BIKE_SEAT_DISTANCE]=value; immersiveBikeSeatSeen=true;
             }
             else if (std::sscanf(line, "ImmersiveBikeSeatHeightCm=%d", &value)==1) {
                 values[F_IMMERSIVE_BIKE_SEAT_HEIGHT]=value; immersiveBikeSeatSeen=true;
             }
+            else if (std::sscanf(line, "ImmersiveBikeSeatSideCm=%d", &value)==1)
+                values[F_IMMERSIVE_BIKE_SEAT_SIDE]=value;
             else if (std::sscanf(line, "WheelCenterSideCm=%d", &value)==1) values[F_WHEEL_SIDE]=value;
             else if (std::sscanf(line, "WheelCenterDistanceCm=%d", &value)==1) values[F_WHEEL_DISTANCE]=value;
             else if (std::sscanf(line, "WheelCenterHeightCm=%d", &value)==1) values[F_WHEEL_HEIGHT]=value;
@@ -479,9 +566,22 @@ void Load() {
                 keepRiderOnFlips=value;
             else if (std::sscanf(line, "HideInteriorGlass=%d", &value)==1)
                 hideInteriorGlass=value;
+            else if (std::sscanf(line, "DrivebyImmersive=%d", &value)==1)
+                drivebyImmersive=value;
+            else if (std::sscanf(line, "CarCameraTilt=%d", &value)==1)
+                carCameraTilt=value;
+            else if (std::sscanf(line, "MotionSteeringHand=%d", &value)==1)
+                motionHand=value;
+            else if (std::sscanf(line, "BoatCameraTilt=%d", &value)==1)
+                boatCameraTilt=value;
             else {
                 int model = -1, mode = -1, hand = -1;
-                if (std::sscanf(line, "ModelSeat.%d.%d.ForwardCm=%d",
+                if (std::sscanf(line, "ModelSeat.%d.%d.SideCm=%d",
+                                &model, &mode, &value)==3 &&
+                    model >= 0 && mode >= 0 && mode < MODE_COUNT) {
+                    g_modelCalibration[model].seatSide[mode] =
+                        ClampModelSeat(false, value);
+                } else if (std::sscanf(line, "ModelSeat.%d.%d.ForwardCm=%d",
                                 &model, &mode, &value)==3 &&
                     model >= 0 && mode >= 0 && mode < MODE_COUNT) {
                     g_modelCalibration[model].seatForward[mode] =
@@ -560,11 +660,15 @@ void Load() {
         highlights=1;
         LOGI("[driving] migrating legacy settings: BIKE=IMMERSIVE, highlights=ON");
     }
-    const int loadedCarMode=std::clamp(carMode,0,MODE_COUNT-1);
-    const int loadedBikeMode=std::clamp(bikeMode,0,MODE_COUNT-1);
+    // MOTION steering is not shipped.  Migrate old/invalid values to the
+    // ordinary stick mode instead of silently enabling a hand-driven input
+    // path that is no longer exposed by the menu.
+    const int loadedCarMode=carMode==MODE_IMMERSIVE?MODE_IMMERSIVE:MODE_DEFAULT;
+    const int loadedBikeMode=bikeMode==MODE_IMMERSIVE?MODE_IMMERSIVE:MODE_DEFAULT;
     g_carMode.store(kImmersiveDrivingEnabled?loadedCarMode:MODE_DEFAULT);
     g_bikeMode.store(kImmersiveDrivingEnabled?loadedBikeMode:MODE_DEFAULT);
-    g_bicycleMode.store(std::clamp(bicycleMode,0,BICYCLE_MODE_COUNT-1));
+    (void)bicycleMode;
+    g_bicycleMode.store(BICYCLE_HANDLEBAR_TRIGGER);
     for (int field=0; field<F_COUNT; ++field)
         g_value[field].store(ClampField(field, values[field]));
     g_wheelVisible.store(visible!=0);
@@ -575,6 +679,10 @@ void Load() {
         std::clamp(bikeVisualLeanPercent,25,100));
     g_keepRiderOnFlips.store(keepRiderOnFlips!=0);
     g_hideInteriorGlass.store(hideInteriorGlass!=0);
+    g_drivebyImmersive.store(drivebyImmersive!=0);
+    g_carCameraTilt.store(carCameraTilt!=0);
+    g_motionHand.store(std::clamp(motionHand,0,1));
+    g_boatCameraTilt.store(boatCameraTilt!=0);
     LOGI("[driving] car=%s bike=%s seat=%+d/%+d/%+d wheel=%+d/%+d/%+d r=%dcm",
          g_carMode.load()==MODE_IMMERSIVE?"IMMERSIVE":"DEFAULT",
          g_bikeMode.load()==MODE_IMMERSIVE?"IMMERSIVE":"DEFAULT",
@@ -984,14 +1092,18 @@ int ModeForAppearance(int appearance) {
         const int model=g_activeVehicleModel.load(std::memory_order_acquire);
         // Rhino: always chase view. Quad: blocked from immersive until it is
         // mapped onto the bike handlebar controls.
-        if (model==kRhinoModelId||IsQuadBikeModelId(model)||
-            g_carView.load()==VIEW_THIRD_PERSON)
+        if (model==kRhinoModelId||IsQuadBikeModelId(model))
             return MODE_DEFAULT;
-        return g_carMode.load();
+        const int carMode=g_carMode.load();
+        if (g_carView.load()==VIEW_THIRD_PERSON&&carMode==MODE_IMMERSIVE)
+            return MODE_DEFAULT;   // cockpit mode needs the cockpit camera
+        return carMode;
     }
     if (appearance==2) {
-        if (g_bikeView.load()==VIEW_THIRD_PERSON) return MODE_DEFAULT;
-        return g_bikeMode.load();
+        const int bikeMode=g_bikeMode.load();
+        if (g_bikeView.load()==VIEW_THIRD_PERSON&&bikeMode==MODE_IMMERSIVE)
+            return MODE_DEFAULT;
+        return bikeMode;
     }
     if (appearance==4) {
         if (g_boatView.load()==VIEW_THIRD_PERSON) return MODE_DEFAULT;
@@ -1013,7 +1125,7 @@ bool BuildWheelTracking(WheelVisualState* visual) {
         reinterpret_cast<const char*>(vehicle)+0x32);
     V3 vr,vf,vu,vp;
     if (!ReadEntityMatrix(vehicle,&vr,&vf,&vu,&vp)) return false;
-    // CPed::m_matrix is commonly null while seated on Android. qbuild needs the
+    // CPed::m_matrix is commonly null while seated on Android. reference Quest build needs the
     // player's world position only, so use the exported FindPlayerCoors HFA
     // instead of making the entire wheel depend on that optional ped matrix.
     V3 pp = vp + vu * 0.65f;
@@ -1444,6 +1556,7 @@ AxisQueryFn g_origAccelerate{},g_origBrake{},g_origSteering{},
             g_origSteeringUpDown{},g_origHandBrake{};
 SprintFn g_origSprint{};
 ButtonQueryFn g_origNextStation{};
+ButtonQueryFn g_origLastStation{};
 BikePreRenderFn g_origBikePreRender{};
 KnockOffAffectsPedFn g_origKnockOffAffectsPed{};
 
@@ -1647,7 +1760,7 @@ void UpdateInteriorGlassMaterials() {
 // earlier by writing Touch R2/L2 directly to Cross/Square.  These hooks are the
 // equivalent SA boundary: while the local player is in any vehicle, return the
 // VR value without first entering the game's touch-widget query/trampoline.
-// Besides matching qbuild, that keeps vehicle entry independent of several
+// Besides matching reference Quest build, that keeps vehicle entry independent of several
 // mobile-only UI calls in the original queries.
 bool HasPlayerVehicle() {
     return g.FindPlayerVehicle&&g.FindPlayerVehicle(-1,false)!=nullptr;
@@ -1677,7 +1790,7 @@ int OnGetAccelerate(void* pad) {
                     std::clamp(input.triggers[1],0.0f,1.0f)*255.0f);
             return static_cast<int>(std::clamp(g_bikeThrottle,0.0f,1.0f)*255.0f);
         }
-        // qbuild replaces Cross completely while driving: A is the handbrake
+        // reference Quest build replaces Cross completely while driving: A is the handbrake
         // and R2 alone is the authoritative accelerator.
         return static_cast<int>(std::clamp(input.triggers[1],0.0f,1.0f)*255.0f);
     }
@@ -1691,9 +1804,27 @@ int OnGetBrake(void* pad) {
     }
     return g_origBrake?g_origBrake(pad):0;
 }
+void ReadMappedGameplaySticks(const xr::InputState& input,
+                              float& moveX,float& moveY,
+                              float& turnX,float& turnY) {
+    locomotion::MapGameplaySticks(
+        input.leftStick[0],input.leftStick[1],
+        input.rightStick[0],input.rightStick[1],
+        &moveX,&moveY,&turnX,&turnY);
+}
+
 int OnGetSteering(void* pad) {
     EnsureInit();
     if (VrGameplayInputAllowed()&&HasPlayerVehicle()) {
+        const int steerAppearance=GetActiveVehicleAppearance();
+        if ((steerAppearance==1||steerAppearance==2)&&
+            ModeForAppearance(steerAppearance)==MODE_MOTION) {
+            // MOTION: controller-yaw steering, same stock-minus convention
+            // as the immersive wheel below.
+            return static_cast<int>(-std::clamp(
+                g_motionSteering.load(std::memory_order_relaxed),
+                -1.0f,1.0f)*128.0f);
+        }
         if (ModeForAppearance(GetActiveVehicleAppearance())==MODE_IMMERSIVE) {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             const int model=g_activeVehicleModel.load(std::memory_order_acquire);
@@ -1714,8 +1845,10 @@ int OnGetSteering(void* pad) {
         // retain immediate stick steering.  The Android query does not reliably
         // read the NewState axis written by VrCamera::OnUpdatePads.
         xr::InputState input{}; xr::GetInput(input);
+        float moveX=0.0f,moveY=0.0f,turnX=0.0f,turnY=0.0f;
+        ReadMappedGameplaySticks(input,moveX,moveY,turnX,turnY);
         const int steer=static_cast<int>(
-            std::clamp(input.leftStick[0],-1.0f,1.0f)*128.0f);
+            std::clamp(moveX,-1.0f,1.0f)*128.0f);
         // Helis feed this value into their roll channel (ProcessControlInputs
         // stores -steer/128 at heli+0xbd4); log it so a capture shows whether
         // the stick reaches the game.
@@ -1754,8 +1887,10 @@ int OnGetSteeringUpDown(void* pad) {
             // stick felt completely dead (roll alone is heavily auto-levelled
             // and nearly invisible). Stick forward = nose down.
             xr::InputState input{}; xr::GetInput(input);
+            float moveX=0.0f,moveY=0.0f,turnX=0.0f,turnY=0.0f;
+            ReadMappedGameplaySticks(input,moveX,moveY,turnX,turnY);
             return static_cast<int>(
-                -std::clamp(input.leftStick[1],-1.0f,1.0f)*128.0f);
+                -std::clamp(moveY,-1.0f,1.0f)*128.0f);
         }
     }
     return g_origSteeringUpDown?g_origSteeringUpDown(pad):0;
@@ -1795,7 +1930,8 @@ bool OnGetSprint(void* pad,int sprintType) {
         // Vice City Cross mapping through the remappable bindings: any face
         // button assigned to SPRINT feeds Cross, plus R2 as before.
         return locomotion::ActionHeld(locomotion::BIND_ACT_SPRINT,
-                                      input.a,input.b,input.x,input.y,true)||
+                                      input.a,input.b,input.x,input.y,
+                                      input.l3,input.r3,true)||
                input.triggers[1]>=0.50f;
     }
     return g_origSprint?g_origSprint(pad,sprintType):false;
@@ -1808,6 +1944,14 @@ bool OnNextStationJustUp(void* pad) {
         return true;
     }
     return g_origNextStation ? g_origNextStation(pad) : false;
+}
+bool OnLastStationJustUp(void* pad) {
+    if (VrGameplayInputAllowed() && HasPlayerVehicle() &&
+        g_radioPrevJustPressed.exchange(false, std::memory_order_acq_rel)) {
+        LOGI("[driving] grip+X -> previous radio station");
+        return true;
+    }
+    return g_origLastStation ? g_origLastStation(pad) : false;
 }
 
 bool PatchAbsoluteJump(void* target,void* replacement) {
@@ -1991,7 +2135,9 @@ int OnGetCarGunUpDown(void* pad, int ignoreDucking, void* vehicle,
                       float range, int useSecondary) {
     if (AircraftRightStickActive()) {
         xr::InputState input{}; xr::GetInput(input);
-        float v = input.rightStick[1];
+        float moveX=0.0f,moveY=0.0f,turnX=0.0f,turnY=0.0f;
+        ReadMappedGameplaySticks(input,moveX,moveY,turnX,turnY);
+        float v = turnY;
         if (std::abs(v) < 0.18f) v = 0.0f;
         // Stick forward sweeps the Hydra nozzles toward level flight.
         return static_cast<int>(std::clamp(v, -1.0f, 1.0f) * 128.0f);
@@ -2004,7 +2150,9 @@ int OnGetCarGunUpDown(void* pad, int ignoreDucking, void* vehicle,
 int OnGetCarGunLeftRight(void* pad, int ignoreDucking, int useSecondary) {
     if (AircraftRightStickActive()) {
         xr::InputState input{}; xr::GetInput(input);
-        float v = input.rightStick[0];
+        float moveX=0.0f,moveY=0.0f,turnX=0.0f,turnY=0.0f;
+        ReadMappedGameplaySticks(input,moveX,moveY,turnX,turnY);
+        float v = turnX;
         if (std::abs(v) < 0.18f) v = 0.0f;
         return static_cast<int>(std::clamp(v, -1.0f, 1.0f) * 128.0f);
     }
@@ -2148,7 +2296,9 @@ int OnGetTurretLeft(void* pad) {
     if (VrGameplayInputAllowed() &&
         g_activeVehicleAppearance.load(std::memory_order_acquire) == 3) {
         xr::InputState input{}; xr::GetInput(input);
-        return input.rightStick[0] < -0.35f ? 1 : 0;
+        float moveX=0.0f,moveY=0.0f,turnX=0.0f,turnY=0.0f;
+        ReadMappedGameplaySticks(input,moveX,moveY,turnX,turnY);
+        return turnX < -0.35f ? 1 : 0;
     }
     return g_origTurretLeft ? g_origTurretLeft(pad) : 0;
 }
@@ -2157,7 +2307,9 @@ int OnGetTurretRight(void* pad) {
     if (VrGameplayInputAllowed() &&
         g_activeVehicleAppearance.load(std::memory_order_acquire) == 3) {
         xr::InputState input{}; xr::GetInput(input);
-        return input.rightStick[0] > 0.35f ? 1 : 0;
+        float moveX=0.0f,moveY=0.0f,turnX=0.0f,turnY=0.0f;
+        ReadMappedGameplaySticks(input,moveX,moveY,turnX,turnY);
+        return turnX > 0.35f ? 1 : 0;
     }
     return g_origTurretRight ? g_origTurretRight(pad) : 0;
 }
@@ -2270,6 +2422,11 @@ void InstallPadHooks() {
     g_origNextStation=reinterpret_cast<ButtonQueryFn>(InstallStationTrampoline(
         reinterpret_cast<void*>(g.CPad_NextStationJustUp),
         reinterpret_cast<void*>(&OnNextStationJustUp)));
+    // LastStationJustUp shares the exact NextStation prologue (verified in
+    // the shipped arm64), so the same verified trampoline applies.
+    g_origLastStation=reinterpret_cast<ButtonQueryFn>(InstallStationTrampoline(
+        reinterpret_cast<void*>(g.CPad_LastStationJustUp),
+        reinterpret_cast<void*>(&OnLastStationJustUp)));
     LOGI("[driving] aircraft gamepad input-type patch=%d",
          InstallInputTypePatch()?1:0);
     constexpr std::uint32_t carGunUpDown[4]={
@@ -2417,8 +2574,15 @@ void CycleMode(int direction) {
 }
 int GetCarMode() { EnsureInit(); return g_carMode.load(); }
 int GetBikeMode() { EnsureInit(); return g_bikeMode.load(); }
-const char* GetCarModeName() { return GetCarMode()==MODE_IMMERSIVE?"IMMERSIVE":"DEFAULT"; }
-const char* GetBikeModeName() { return GetBikeMode()==MODE_IMMERSIVE?"IMMERSIVE":"DEFAULT"; }
+const char* ModeName(int mode) {
+    switch (mode) {
+        case MODE_IMMERSIVE: return "IMMERSIVE";
+        case MODE_MOTION:    return "MOTION";
+        default:             return "DEFAULT";
+    }
+}
+const char* GetCarModeName() { return ModeName(GetCarMode()); }
+const char* GetBikeModeName() { return ModeName(GetBikeMode()); }
 void CycleCarMode(int direction) {
     EnsureInit(); if (direction==0) return;
     if (!kImmersiveDrivingEnabled) {
@@ -2427,7 +2591,7 @@ void CycleCarMode(int direction) {
         LOGW("[driving] IMMERSIVE is disabled in this diagnostic build");
         return;
     }
-    g_carMode.store((g_carMode.load()+MODE_COUNT+(direction<0?-1:1))%MODE_COUNT);
+    g_carMode.store((g_carMode.load()+MODE_MOTION+(direction<0?-1:1))%MODE_MOTION);
     Save(); ResetInteraction(); LOGI("[driving] car mode -> %s",GetCarModeName());
 }
 void CycleBikeMode(int direction) {
@@ -2437,7 +2601,7 @@ void CycleBikeMode(int direction) {
         ResetInteraction();
         return;
     }
-    g_bikeMode.store((g_bikeMode.load()+MODE_COUNT+(direction<0?-1:1))%MODE_COUNT);
+    g_bikeMode.store((g_bikeMode.load()+MODE_MOTION+(direction<0?-1:1))%MODE_MOTION);
     Save(); ResetInteraction(); LOGI("[driving] bike mode -> %s",GetBikeModeName());
 }
 
@@ -2458,16 +2622,15 @@ int GetModeForVehicleType(int vehicleType) {
     }
 }
 const char* GetModeNameForVehicleType(int vehicleType) {
-    return GetModeForVehicleType(vehicleType)==MODE_IMMERSIVE?
-        "IMMERSIVE":"DEFAULT";
+    return ModeName(GetModeForVehicleType(vehicleType));
 }
 void CycleModeForVehicleType(int vehicleType,int direction) {
     if (vehicleType==VEHICLE_BIKE) { CycleBikeMode(direction); return; }
     if (vehicleType==VEHICLE_PLANE) {
         EnsureInit(); if (direction==0) return;
         if (!kImmersiveDrivingEnabled) { g_planeMode.store(MODE_DEFAULT); return; }
-        g_planeMode.store((g_planeMode.load()+MODE_COUNT+
-                           (direction<0?-1:1))%MODE_COUNT);
+        g_planeMode.store((g_planeMode.load()+MODE_MOTION+
+                           (direction<0?-1:1))%MODE_MOTION);
         Save(); ResetInteraction();
         LOGI("[driving] plane mode -> %s",
              g_planeMode.load()==MODE_IMMERSIVE?"IMMERSIVE":"DEFAULT");
@@ -2476,8 +2639,8 @@ void CycleModeForVehicleType(int vehicleType,int direction) {
     if (vehicleType==VEHICLE_BOAT) {
         EnsureInit(); if (direction==0) return;
         if (!kImmersiveDrivingEnabled) { g_boatMode.store(MODE_DEFAULT); return; }
-        g_boatMode.store((g_boatMode.load()+MODE_COUNT+
-                          (direction<0?-1:1))%MODE_COUNT);
+        g_boatMode.store((g_boatMode.load()+MODE_MOTION+
+                          (direction<0?-1:1))%MODE_MOTION);
         Save(); ResetInteraction();
         LOGI("[driving] boat mode -> %s",
              g_boatMode.load()==MODE_IMMERSIVE?"IMMERSIVE":"DEFAULT");
@@ -2547,13 +2710,9 @@ const char* GetBicycleImmersiveModeName() {
         "HANDLEBAR + R2":"MOTION";
 }
 void CycleBicycleImmersiveMode(int direction) {
-    EnsureInit(); if (!direction) return;
-    const int next=(g_bicycleMode.load()+BICYCLE_MODE_COUNT+
-                    (direction<0?-1:1))%BICYCLE_MODE_COUNT;
-    g_bicycleMode.store(next,std::memory_order_release);
-    Save(); ResetInteraction();
-    LOGI("[driving] bicycle immersive mode -> %s",
-         GetBicycleImmersiveModeName());
+    EnsureInit();
+    (void)direction;
+    g_bicycleMode.store(BICYCLE_HANDLEBAR_TRIGGER,std::memory_order_release);
 }
 
 int GetCurrentBikeAcceleratorMode() {
@@ -2591,56 +2750,62 @@ namespace {
 // the full VC set with the immersive helm wheel.
 constexpr int kDefaultBikeItems[] = {
     MENU_VEHICLE_TYPE, MENU_DRIVING_TYPE, MENU_CAMERA_VIEW,
+    MENU_GLOBAL_SIDE,
     MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE,
     MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
-    MENU_KEEP_RIDER_ON_FLIPS, MENU_RESET, MENU_BACK
+    MENU_KEEP_RIDER_ON_FLIPS, MENU_DRIVEBY_AIM, MENU_RESET, MENU_BACK
 };
 constexpr int kDefaultCarItems[] = {
     MENU_VEHICLE_TYPE, MENU_DRIVING_TYPE, MENU_CAMERA_VIEW,
-    MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
-    MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
-    MENU_INTERIOR_GLASS, MENU_RESET, MENU_BACK
+    MENU_CAR_CAMERA_TILT,
+    MENU_GLOBAL_SIDE, MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE, MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
+    MENU_INTERIOR_GLASS, MENU_DRIVEBY_AIM, MENU_RESET, MENU_BACK
 };
 constexpr int kImmersiveBikeItems[] = {
     MENU_VEHICLE_TYPE, MENU_DRIVING_TYPE, MENU_CAMERA_VIEW,
-    MENU_BICYCLE_MODE, MENU_BIKE_ACCELERATOR,
-    MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
-    MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
+    MENU_BIKE_ACCELERATOR,
+    MENU_GLOBAL_SIDE, MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE, MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
     MENU_CONTROL_CALIBRATION, MENU_HANDLE_HIGHLIGHTS,
     MENU_BIKE_HAND_TILT, MENU_LOCAL_HORIZON, MENU_BIKE_VISUAL_LEAN,
     MENU_KEEP_RIDER_ON_FLIPS, MENU_RESET, MENU_BACK
 };
 constexpr int kImmersiveCarItems[] = {
     MENU_VEHICLE_TYPE, MENU_DRIVING_TYPE, MENU_CAMERA_VIEW,
-    MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
-    MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
+    MENU_CAR_CAMERA_TILT,
+    MENU_GLOBAL_SIDE, MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE, MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
     MENU_CONTROL_CALIBRATION, MENU_HANDLE_HIGHLIGHTS,
     MENU_WHEEL_VISIBLE, MENU_INTERIOR_GLASS, MENU_RESET, MENU_BACK
 };
 constexpr int kDefaultPlaneItems[] = {
     MENU_VEHICLE_TYPE, MENU_DRIVING_TYPE, MENU_CAMERA_VIEW,
-    MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
-    MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
+    MENU_GLOBAL_SIDE, MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE, MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
     MENU_INTERIOR_GLASS, MENU_RESET, MENU_BACK
 };
 constexpr int kImmersivePlaneItems[] = {
     MENU_VEHICLE_TYPE, MENU_DRIVING_TYPE, MENU_CAMERA_VIEW,
-    MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
-    MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
+    MENU_GLOBAL_SIDE, MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE, MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
     MENU_CONTROL_CALIBRATION, MENU_YOKE_SENSITIVITY,
     MENU_HANDLE_HIGHLIGHTS,
     MENU_WHEEL_VISIBLE, MENU_INTERIOR_GLASS, MENU_RESET, MENU_BACK
 };
 constexpr int kDefaultBoatItems[] = {
     MENU_VEHICLE_TYPE, MENU_DRIVING_TYPE, MENU_CAMERA_VIEW,
-    MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
-    MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
+    MENU_BOAT_CAMERA_TILT,
+    MENU_GLOBAL_SIDE, MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE, MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
     MENU_RESET, MENU_BACK
 };
 constexpr int kImmersiveBoatItems[] = {
     MENU_VEHICLE_TYPE, MENU_DRIVING_TYPE, MENU_CAMERA_VIEW,
-    MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
-    MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
+    MENU_BOAT_CAMERA_TILT,
+    MENU_GLOBAL_SIDE, MENU_GLOBAL_FORWARD, MENU_GLOBAL_HEIGHT,
+    MENU_MODEL_SIDE, MENU_MODEL_FORWARD, MENU_MODEL_HEIGHT,
     MENU_CONTROL_CALIBRATION, MENU_HANDLE_HIGHLIGHTS,
     MENU_WHEEL_VISIBLE, MENU_RESET, MENU_BACK
 };
@@ -2715,6 +2880,7 @@ const char* GetActiveVehicleModelName() {
 }
 bool IsMenuItemAvailable(int vehicleType,int item) {
     switch(item) {
+        case MENU_MODEL_SIDE:
         case MENU_MODEL_FORWARD:
         case MENU_MODEL_HEIGHT:
             return HasCurrentModelForType(vehicleType);
@@ -2735,6 +2901,11 @@ int GetGlobalSeatForwardCm(int vehicleType) {
     return g_value[GlobalSeatField(vehicleType,
         GetModeForVehicleType(vehicleType),false)].load();
 }
+int GetGlobalSeatSideCm(int vehicleType) {
+    EnsureInit();
+    return g_value[GlobalSeatSideField(
+        vehicleType, GetModeForVehicleType(vehicleType))].load();
+}
 int GetGlobalSeatHeightCm(int vehicleType) {
     EnsureInit();
     return g_value[GlobalSeatField(vehicleType,
@@ -2754,7 +2925,23 @@ void AdjustGlobalSeatHeightCm(int vehicleType,int direction) {
     g_value[field].store(ClampField(field,g_value[field].load()+(direction<0?-1:1)));
     Save();
 }
+void AdjustGlobalSeatSideCm(int vehicleType,int direction) {
+    EnsureInit(); if (!direction) return;
+    const int field=GlobalSeatSideField(
+        vehicleType, GetModeForVehicleType(vehicleType));
+    g_value[field].store(ClampField(
+        field, g_value[field].load()+(direction<0?-1:1)));
+    Save();
+}
 
+int GetCurrentModelSeatSideCm(int vehicleType) {
+    if (!HasCurrentModelForType(vehicleType)) return 0;
+    const int model=GetActiveVehicleModelId();
+    const int mode=GetModeForVehicleType(vehicleType);
+    std::lock_guard<std::mutex> lock(g_modelMutex);
+    const auto found=g_modelCalibration.find(model);
+    return found==g_modelCalibration.end()?0:found->second.seatSide[mode];
+}
 int GetCurrentModelSeatForwardCm(int vehicleType) {
     if (!HasCurrentModelForType(vehicleType)) return 0;
     const int model=GetActiveVehicleModelId();
@@ -2770,6 +2957,17 @@ int GetCurrentModelSeatHeightCm(int vehicleType) {
     std::lock_guard<std::mutex> lock(g_modelMutex);
     const auto found=g_modelCalibration.find(model);
     return found==g_modelCalibration.end()?0:found->second.seatHeight[mode];
+}
+void AdjustCurrentModelSeatSideCm(int vehicleType,int direction) {
+    if (!direction||!HasCurrentModelForType(vehicleType)) return;
+    const int model=GetActiveVehicleModelId();
+    const int mode=GetModeForVehicleType(vehicleType);
+    {
+        std::lock_guard<std::mutex> lock(g_modelMutex);
+        int& value=g_modelCalibration[model].seatSide[mode];
+        value=ClampModelSeat(false,value+(direction<0?-1:1));
+    }
+    Save();
 }
 void AdjustCurrentModelSeatForwardCm(int vehicleType,int direction) {
     if (!direction||!HasCurrentModelForType(vehicleType)) return;
@@ -2799,6 +2997,12 @@ int GetActiveSeatForwardCm() {
     if (vehicleType==VEHICLE_NONE) return 0;
     return GetGlobalSeatForwardCm(vehicleType)+
            GetCurrentModelSeatForwardCm(vehicleType);
+}
+int GetActiveSeatSideCm() {
+    const int vehicleType=GetActiveVehicleType();
+    if (vehicleType==VEHICLE_NONE) return 0;
+    return GetGlobalSeatSideCm(vehicleType)+
+           GetCurrentModelSeatSideCm(vehicleType);
 }
 int GetActiveSeatHeightCm() {
     const int vehicleType=GetActiveVehicleType();
@@ -2881,8 +3085,10 @@ const char* WheelCalibrationFieldName(int field) {
 void ResetVehiclePreset(int vehicleType) {
     EnsureInit();
     const int mode=GetModeForVehicleType(vehicleType);
+    const int sideField=GlobalSeatSideField(vehicleType,mode);
     const int forwardField=GlobalSeatField(vehicleType,mode,false);
     const int heightField=GlobalSeatField(vehicleType,mode,true);
+    g_value[sideField].store(kDefaults[sideField]);
     g_value[forwardField].store(kDefaults[forwardField]);
     g_value[heightField].store(kDefaults[heightField]);
     if (vehicleType==VEHICLE_BIKE)
@@ -2891,6 +3097,7 @@ void ResetVehiclePreset(int vehicleType) {
         const int model=GetActiveVehicleModelId();
         std::lock_guard<std::mutex> lock(g_modelMutex);
         ModelCalibration& calibration=g_modelCalibration[model];
+        calibration.seatSide[mode]=0;
         calibration.seatForward[mode]=0;
         calibration.seatHeight[mode]=0;
         if (mode==MODE_IMMERSIVE)
@@ -2951,6 +3158,42 @@ void ToggleInteriorGlass() {
                               std::memory_order_release);
     Save();
 }
+bool CarCameraTiltEnabled() {
+    EnsureInit(); return g_carCameraTilt.load(std::memory_order_acquire);
+}
+void ToggleCarCameraTilt() {
+    EnsureInit();
+    g_carCameraTilt.store(!g_carCameraTilt.load(), std::memory_order_release);
+    Save();
+    LOGI("[driving] car camera -> %s",
+         g_carCameraTilt.load() ? "FULL TILT" : "LEVEL");
+}
+bool BoatCameraTiltEnabled() {
+    EnsureInit(); return g_boatCameraTilt.load(std::memory_order_acquire);
+}
+void ToggleBoatCameraTilt() {
+    EnsureInit();
+    g_boatCameraTilt.store(!g_boatCameraTilt.load(),
+                           std::memory_order_release);
+    Save();
+    LOGI("[driving] boat camera -> %s",
+         g_boatCameraTilt.load() ? "WITH BOAT" : "LEVEL");
+}
+bool IsDrivebyAimImmersive() {
+    EnsureInit();
+    return g_drivebyImmersive.load(std::memory_order_acquire);
+}
+void ToggleDrivebyAimImmersive() {
+    EnsureInit();
+    g_drivebyImmersive.store(!g_drivebyImmersive.load(),
+                             std::memory_order_release);
+    Save();
+}
+bool VehicleWeaponsImmersive() {
+    EnsureInit();
+    return GetMode()==MODE_IMMERSIVE ||
+           g_drivebyImmersive.load(std::memory_order_acquire);
+}
 bool ShouldUseTrackedHands() {
     EnsureInit();
     if (!HasPlayerVehicle()) return true;
@@ -2962,16 +3205,173 @@ void SetMenuPreview(bool active,int calibrationHand) {
                                 std::memory_order_release);
 }
 
+bool MotionHeading(float* heading) {
+    xr::HandPose poses[2]{};
+    if (!physicalweapon::GetHandPosesSnapshot(poses)) return false;
+    const int hand = std::clamp(g_motionHand.load(), 0, 1);
+    if (!poses[hand].valid || !poses[hand].aimValid) return false;
+    const float x = poses[hand].aimOri[0];
+    const float y = poses[hand].aimOri[1];
+    const float z = poses[hand].aimOri[2];
+    const float w = poses[hand].aimOri[3];
+    const float forwardX = -2.0f * (x * z + w * y);
+    const float forwardZ = -(1.0f - 2.0f * (x * x + y * y));
+    if (forwardX * forwardX + forwardZ * forwardZ < 0.01f) return false;
+    *heading = std::atan2(forwardX, -forwardZ);
+    return true;
+}
+
+float WrapAngleRad(float a) {
+    while (a > 3.14159265f) a -= 6.2831853f;
+    while (a < -3.14159265f) a += 6.2831853f;
+    return a;
+}
+
+void UpdateMotionSteering(const xr::InputState& input, bool active) {
+    const int appearance = GetActiveVehicleAppearance();
+    void* vehicle = g.FindPlayerVehicle ? g.FindPlayerVehicle(-1,false)
+                                        : nullptr;
+    const bool engaged = active && vehicle != nullptr &&
+        (appearance == 1 || appearance == 2) &&
+        ModeForAppearance(appearance) == MODE_MOTION;
+    g_motionEngaged.store(engaged, std::memory_order_relaxed);
+    if (!engaged) {
+        g_motionVehicle = nullptr;
+        g_motionRefValid = false;
+        g_motionSteering.store(0.0f, std::memory_order_relaxed);
+        return;
+    }
+    if (g_motionVehicle != vehicle) {
+        g_motionVehicle = vehicle;
+        g_motionRefValid = false;
+        g_motionSteering.store(0.0f, std::memory_order_relaxed);
+    }
+    float heading = 0.0f;
+    if (!MotionHeading(&heading)) {
+        g_motionSteering.store(0.0f, std::memory_order_relaxed);
+        return;
+    }
+    if (!g_motionRefValid) {
+        g_motionSteering.store(0.0f, std::memory_order_relaxed);
+        // The neutral reference is the hand's yaw at the first throttle
+        // squeeze - exactly the Vice City behaviour.
+        if (input.triggers[1] < 0.15f) return;
+        g_motionRefHeading = heading;
+        g_motionRefValid = true;
+    }
+    constexpr float kMaxAngle = 90.0f * 3.14159265f / 180.0f;
+    constexpr float kMidAngle = 30.0f * 3.14159265f / 180.0f;
+    constexpr float kFineScale = 0.5f;
+    float angle = std::clamp(
+        -WrapAngleRad(heading - g_motionRefHeading), -kMaxAngle, kMaxAngle);
+    if (std::fabs(angle) < 3.0f * 3.14159265f / 180.0f) angle = 0.0f;
+    const float absolute = std::fabs(angle);
+    float steering;
+    if (absolute <= kMidAngle) {
+        steering = angle / kMidAngle * kFineScale;
+    } else {
+        const float sign = angle >= 0.0f ? 1.0f : -1.0f;
+        steering = sign * (kFineScale +
+            (absolute - kMidAngle) / (kMaxAngle - kMidAngle) *
+            (1.0f - kFineScale));
+    }
+    g_motionSteering.store(
+        std::fabs(steering) < 0.01f ? 0.0f
+                                    : std::clamp(steering, -1.0f, 1.0f),
+        std::memory_order_relaxed);
+    static double s_motionLogAt = 0.0;
+    timespec logTs{};
+    clock_gettime(CLOCK_MONOTONIC, &logTs);
+    const double logNow = logTs.tv_sec + logTs.tv_nsec * 1e-9;
+    if (logNow - s_motionLogAt > 1.0) {
+        s_motionLogAt = logNow;
+        LOGI("[driving] motion steer=%.2f angle=%.1fdeg ref=%d",
+             g_motionSteering.load(std::memory_order_relaxed),
+             angle * 57.2958f, g_motionRefValid ? 1 : 0);
+    }
+}
+
+bool MotionSteeringActive() {
+    return g_motionEngaged.load(std::memory_order_relaxed);
+}
+float MotionSteeringValue() {
+    return g_motionSteering.load(std::memory_order_relaxed);
+}
+int GetMotionSteeringHand() { EnsureInit(); return g_motionHand.load(); }
+void ToggleMotionSteeringHand() {
+    EnsureInit();
+    g_motionHand.store(1 - g_motionHand.load());
+    g_motionRefValid = false;
+    Save();
+    LOGI("[driving] motion steering hand -> %s",
+         g_motionHand.load() ? "RIGHT" : "LEFT");
+}
+
 void UpdateInput(const xr::InputState& input,bool gameplay,bool blocked) {
+    // Controller-yaw MOTION steering is intentionally unavailable in this
+    // release. Stick and physical cockpit modes remain the only driving paths.
+    g_motionEngaged.store(false,std::memory_order_relaxed);
+    g_motionSteering.store(0.0f,std::memory_order_relaxed);
     EnsureInit(); g_inputBlocked.store(blocked,std::memory_order_release);
     const bool radioAllowed = gameplay && !blocked && HasPlayerVehicle();
     const bool radioDown = radioAllowed && input.x;
     const bool wasRadioDown = g_radioButtonDown.exchange(
         radioDown, std::memory_order_acq_rel);
-    if (radioDown && !wasRadioDown)
-        g_radioChangeJustPressed.store(true, std::memory_order_release);
-    else if (!radioAllowed)
+    if (radioDown && !wasRadioDown) {
+        // Plain X = next station; X with the LEFT grip squeezed = previous.
+        if (input.grip[0] >= 0.55f)
+            g_radioPrevJustPressed.store(true, std::memory_order_release);
+        else
+            g_radioChangeJustPressed.store(true, std::memory_order_release);
+    } else if (!radioAllowed) {
         g_radioChangeJustPressed.store(false, std::memory_order_release);
+        g_radioPrevJustPressed.store(false, std::memory_order_release);
+    }
+
+    // Visible radio navigation (player request): show the station name in
+    // the TIMERS text layer for 3 s whenever the station changes.
+    {
+        static const char* const kStationNames[] = {
+            "RADIO OFF",           // 0 (unused placeholder)
+            "PLAYBACK FM",         // 1
+            "K-ROSE",              // 2
+            "K-DST",               // 3
+            "BOUNCE FM",           // 4
+            "SF-UR",               // 5
+            "RADIO LOS SANTOS",    // 6
+            "RADIO X",             // 7
+            "CSR 103.9",           // 8
+            "K-JAH WEST",          // 9
+            "MASTER SOUNDS 98.3",  // 10
+            "WCTR",                // 11
+            "USER TRACKS",         // 12
+        };
+        double toastNow = 0.0;
+        {
+            timespec ts{};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            toastNow = ts.tv_sec + ts.tv_nsec * 1e-9;
+        }
+        int station = -999;
+        if (radioAllowed && g.AudioEngine &&
+            g.CAudioEngine_GetCurrentRadioStationID) {
+            station = g.CAudioEngine_GetCurrentRadioStationID(g.AudioEngine);
+        }
+        if (station != g_radioLastStation) {
+            if (g_radioLastStation != -999 && station >= 0)
+                g_radioToastUntil = toastNow + 3.0;
+            g_radioLastStation = station;
+        }
+        if (g_radioToastUntil > toastNow && station >= 0) {
+            const char* name = (station >= 1 && station <= 12)
+                ? kStationNames[station] : "RADIO OFF";
+            char line[64];
+            std::snprintf(line, sizeof(line), "RADIO: %s", name);
+            xr::PublishRadioText(line);
+        } else {
+            xr::PublishRadioText("");
+        }
+    }
     const int appearance=GetActiveVehicleAppearance();
     const int activeType=appearance==1?VEHICLE_CAR:
                          appearance==2?VEHICLE_BIKE:
@@ -3003,7 +3403,7 @@ void UpdateInput(const xr::InputState& input,bool gameplay,bool blocked) {
         static bool prevJumpButton=false;
         const bool jumpButton=locomotion::ActionHeld(
             locomotion::BIND_ACT_JUMP,
-            input.a,input.b,input.x,input.y,true);
+            input.a,input.b,input.x,input.y,input.l3,input.r3,true);
         g_jumpEdge.store(gameplay&&!blocked&&activeType==VEHICLE_NONE&&
                              jumpButton&&!prevJumpButton,
                          std::memory_order_release);

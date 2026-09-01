@@ -7,7 +7,7 @@ namespace savr::xr { struct HandPose; }
 // Physical ownership of the player's inventory weapons.
 //
 // This module deliberately owns no RenderWare/OpenGL objects.  It only advances
-// the qbuild-style interaction state on the GameThread and publishes small,
+// the reference Quest build-style interaction state on the GameThread and publishes small,
 // thread-safe snapshots for the existing stereo/depth renderer:
 //
 //   HOLSTER --fresh grip--> HELD(hand)
@@ -96,7 +96,7 @@ unsigned int HeldHandMaskRelaxed();
 int PreferredHeldHand();
 int ActiveHeldSlot();
 
-// qbuild-style two-handed ownership. A support hand never owns/duplicates the
+// reference Quest build-style two-handed ownership. A support hand never owns/duplicates the
 // inventory slot: HeldSlot(support) remains -1 and the primary hand continues to
 // drive selection, trigger and rendering. Only SA long guns return true here.
 bool IsTwoHandedWeaponType(int weaponType);
@@ -127,7 +127,7 @@ int SupportCalibrationPrimaryHand();
 bool GetTwoHandTransformTracking(int primaryHand, float pivotOut[3],
                                  float axisOut[3], float* angleRadiansOut);
 
-// One ballistic record is retained per source hand, matching qbuild. A hand may
+// One ballistic record is retained per source hand, matching reference Quest build. A hand may
 // catch either record. Returned pose includes velocity/gravity/spin at query time.
 int  DroppedSlot(int sourceHand);
 bool GetDroppedPoseTracking(int sourceHand, TrackingPose* out);
@@ -164,13 +164,13 @@ float FireTrigger();
 // is not a generic grip release and never creates a flying weapon-model record.
 void ReleaseAfterUse(int hand, int slot);
 
-// qbuild WeaponGripLock semantics: releasing away from the assigned socket keeps
+// reference Quest build WeaponGripLock semantics: releasing away from the assigned socket keeps
 // the weapon held; releasing at the socket still returns it. Runtime only here;
 // the menu/settings owner may persist this through its existing settings file.
 void SetGripLock(bool enabled);
 bool GripLock();
 
-// The qbuild-compatible default supports two independently held slots. A caller
+// The reference Quest build-compatible default supports two independently held slots. A caller
 // may temporarily disable dual hold while bringing up a single-clump renderer;
 // single-weapon mode still permits either hand and hand-to-hand transfer.
 void SetDualHoldEnabled(bool enabled);

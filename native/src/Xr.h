@@ -28,6 +28,9 @@ bool IsSessionFocused();
 struct InputState {
     float leftStick[2]{};
     float rightStick[2]{};
+    // Capacitive thumbrest touch per hand (Quest Touch). While a thumb
+    // rests on either pad, the right stick becomes the D-pad (UEVR parity).
+    bool  thumbrest[2]{};
     float triggers[2]{};   // left, right
     float grip[2]{};       // left, right squeeze [0,1]
     bool  a{}, b{}, x{}, y{}, menu{};
@@ -45,6 +48,10 @@ struct InputState {
 // Copy out the most recent controller state. Cheap; safe to call every frame.
 void GetInput(InputState& out);
 
+// Fire a controller vibration pulse on one hand (0 left, 1 right).
+void TriggerHaptic(int hand, float amplitude, float frequencyHz,
+                   float durationMs);
+
 // Publish the already-formatted stock text buffers after CMessages::Display.
 // The compositor renders these strings with the APK's own font files onto
 // transparent VR layers, so BIG MESSAGES and HELP TEXT no longer sample crops
@@ -58,6 +65,9 @@ void PublishHudText(const std::int16_t* brief, int briefCapacity,
 // CUserDisplay::OnscnTimer each capture pass. Empty string clears the layer.
 // Rendered with the APK font as the TIMERS element.
 void PublishMissionTimersText(const char* text);
+// Transient radio-station line, shown in the TIMERS text layer while the
+// station changes (empty string clears it).
+void PublishRadioText(const char* text);
 
 // Per-hand tracked pose for rendering VR hands. grip drives the hand model; aim
 // gives the pointing axis. Poses are in the session LOCAL space (same as the head
@@ -79,6 +89,21 @@ void GetHandPoses(HandPose out[2]);
 // RenderWare weapon matrices. SetStereoEyeTextures copies it into the matching
 // ring slot instead of resampling the asynchronously updated XR poses.
 void SetRenderedHandPoses(const HandPose poses[2]);
+
+// Basketball palm lock: while the ball is held, the rendered hand(s) are
+// pinned onto the ball surface with an open palm (wheel-grab pattern), so
+// ball and hand can never visibly drift apart. Positions are in tracking
+// space. An all-false struct clears the lock.
+struct BallHandLock {
+    bool  locked[2]{false, false};
+    float pos[2][3]{};
+    // Palm basis (tracking space): `up` faces from the hand INTO the ball
+    // (the mesh palm normal), `fwd` is the finger direction tangent to the
+    // ball surface. Zero vectors = keep the controller orientation.
+    float up[2][3]{};
+    float fwd[2][3]{};
+};
+void SetBallHandLock(const BallHandLock& lock);
 
 // Two-hand visual correction captured alongside the stereo eye textures.  All
 // vectors are in OpenXR LOCAL space.  `pivot`, `axis` and `angleRadians` are the
@@ -133,6 +158,18 @@ float RecommendedGameFovXDegrees();
 // between the two positions is what produces real depth). false until valid.
 bool GetEyePoses(float positionOut[2][3], float orientationOut[2][4]);
 
+// Runtime-provided hidden-area triangle mesh for one physical eye. Vertices are
+// normalized view coordinates in the OpenXR convention; indices address the
+// returned vertex array. The storage is immutable for the lifetime of the XR
+// instance and therefore may be read by the GameThread without copying.
+struct HiddenAreaMaskView {
+    const float* verticesXY{};              // vertexCount pairs: x,y
+    const unsigned short* indices{};        // triangle-list indices
+    int vertexCount{};
+    int indexCount{};
+};
+bool GetHiddenAreaMask(int eye, HiddenAreaMaskView& out);
+
 // ---------------------------------------------------------------------------
 // Stereo eye-texture bridge.
 //
@@ -160,16 +197,38 @@ constexpr int kGameplayHudLogicalHeight = 576;
 // and the game falls back to the mono path. Call once, before any Stereo* use.
 void SetStereoContextShared(bool shared);
 
+// Claim the ring slot for `seq` before the GameThread records either eye into it.
+// The compositor pins a slot while copying both eyes, so a failed claim means the
+// producer must leave that slot untouched and retry the same sequence next frame.
+bool TryBeginStereoEyeWrite(int seq);
+void CancelStereoEyeWrite(int seq);
+
+// The experiment remains available for dedicated builds, while normal builds
+// compile this call to a constant false and retain the accepted hot path.
+#if defined(SAVR_EXPERIMENTAL_BACKPRESSURE)
+bool ShouldThrottleStereoProducer(int nextSequence);
+#else
+inline bool ShouldThrottleStereoProducer(int) { return false; }
+#endif
+
 // Stereo: publish this frame's eye textures and their matching depth renderbuffers.
-// Both arrays are [3][2] row-major GL object ids from the shared engine context —
+// Both arrays are [4][2] row-major GL object ids from the shared engine context —
 // one left/right pair per ring buffer. `seq` is a monotonically increasing counter; the
-// compositor samples the pair a couple of frames behind it so it never reads a
-// pair the writer is overwriting or the RenderQueue thread is still drawing.
+// compositor samples a lagged pair and pins that slot until both eyes are copied;
+// the lag protects RenderQueue completion while the pin prevents ring wrap.
 // Published by the GameThread each stereo frame.
 void SetStereoEyeTextures(const unsigned int* tex, const unsigned int* depth,
                           const unsigned int* hudTex,
                           const float* nearZ, const float* farZ,
                           int seq, int width, int height);
+
+// RenderQueue command 46 normally presents the hidden Android surface through
+// eglSwapBuffers.  Once a direct stereo generation is pending, the RenderQueue
+// thread may replace that redundant present with a share-group GL fence.  The
+// XR context inserts a server-side wait before sampling the matching ring slot;
+// failures keep the retail swap path intact.
+bool TryPublishStereoProducerFenceFromRenderQueue();
+void NotifyStereoRetailSwapCompletedFromRenderQueue();
 
 // Publish the game camera's water probe on the GameThread. The values are
 // copied into the same ring slot as the eye textures so the compositor grades
@@ -221,10 +280,15 @@ void SetMenuState(bool visible, int selection, int count, int category);
 // present thread draws a small cube at each. Up to 8.
 void SetHolsterMarkers(const float positions[][3], int count);
 
-// Parachute brake toggles (canopy open): two handles in LOCAL tracking space,
-// drawn orange (free) or green (pulled). visible=false hides both.
-void SetParachuteToggles(const float positions[2][3], const bool grabbed[2],
+// Parachute brake toggles (canopy open): two handles and their upper riser
+// anchors in LOCAL tracking space. visible=false hides the complete assembly.
+void SetParachuteToggles(const float positions[2][3],
+                         const float anchors[2][3], const bool grabbed[2],
                          bool visible);
+
+// Freefall canopy-deploy ring and its short tether in LOCAL tracking space.
+void SetParachuteDeployRing(const float position[3], const float anchor[3],
+                            const float forward[3], bool grabbed, bool visible);
 
 // Active weapon's object-space geometry, published by the GameThread (extracted
 // from the loaded RpAtomic). The present thread transforms it to the right hand's
@@ -276,6 +340,17 @@ int  GetGpuPerfIdx();
 const char* PerfLevelName(int idx);
 void SetGameThreadTid(unsigned int tid);
 
+// A consumer timeout may prove that the exact next producer publication landed
+// just beyond the presentation boundary.  The XR side calibrates that phase
+// error over several matching samples and offers one bounded advance to the
+// existing 72 Hz GameThread pacer.  Consuming an advance never changes the
+// steady frame period; it only shortens one otherwise-idle sleep.  The caller
+// reports only the advance retained in the next pacer deadline, so diagnostics
+// can distinguish a request from a phase change that actually reached the
+// producer timeline after scheduler overshoot.
+std::uint64_t ConsumeStereoPacerAdvanceNs(std::uint64_t maxNs);
+void ReportStereoPacerAdvanceApplied(std::uint64_t appliedNs);
+
 // VR menu calibration page. RIGHT is the single master profile; LEFT consumes the
 // same values through its mirrored hand basis, so only one hand is calibrated.
 void SetCalibPage(bool active, int selection, int hand, int weaponType);
@@ -288,6 +363,9 @@ void SetHolsterCalibMenu(bool active, int selection);
 void SetDrivingMenu(bool active, int selection, int vehicleType);
 void SetDrivingCalibrationMenu(bool active, int selection, int hand);
 void SetLocomotionMenu(bool active, int selection);
+void SetVehicleCameraMenu(bool active, int selection);
+void SetBasketballMenu(bool active, int selection);
+void SetBasketballCalibMenu(bool active, int selection);
 // page: 0 = HUD root (presets/element/enable), 1 = sprite-crop + screen
 // placement submenu, 2 = wrist placement submenu (on-foot slot), 3 = wrist
 // submenu editing the VEHICLE/dash slot. Any active page keeps the
@@ -308,10 +386,19 @@ void SetGraphicsDistanceMenu(bool active, int selection);
 
 // Stop the compositor consuming the current RenderWare eye-texture generation.
 // VrCamera calls this immediately before atomically switching to a newly-sized
-// triple buffer; publication resumes after the replacement ring has warmed up.
+// four-slot ring; publication resumes after the replacement ring has warmed up.
 void ResetStereoEyeTextures();
 
-// Ensure the triple-buffered eye textures exist at this per-eye size. Cheap when
+// Drain compositor-side source-read fences while the XR GL context is still
+// current. Call once before the consumer thread releases that context.
+void DrainStereoEyeReads();
+
+// The old RenderWare raster ring may be destroyed only after every row of the
+// replacement epoch has been published. Claiming each row proves any old
+// CPU/GPU reader of that slot completed before its replacement was recorded.
+bool StereoEyeRetiredRingCanBeDestroyed();
+
+// Ensure the four-buffered eye textures exist at this per-eye size. Cheap when
 // already sized; recreates on a size change. Returns false if allocation failed
 // or the XR context is not shared.
 bool StereoEnsure(int width, int height);
@@ -344,6 +431,11 @@ void SetRenderHeadPose(const float position[3], const float orientation[4]);
 // The game is handed a surface of exactly this size so it never renders at the
 // wrong resolution for the headset.
 bool RecommendedEyeSize(int& width, int& height);
+
+// Wide-menu crop: while the mobile menu renders into a 16:9 logical band of
+// the (taller) game surface, keep the theater pointer in that same band. (0,0)
+// clears the crop and the quad shows the full frame again.
+void SetTheaterCrop(int width, int height);
 
 // Hand over the engine's finished frame for the compositor to show. The texture
 // is an external OES texture in the render thread's context; transform is the 4x4

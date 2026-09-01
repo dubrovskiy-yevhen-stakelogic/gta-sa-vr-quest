@@ -34,6 +34,12 @@ const PointMetadata* Metadata(int point);
 const char* PointName(int point);
 bool IsPointFixed(int point);
 
+// Per-socket visibility/interaction switch. Hidden sockets render no weapon,
+// publish no marker and cannot grab invisibly; their slot assignment is kept.
+bool PointVisible(int point);
+void SetPointVisible(int point, bool visible);
+void TogglePointVisible(int point);
+
 // Configured SA eWeaponSlot for a body point. -1 means EMPTY. The centre chest
 // point is always slot 8 (THROWABLE), even if an old/malformed file says
 // otherwise.

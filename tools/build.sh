@@ -285,7 +285,12 @@ echo "==> libsavr.so ($CONFIGURATION, arm64-v8a)"
   "-DOPENXR_LOADER_SO=$OPENXR_LOADER" \
   -DANDROID_ABI=arm64-v8a \
   -DANDROID_PLATFORM=android-28 \
+  -DSAVR_DEV=OFF \
   "-DCMAKE_BUILD_TYPE=$CONFIGURATION"
+grep -q '^SAVR_DEV:BOOL=OFF$' "$NATIVE_BUILD/CMakeCache.txt" || {
+  echo 'CMake cache did not retain the required player setting SAVR_DEV=OFF' >&2
+  exit 1
+}
 "$CMAKE" --build "$NATIVE_BUILD"
 
 echo "==> loader DEX"

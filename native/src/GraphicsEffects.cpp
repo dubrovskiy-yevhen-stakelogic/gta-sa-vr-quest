@@ -27,10 +27,9 @@ namespace {
 
 constexpr char kEffectsProperty[] = "debug.savr.effects";
 constexpr char kFxProbeProperty[] = "debug.savr.fxprobe";
-// Profile 1 is the intended, shipping candidate (fire, parachute ropes, glass,
-// skidmarks). Default it ON so players get effects without setting a property;
-// the debug.savr.effects property still overrides -- set it to 0 for a clean
-// perf A/B baseline, or 2/3 for the heavier candidates.
+// The stable VR-safe set is the shipping baseline. Players can disable it from
+// the persisted graphics menu; the hidden property only selects internal tiers
+// 1..3 and can no longer strand normal installs on profile 0.
 constexpr int kDefaultProfile = 1;
 constexpr std::uint64_t kReportIntervalCalls = 240; // 120 stereo frames
 constexpr std::uint64_t kFlameLifecycleGraceMs = 120;
@@ -92,6 +91,8 @@ struct Functions {
     VoidFn heliSearchlights{};
     VoidFn scriptSearchlights{};
     VoidFn heliPostSearchlight{};
+    std::uint32_t* heliSearchlightCount{};
+    std::uint16_t* scriptSearchlightCount{};
     VoidFn brightLights{};
     VoidFn shinyTexts{};
     VoidFn markers{};
@@ -154,6 +155,7 @@ bool g_embeddedCanopyHideReady = false;
 bool g_lampGroundPoolsReady = false;
 bool g_wetReflectionsReady = false;
 bool g_underwaterStateReady = false;
+bool g_searchlightsReady = false;
 std::atomic<bool> g_mobileColorResolveAttempted{false};
 bool g_mobileColorReady = false;
 MobileRenderFn g_mobileRender{};
@@ -354,7 +356,7 @@ private:
 
 void OnRwCameraBeginUpdate(void* rwCamera) {
     if (g_origRwCameraBeginUpdate) g_origRwCameraBeginUpdate(rwCamera);
-    if (!rwCamera || Profile() == 0 || !vrcam::IsStereoActive() ||
+    if (!rwCamera || !Enabled() || !vrcam::IsStereoActive() ||
         !g_coronaViewSyncReady || !g_fn.matrixUpdate || !g.TheCamera ||
         !g_scene) {
         return;
@@ -393,7 +395,7 @@ void OnRwCameraBeginUpdate(void* rwCamera) {
 
 void OnDisplayActualLight(void* entity) {
     if (!g_origDisplayActualLight) return;
-    const bool ownsStereoLights = Profile() > 0 &&
+    const bool ownsStereoLights = Enabled() &&
         vrcam::IsStereoActive() &&
         g_flatPassSuppressed.load(std::memory_order_acquire);
     ScopedTrafficLightQuality quality(ownsStereoLights);
@@ -413,7 +415,7 @@ void OnProcessLightsForEntity(void* entity) {
     if (!g_origProcessLights) return;
     g_origProcessLights(entity);
 
-    if (!g_lampGroundPoolsReady || Profile() == 0 ||
+    if (!g_lampGroundPoolsReady || !Enabled() ||
         !vrcam::IsStereoActive() || !entity || !g_modelInfoPtrs ||
         !g_get2dEffect || !g_storeStaticShadow || !g_coronaArray) {
         return;
@@ -1104,6 +1106,9 @@ struct Aggregate {
     std::uint64_t essentialLightReplayMisses{};
     std::uint64_t brightLightSlotsMax{};
     std::uint64_t shinyTextSlotsMax{};
+    std::uint64_t searchlightEyeCalls{};
+    std::uint32_t heliSearchlightsMax{};
+    std::uint16_t scriptSearchlightsMax{};
 };
 
 Aggregate g_aggregate{};
@@ -1736,7 +1741,7 @@ void OnRenderReflections() {
     g_origRenderReflections();
     g_wetReflectionCalls.fetch_add(1, std::memory_order_relaxed);
 
-    if (!g_wetReflectionsReady || Profile() == 0 ||
+    if (!g_wetReflectionsReady || !Enabled() ||
         !vrcam::IsStereoActive() || !g_scene || !g_rqSelectedTarget ||
         !g_backTarget) {
         return;
@@ -1807,7 +1812,7 @@ void OnResolveShadowTarget(float strength) {
     // leaves the producer on the flat Android backTarget, so restore the
     // current XR camera target before that existing pass begins. A flat camera
     // resolves back to the same target and is deliberately left untouched.
-    if (Profile() == 0 || !savr::vrcam::IsStereoActive() || !g_scene ||
+    if (!Enabled() || !savr::vrcam::IsStereoActive() || !g_scene ||
         !g_backTarget) {
         return;
     }
@@ -2218,7 +2223,7 @@ void PublishMobileColorState(int eye) {
     // parameters once, at eye 0 where the original timestep is still active.
     // CCTV is its only normal draw call; suppress that one transiently so this
     // parameter capture cannot paint a flat fullscreen overlay into one eye.
-    const bool ownsFlatPass = Profile() > 0 &&
+    const bool ownsFlatPass = Enabled() &&
         g_flatPassSuppressed.load(std::memory_order_acquire) &&
         vrcam::IsStereoActive();
     xr::MobileColorState state{};
@@ -2577,7 +2582,8 @@ void OnWeaponUpdate(void* weapon, void* ped) {
     // is allowed again.
     auto* const bytes = static_cast<std::uint8_t*>(weapon);
     const bool localFlamethrower =
-        Profile() == 1 && savr::vrcam::IsStereoActive() && bytes && ped &&
+        Enabled() && Profile() == 1 && savr::vrcam::IsStereoActive() &&
+        bytes && ped &&
         g.FindPlayerPed &&
         *reinterpret_cast<const std::int32_t*>(bytes) == 37 &&
         ped == g.FindPlayerPed(-1);
@@ -2847,7 +2853,7 @@ bool OnFireAreaEffect(void* weapon, void* firingEntity,
     // other area weapon retain the retail producer unchanged.
     constexpr std::int32_t kFlamethrowerType = 37;
     const bool localFlamethrower =
-        Profile() == 1 && savr::vrcam::IsStereoActive() && weapon &&
+        Enabled() && Profile() == 1 && savr::vrcam::IsStereoActive() && weapon &&
         firingEntity && origin && g.FindPlayerPed &&
         *static_cast<const std::int32_t*>(weapon) == kFlamethrowerType &&
         firingEntity == g.FindPlayerPed(-1);
@@ -3089,7 +3095,7 @@ void OnFxManagerUpdate(void* manager, void* camera, float timeDelta) {
 
 int OnFxFrustumCollision(void* frustum, void* sphere) {
     if (!g_origFxFrustumCollision) return 0;
-    if (Profile() != 1 || !g_fxCameraPositionValid || !sphere)
+    if (!Enabled() || Profile() != 1 || !g_fxCameraPositionValid || !sphere)
         return g_origFxFrustumCollision(frustum, sphere);
 
     const float* const values = static_cast<const float*>(sphere);
@@ -3252,7 +3258,7 @@ bool InstallEyeBeginViewSync(void* handle) {
     }
 
     // The Quest eye loop deliberately calls this shared symbol pointer. Wrap
-    // that one local dispatch point instead of editing the concurrently-owned
+    // that one local dispatch point instead of editing the shared
     // camera renderer or patching every libGame callsite.
     g_origRwCameraBeginUpdate = resolved;
     g.RwCameraBeginUpdate = &OnRwCameraBeginUpdate;
@@ -3461,6 +3467,13 @@ bool ResolveFunctions() {
     g_fn.heliSearchlights = Resolve<VoidFn>(handle, "_ZN5CHeli25RenderAllHeliSearchLightsEv");
     g_fn.scriptSearchlights = Resolve<VoidFn>(handle, "_ZN11CTheScripts21RenderAllSearchLightsEv");
     g_fn.heliPostSearchlight = Resolve<VoidFn>(handle, "_ZN5CHeli20Post_SearchLightConeEv");
+    g_fn.heliSearchlightCount = Resolve<std::uint32_t*>(
+        handle, "_ZN5CHeli20NumberOfSearchLightsE");
+    g_fn.scriptSearchlightCount = Resolve<std::uint16_t*>(
+        handle, "_ZN11CTheScripts26NumberOfScriptSearchLightsE");
+    g_searchlightsReady = g_fn.heliPreSearchlight && g_fn.heliSearchlights &&
+        g_fn.scriptSearchlights && g_fn.heliPostSearchlight &&
+        g_fn.heliSearchlightCount && g_fn.scriptSearchlightCount;
     // CSpecialFX::Render is intentionally split. Its first two children are
     // temporal motion-blur streaks and stock bullet traces (the XR compositor
     // already owns a stereo-safe tracer pass); the remaining four are useful,
@@ -3513,10 +3526,7 @@ bool ResolveFunctions() {
         g_fn.waterCannons && g_fn.brightLights && g_fn.shinyTexts &&
         g_fn.markers && g_fn.checkpoints && g_fn.pointLightFog &&
         g_essentialLightStereoReady;
-    const bool extendedReady = g_fn.birds && g_fn.ropes &&
-        g_fn.movingThings && g_fn.heliPreSearchlight &&
-        g_fn.heliSearchlights && g_fn.scriptSearchlights &&
-        g_fn.heliPostSearchlight;
+    const bool extendedReady = g_fn.birds && g_fn.ropes && g_fn.movingThings;
     const int profile = Profile();
     g_ready = fireReady && (profile < 1 || lightweightReady) &&
         (profile < 2 || balancedReady) &&
@@ -3566,6 +3576,9 @@ bool ResolveFunctions() {
          g_fn.waterCannons ? 1 : 0, g_fn.pointLightFog ? 1 : 0);
     LOGI("[gfxfx.marker] stereo_state=%d array=%p",
          g_markerStereoStateReady ? 1 : 0, g_markerArray);
+    LOGI("[gfxfx.search] ready=%d heli_count=%p script_count=%p",
+         g_searchlightsReady ? 1 : 0, g_fn.heliSearchlightCount,
+         g_fn.scriptSearchlightCount);
     return g_ready;
 }
 
@@ -3725,6 +3738,13 @@ void Report(double elapsedMs, int eye) {
              g_wetReflectionDraws.exchange(0, std::memory_order_relaxed)),
          static_cast<double>(underWaterness),
          static_cast<double>(waterDepth));
+    LOGI("[gfxfx.search] ready=%d full_flat=%d eye_calls=%llu "
+         "heli_max=%u script_max=%u",
+         g_searchlightsReady ? 1 : 0,
+         g_flatPassSuppressed.load(std::memory_order_acquire) ? 1 : 0,
+         static_cast<unsigned long long>(g_aggregate.searchlightEyeCalls),
+         g_aggregate.heliSearchlightsMax,
+         static_cast<unsigned int>(g_aggregate.scriptSearchlightsMax));
     g_aggregate = {};
 }
 
@@ -3739,10 +3759,11 @@ int Profile() {
             errno = 0;
             const long parsed = std::strtol(text, &end, 10);
             if (errno == 0 && end != text && end && *end == '\0' &&
-                parsed >= 0 && parsed <= 3) {
+                parsed >= 1 && parsed <= 3) {
                 value = static_cast<int>(parsed);
             } else {
-                LOGW("[gfxfx] ignoring invalid %s=%s (valid 0..3)",
+                LOGW("[gfxfx] ignoring retired/invalid %s=%s (valid 1..3; "
+                     "use WORLD EFFECTS for off)",
                      kEffectsProperty, text);
             }
         }
@@ -3752,20 +3773,24 @@ int Profile() {
     return profile;
 }
 
+bool Enabled() {
+    return Profile() > 0 && vrcam::AreWorldEffectsEnabled();
+}
+
 void RenderSkyEye(void* rwCamera, int eye) {
     if (!rwCamera || (eye != 0 && eye != 1)) return;
     RenderStereoSkyObjects(rwCamera, eye);
 }
 
 void RenderEye(void* rwCamera, int eye) {
-    const int profile = Profile();
+    const int profile = Enabled() ? Profile() : 0;
     // Invalidate the paired destructive-queue replay before any eye-0 early
     // return. A transient target/symbol failure must never let eye 1 consume a
     // snapshot retained from the previous frame.
     if (eye == 0) g_essentialLightSnapshotValid = false;
     // Published BEFORE the profile gate: the underwater grade runs in the XR
-    // compositor, not in the recorded eye passes, and profile 0 (the default
-    // whenever the debug.savr.effects property is unset) must not kill it.
+    // compositor, not in the recorded eye passes, and WORLD EFFECTS OFF must
+    // not kill the independent underwater treatment.
     PublishUnderwaterState(eye);
     // Mobile Original colour is also a compositor resolve, independent of the
     // optional geometry-effects profile. Publish it before this frame's stereo
@@ -3813,6 +3838,14 @@ void RenderEye(void* rwCamera, int eye) {
     // late world-space/alpha geometry; no simulation update is performed here.
     if (profile >= 3) Call(g_fn.birds);
     if (profile >= 1) {
+        // Re-establish RenderWare's canonical GL state BEFORE these stock late
+        // effects. The per-eye RenderScene pass leaves RW's cached texture-stage
+        // pointer tailored to its final world batch; CGlass::Render then issues
+        // RwRenderStateSet calls that dereference that stale cache
+        // (crash: wild ptr in _rwOpenGLSetRenderState via CGlass::Render). A
+        // DefinedState here writes the texture raster and refreshes the cache so
+        // the glass/skidmark/rope draws start from a known-good state.
+        if (g_fn.definedState) g_fn.definedState();
         g_fn.renderStateSet(2, reinterpret_cast<void*>(1));
         Call(g_fn.skidmarks);
         Call(g_fn.ropes);
@@ -3851,11 +3884,24 @@ void RenderEye(void* rwCamera, int eye) {
     g_insideFxRender = false;
     if (probeMode > 0) RestoreRenderState(preProbeState);
     if (profile >= 1) Call(g_fn.waterCannons);
-    if (profile >= 3) {
-        Call(g_fn.heliPreSearchlight);
-        Call(g_fn.heliSearchlights);
-        Call(g_fn.scriptSearchlights);
-        Call(g_fn.heliPostSearchlight);
+    // Searchlight cones are pure late geometry, but their stock helpers share
+    // mutable cone scratch state. Replay them only when SAVR owns the complete
+    // flat RenderEffects pass, in the exact retail Pre/heli/script/Post order.
+    // The exported counters preserve retail's zero-work fast path.
+    if (profile >= 1 && fullFlatSuppressed && g_searchlightsReady) {
+        const std::uint32_t heliCount = *g_fn.heliSearchlightCount;
+        const std::uint16_t scriptCount = *g_fn.scriptSearchlightCount;
+        if (heliCount != 0 || scriptCount != 0) {
+            Call(g_fn.heliPreSearchlight);
+            Call(g_fn.heliSearchlights);
+            Call(g_fn.scriptSearchlights);
+            Call(g_fn.heliPostSearchlight);
+            ++g_aggregate.searchlightEyeCalls;
+            g_aggregate.heliSearchlightsMax = std::max(
+                g_aggregate.heliSearchlightsMax, heliCount);
+            g_aggregate.scriptSearchlightsMax = std::max(
+                g_aggregate.scriptSearchlightsMax, scriptCount);
+        }
     }
     if (essentialLightQueuesReady) {
         Call(g_fn.brightLights);

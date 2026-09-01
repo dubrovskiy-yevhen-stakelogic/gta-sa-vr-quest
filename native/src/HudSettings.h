@@ -113,8 +113,15 @@ bool GameplayHudEnabled();
 void SetGameplayHudEnabled(bool enabled); // persists immediately
 void ToggleGameplayHud();                  // persists immediately
 
+// IMMERSIVE wrist/dashboard panels normally reveal only while the player
+// looks at them. This option keeps the distance safety fade but disables the
+// gaze-direction fade.
+bool GazeAutoHideEnabled();
+void SetGazeAutoHideEnabled(bool enabled); // persists immediately
+void ToggleGazeAutoHide();                 // persists immediately
+
 // Single predicate for the renderer.  Keeping the master switch separate from
-// the preset matches qbuild and allows CLASSIC placement to stay selected while
+// the preset matches reference Quest build and allows CLASSIC placement to stay selected while
 // the player temporarily hides the HUD.
 bool ShouldRenderClassicHud();
 
