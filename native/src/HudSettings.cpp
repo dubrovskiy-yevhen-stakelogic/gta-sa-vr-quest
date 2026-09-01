@@ -35,7 +35,7 @@ struct ElementDefaults {
 // real-image crops; Health contains the complete top-right status block.
 constexpr ElementDefaults kElementDefaults[ELEMENT_COUNT] = {
     {1,   0, 104, 284, 284,  25, 47, 28, 34,  2}, // radar
-    {1, 776,  16, 216,  48,  53, 42,  8,  3, 14}, // complete top-right status
+    {1, 776,  16, 244,  84,  53, 42,  8,  3, 14}, // complete top-right status
     {0, 348, 308, 676, 264,  40, 40, 23,  5, 10}, // large mission messages
     {1, 200,   0, 624, 240,  36, 34, 24, 15, 10}, // help/tutorial/brief text
     {1,   0,   0,  64,  64,  62, 26, 24,  8, 10}, // mission timers/counters

@@ -119,6 +119,15 @@ bool IsColorGradingEnabled();
 void SetColorGradingEnabled(bool enabled);
 bool IsHdWeaponsEnabled();
 void SetHdWeaponsEnabled(bool enabled);
+enum TracerColorMode {
+    TRACER_COLOR_VICE_CITY = 0,
+    TRACER_COLOR_GOLD = 1,
+};
+int GetTracerColorMode();
+const char* GetTracerColorModeName();
+void AdjustTracerColorMode(int direction);
+int GetTracerSmokeSpreadPercent();
+void AdjustTracerSmokeSpread(int direction);
 int  GetGraphicsDistanceSettingCount();
 const char* GetGraphicsDistanceSettingName(int field);
 int  GetGraphicsDistanceSettingMeters(int field);

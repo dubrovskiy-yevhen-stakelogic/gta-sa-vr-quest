@@ -603,6 +603,14 @@ constexpr int kShadowModeCount = 4;
 constexpr int kDefaultShadowMode = kShadowModeSimple;
 std::atomic<int> g_dynamicShadowMode{kDefaultShadowMode};
 std::atomic<bool> g_hdWeaponsEnabled{false};
+constexpr int kTracerColorModeCount = 2;
+constexpr int kDefaultTracerColorMode = TRACER_COLOR_VICE_CITY;
+std::atomic<int> g_tracerColorMode{kDefaultTracerColorMode};
+constexpr int kTracerSmokeSpreadMin = 25;
+constexpr int kTracerSmokeSpreadMax = 400;
+constexpr int kTracerSmokeSpreadStep = 25;
+constexpr int kDefaultTracerSmokeSpread = 100;
+std::atomic<int> g_tracerSmokeSpread{kDefaultTracerSmokeSpread};
 std::atomic<std::uint32_t> g_neonSignsSeenMask{0};
 int g_currentRenderScaleIndex = kDefaultRenderScaleIndex;
 
@@ -619,6 +627,24 @@ const char* ShadowModeName(int mode) {
         "OFF", "SIMPLE", "HYBRID", "FULL",
     };
     return kNames[ClampShadowMode(mode)];
+}
+
+int ClampTracerColorMode(int mode) {
+    return std::clamp(mode, 0, kTracerColorModeCount - 1);
+}
+
+int ClampTracerSmokeSpread(int percent) {
+    const int clamped = std::clamp(
+        percent, kTracerSmokeSpreadMin, kTracerSmokeSpreadMax);
+    return ((clamped + kTracerSmokeSpreadStep / 2) /
+            kTracerSmokeSpreadStep) * kTracerSmokeSpreadStep;
+}
+
+const char* TracerColorModeName(int mode) {
+    static constexpr const char* kNames[kTracerColorModeCount] = {
+        "VICE CITY", "GOLD",
+    };
+    return kNames[ClampTracerColorMode(mode)];
 }
 
 int ClampDistanceChoice(int field, int choice) {
@@ -650,6 +676,8 @@ void LoadGraphicsSettings() {
     int shadowMode = kDefaultShadowMode;
     bool shadowModeExplicit = false;
     bool hdWeapons = false;
+    int tracerColorMode = kDefaultTracerColorMode;
+    int tracerSmokeSpread = kDefaultTracerSmokeSpread;
     std::array<int, GFXDIST_COUNT> choices{};
     for (int i = 0; i < GFXDIST_COUNT; ++i)
         choices[i] = kGraphicsDistanceSpecs[i].defaultChoice;
@@ -692,6 +720,14 @@ void LoadGraphicsSettings() {
                 hdWeapons = value != 0;
                 continue;
             }
+            if (std::strcmp(key, "TracerColor") == 0) {
+                tracerColorMode = ClampTracerColorMode(value);
+                continue;
+            }
+            if (std::strcmp(key, "TracerSmokeSpread") == 0) {
+                tracerSmokeSpread = ClampTracerSmokeSpread(value);
+                continue;
+            }
             for (int i = 0; i < GFXDIST_COUNT; ++i) {
                 if (std::strcmp(key, kGraphicsDistanceSpecs[i].key) == 0) {
                     choices[i] = NearestDistanceChoice(i, value);
@@ -712,17 +748,23 @@ void LoadGraphicsSettings() {
     shadowMode = ClampShadowMode(shadowMode);
     g_dynamicShadowMode.store(shadowMode, std::memory_order_release);
     g_hdWeaponsEnabled.store(hdWeapons, std::memory_order_release);
+    g_tracerColorMode.store(ClampTracerColorMode(tracerColorMode),
+                            std::memory_order_release);
+    g_tracerSmokeSpread.store(ClampTracerSmokeSpread(tracerSmokeSpread),
+                              std::memory_order_release);
     for (int i = 0; i < GFXDIST_COUNT; ++i) {
         g_graphicsDistanceChoice[i].store(
             ClampDistanceChoice(i, choices[i]), std::memory_order_release);
     }
-    LOGI("[graphics.settings] loaded scale=%d%% effects=%d neon=%d grade=%d shadows=%s "
+    LOGI("[graphics.settings] loaded scale=%d%% effects=%d neon=%d grade=%d shadows=%s tracer=%s spread=%d%% "
          "vehicle=%dm ped=%dm trees=%dm traffic_spawn=%dm ped_spawn=%dm flight=%dm",
          static_cast<int>(kEyeRenderScales[renderScale] * 100.0f + 0.5f),
          worldEffects ? 1 : 0,
          neonSigns ? 1 : 0,
          colorGrading ? 1 : 0,
-          ShadowModeName(shadowMode),
+         ShadowModeName(shadowMode),
+         TracerColorModeName(tracerColorMode),
+         ClampTracerSmokeSpread(tracerSmokeSpread),
          kGraphicsDistanceSpecs[GFXDIST_VEHICLE_DETAIL].metres[choices[GFXDIST_VEHICLE_DETAIL]],
          kGraphicsDistanceSpecs[GFXDIST_PED_DRAW].metres[choices[GFXDIST_PED_DRAW]],
          kGraphicsDistanceSpecs[GFXDIST_TREES_PALMS].metres[choices[GFXDIST_TREES_PALMS]],
@@ -790,6 +832,12 @@ void SaveGraphicsSettings() {
         ok = std::fprintf(file, "HdWeapons=%d\n",
                           g_hdWeaponsEnabled.load(std::memory_order_acquire)
                               ? 1 : 0) >= 0 && ok;
+        ok = std::fprintf(file, "TracerColor=%d\n",
+                          ClampTracerColorMode(g_tracerColorMode.load(
+                              std::memory_order_acquire))) >= 0 && ok;
+        ok = std::fprintf(file, "TracerSmokeSpread=%d\n",
+                          ClampTracerSmokeSpread(g_tracerSmokeSpread.load(
+                              std::memory_order_acquire))) >= 0 && ok;
         for (int i = 0; i < GFXDIST_COUNT; ++i) {
             ok = std::fprintf(file, "%s=%d\n", kGraphicsDistanceSpecs[i].key,
                               GraphicsDistanceMetresInternal(i)) >= 0 && ok;
@@ -2222,6 +2270,7 @@ thread_local MobileDistanceFogSnapshot g_aircraftFogSceneSnapshot{};
 thread_local float g_aircraftFogSceneStart = 0.0f;
 thread_local float g_aircraftFogSceneEnd = 0.0f;
 thread_local MobileDistanceFogSnapshot g_aircraftGroundFogBaseline{};
+thread_local MobileDistanceFogSnapshot g_recentGroundFogBaseline{};
 thread_local bool g_aircraftFogWasActive = false;
 
 CamBasis ReadCam(std::uintptr_t cam) {
@@ -5293,10 +5342,10 @@ void OnUpdatePads() {
                         togglePos[side][0] = head[0] + fwdX*0.24f + rightX*lateral;
                         togglePos[side][1] = head[1] - 0.04f;
                         togglePos[side][2] = head[2] + fwdZ*0.24f + rightZ*lateral;
-                        const float anchorLateral = side == 0 ? -0.23f : 0.23f;
+                        const float anchorLateral = side == 0 ? -0.55f : 0.55f;
                         toggleAnchor[side][0] = head[0] + fwdX*0.08f +
                             rightX*anchorLateral;
-                        toggleAnchor[side][1] = head[1] + 0.58f;
+                        toggleAnchor[side][1] = head[1] + 1.70f;
                         toggleAnchor[side][2] = head[2] + fwdZ*0.08f +
                             rightZ*anchorLateral;
                     }
@@ -17289,6 +17338,83 @@ private:
     bool wasVisible_{};
 };
 
+// The retail parachute model (3131 / parachute.dff) keeps the canopy, long
+// strings and lower ripcord/handles in one geometry. They cannot be split at
+// half height by material, so hide both exact rigging materials and let the
+// tracked risers make one continuous, hand-aligned replacement up to the
+// canopy. The canopy material is never touched.
+class ScopedParachuteStringsHide {
+public:
+    explicit ScopedParachuteStringsHide(bool requested) {
+        if (!requested || !g.CModelInfo_ms_modelInfoPtrs ||
+            !g.RpClumpForAllAtomics || !g.RpGeometryForAllMaterials) {
+            return;
+        }
+        constexpr int kParachuteModelId = 3131;
+        void* const modelInfo = g.CModelInfo_ms_modelInfoPtrs[kParachuteModelId];
+        void* const clump = modelInfo
+            ? *reinterpret_cast<void**>(
+                  static_cast<std::uint8_t*>(modelInfo) + 0x40)
+            : nullptr;
+        if (!clump) return;
+        g.RpClumpForAllAtomics(clump, &AtomicCallback, this);
+        if (savedCount_ > 0) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_acq_rel))
+                LOGI("[vr.chute.stock] hidden rigging materials=%d model=%d",
+                     savedCount_, kParachuteModelId);
+        }
+    }
+
+    ~ScopedParachuteStringsHide() {
+        for (int i = 0; i < savedCount_; ++i) {
+            if (saved_[i].color) *saved_[i].color = saved_[i].rgba;
+        }
+    }
+
+private:
+    struct SavedMaterial {
+        std::uint32_t* color{};
+        std::uint32_t rgba{};
+    };
+    static constexpr int kCapacity = 4;
+
+    static bool TextureNameIsHiddenRigging(const void* texture) {
+        if (!texture) return false;
+        const char* const name = reinterpret_cast<const char*>(texture) + 0x20;
+        return std::strcmp(name, "strings") == 0 ||
+               std::strcmp(name, "ripcord") == 0;
+    }
+
+    static void* MaterialCallback(void* material, void* data) {
+        auto* const self = static_cast<ScopedParachuteStringsHide*>(data);
+        if (!self || !material || self->savedCount_ >= kCapacity) return material;
+        void* const texture = *reinterpret_cast<void**>(material);
+        if (!TextureNameIsHiddenRigging(texture)) return material;
+        auto* const color = reinterpret_cast<std::uint32_t*>(
+            static_cast<std::uint8_t*>(material) + 0x08);
+        for (int i = 0; i < self->savedCount_; ++i) {
+            if (self->saved_[i].color == color) return material;
+        }
+        const std::uint32_t rgba = *color;
+        self->saved_[self->savedCount_++] = SavedMaterial{color, rgba};
+        *color = rgba & 0x00ffffffu;
+        return material;
+    }
+
+    static void* AtomicCallback(void* atomic, void* data) {
+        if (!atomic || !g.RpGeometryForAllMaterials) return atomic;
+        void* const geometry = *reinterpret_cast<void**>(
+            static_cast<std::uint8_t*>(atomic) + 0x30);
+        if (geometry)
+            g.RpGeometryForAllMaterials(geometry, &MaterialCallback, data);
+        return atomic;
+    }
+
+    SavedMaterial saved_[kCapacity]{};
+    int savedCount_{};
+};
+
 struct PendingWeaponDraw { void* clump{}; RwMat matrix{}; };
 constexpr int kMaxPendingWeapons = 16; // 2 held + 2 flying + 7 sockets + preview
 PendingWeaponDraw g_pendingWeapons[kMaxPendingWeapons]{};
@@ -17485,6 +17611,8 @@ struct AircraftCoarseLodProfile {
     bool scanAlignmentActive{};
     bool hlodFillActive{};
     bool flightRangeOverrideActive{};
+    bool altitudeVisibilityStable{};
+    bool altitudeValid{};
     float altitudeM{};
     float groundRadiusM{};
     float scanFarM{};
@@ -17496,20 +17624,29 @@ struct AircraftCoarseLodProfile {
 thread_local bool g_aircraftLodAltitudeLatched = false;
 thread_local float g_aircraftLodLastValidAltitudeM = 0.0f;
 thread_local float g_aircraftGroundRetailFarM = 0.0f;
+thread_local float g_recentGroundRetailFarM = 0.0f;
+thread_local bool g_airborneRangeSessionActive = false;
 
 AircraftCoarseLodProfile CurrentAircraftCoarseLodProfile() {
     AircraftCoarseLodProfile profile{};
-    if (!g_stereoActive.load(std::memory_order_relaxed) ||
-        !g_lodHandoffHookActive.load(std::memory_order_acquire) ||
-        driving::GetActiveVehicleType() != driving::VEHICLE_PLANE ||
-        (g.CCutsceneMgr_ms_running && *g.CCutsceneMgr_ms_running)) {
+    const bool baseReady = g_stereoActive.load(std::memory_order_relaxed) &&
+        g_lodHandoffHookActive.load(std::memory_order_acquire) &&
+        !(g.CCutsceneMgr_ms_running && *g.CCutsceneMgr_ms_running);
+    if (!baseReady) {
         g_aircraftLodAltitudeLatched = false;
         g_aircraftLodLastValidAltitudeM = 0.0f;
         g_aircraftGroundRetailFarM = 0.0f;
+        g_airborneRangeSessionActive = false;
         return profile;
     }
-    profile.scanAlignmentActive = true;
-    profile.hlodFillActive = true;
+    const bool planeActive =
+        driving::GetActiveVehicleType() == driving::VEHICLE_PLANE;
+    const bool parachuteActive =
+        g_parachuteAirState.load(std::memory_order_relaxed);
+    const bool airborneVisibilityActive = planeActive || parachuteActive;
+    profile.scanAlignmentActive = planeActive;
+    profile.hlodFillActive = planeActive;
+    profile.altitudeVisibilityStable = airborneVisibilityActive;
     bool altitudeValid = false;
     if (g.FindPlayerCoors && g.CWorld_FindGroundZForCoord) {
         const GameSymbols::Vec3 player = g.FindPlayerCoors(-1);
@@ -17530,6 +17667,27 @@ AircraftCoarseLodProfile CurrentAircraftCoarseLodProfile() {
         if (std::isfinite(retailDrawFar) && retailDrawFar > 0.0f)
             profile.retailDrawFarM = retailDrawFar;
     }
+    profile.altitudeValid = altitudeValid;
+
+    // Remember a genuine ground-level retail range continuously, not merely
+    // after the player has entered a plane.  A parachute can become active only
+    // after CJ has already left the vehicle (or jumped from a tall building),
+    // when mobile SA may already have shortened the live far plane.
+    if (!airborneVisibilityActive) {
+        if (altitudeValid && profile.altitudeM <= 20.0f &&
+            profile.retailDrawFarM > 0.0f) {
+            g_recentGroundRetailFarM = profile.retailDrawFarM;
+        }
+        g_aircraftLodAltitudeLatched = false;
+        g_aircraftLodLastValidAltitudeM = 0.0f;
+        g_aircraftGroundRetailFarM = 0.0f;
+        g_airborneRangeSessionActive = false;
+        return profile;
+    }
+    if (!g_airborneRangeSessionActive) {
+        g_airborneRangeSessionActive = true;
+        g_aircraftGroundRetailFarM = g_recentGroundRetailFarM;
+    }
     // Mobile SA shortens its live CDraw far as the camera gains altitude.
     // Capture the unmodified retail value while the plane is on/near the
     // ground and use it as a floor for the rest of that flight. This is not a
@@ -17539,6 +17697,7 @@ AircraftCoarseLodProfile CurrentAircraftCoarseLodProfile() {
         profile.retailDrawFarM > 0.0f) {
         g_aircraftGroundRetailFarM = std::max(
             g_aircraftGroundRetailFarM,profile.retailDrawFarM);
+        g_recentGroundRetailFarM = profile.retailDrawFarM;
     }
     if (g_aircraftGroundRetailFarM > 0.0f &&
         profile.retailDrawFarM > 0.0f &&
@@ -17562,6 +17721,11 @@ AircraftCoarseLodProfile CurrentAircraftCoarseLodProfile() {
     profile.scanFarM = profile.retailDrawFarM;
     profile.farClipM = profile.retailDrawFarM;
     profile.lowLodScale = 1.0f;
+
+    // A parachute reuses only the proven ground-level far/fog floor.  It does
+    // not opt into the aircraft HLOD underlay, deterministic detail selectors,
+    // scan alignment or user-configured expanded flight distances.
+    if (!planeActive) return profile;
 
     // User flight range is deliberately a cheap background-only control. It
     // exposes more of the existing HLOD underlay and extends projection/fog,
@@ -20752,15 +20916,27 @@ void OnRenderScene(bool underwater) {
     // The feature is fail-open: without the exact mobile bridge or Im3D path,
     // all retail fog state remains untouched.
     const MobileDistanceFogSnapshot mobileFog = CaptureMobileDistanceFog();
-    const bool aircraftFogFlight=aircraftLod.scanAlignmentActive;
+    const bool aircraftFogFlight=aircraftLod.altitudeVisibilityStable;
     if (!aircraftFogFlight) {
+        if (aircraftLod.altitudeValid && aircraftLod.altitudeM <= 20.0f &&
+            mobileFog.valid) {
+            g_recentGroundFogBaseline = mobileFog;
+        }
         g_aircraftGroundFogBaseline={};
-    } else if (mobileFog.valid &&
-               (!g_aircraftFogWasActive||aircraftLod.altitudeM<=20.0f)) {
+    } else if (!g_aircraftFogWasActive) {
+        if (aircraftLod.altitudeValid && aircraftLod.altitudeM <= 20.0f &&
+            mobileFog.valid) {
+            g_aircraftGroundFogBaseline=mobileFog;
+        } else {
+            g_aircraftGroundFogBaseline=g_recentGroundFogBaseline;
+        }
+    } else if (aircraftLod.altitudeM<=20.0f && mobileFog.valid) {
         g_aircraftGroundFogBaseline=mobileFog;
+        g_recentGroundFogBaseline=mobileFog;
         static unsigned int fogGroundLog=0;
         if ((++fogGroundLog%120u)==1u)
-            LOGI("[lod.air.groundfog] agl=%.1f range=%.1f..%.1f",
+            LOGI("[lod.air.groundfog] mode=%s agl=%.1f range=%.1f..%.1f",
+                 aircraftLod.scanAlignmentActive?"plane":"chute",
                  aircraftLod.altitudeM,mobileFog.start,mobileFog.end);
     }
     g_aircraftFogWasActive=aircraftFogFlight;
@@ -20827,6 +21003,8 @@ void OnRenderScene(bool underwater) {
     ScopedStereoModelDrawDistances stereoModelDrawDistances;
     {
         ScopedScreenDimensions screenDimensions(g.RsGlobal);
+        ScopedParachuteStringsHide hideRetailParachuteStrings(
+            g_parachuteAirState.load(std::memory_order_relaxed));
         for (int e = 0; e < 2; ++e) {
             screenDimensions.Set(g_eyeRasterW, g_eyeRasterH);
         if (e != 0) {                                        // freeze time for the 2nd eye
@@ -28794,6 +28972,57 @@ bool IsHdWeaponsEnabled() {
     return g_hdWeaponsEnabled.load(std::memory_order_acquire);
 }
 
+int GetTracerColorMode() {
+    EnsureGraphicsSettingsLoaded();
+    return ClampTracerColorMode(
+        g_tracerColorMode.load(std::memory_order_acquire));
+}
+
+const char* GetTracerColorModeName() {
+    return TracerColorModeName(GetTracerColorMode());
+}
+
+void AdjustTracerColorMode(int direction) {
+    EnsureGraphicsSettingsLoaded();
+    if (direction == 0) return;
+    const int step = direction < 0 ? -1 : 1;
+    const int current = GetTracerColorMode();
+    const int desired = (current + kTracerColorModeCount + step) %
+        kTracerColorModeCount;
+    if (g_tracerColorMode.exchange(desired, std::memory_order_acq_rel) ==
+        desired) {
+        return;
+    }
+    SaveGraphicsSettings();
+    LOGI("[weapon.tracer] color=%s", TracerColorModeName(desired));
+}
+
+int GetTracerSmokeSpreadPercent() {
+    EnsureGraphicsSettingsLoaded();
+    return ClampTracerSmokeSpread(
+        g_tracerSmokeSpread.load(std::memory_order_acquire));
+}
+
+void AdjustTracerSmokeSpread(int direction) {
+    EnsureGraphicsSettingsLoaded();
+    if (direction == 0) return;
+    int current = GetTracerSmokeSpreadPercent();
+    for (;;) {
+        const int desired = ClampTracerSmokeSpread(
+            current + (direction < 0 ? -kTracerSmokeSpreadStep
+                                     : kTracerSmokeSpreadStep));
+        if (desired == current) return;
+        if (g_tracerSmokeSpread.compare_exchange_weak(
+                current, desired, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            SaveGraphicsSettings();
+            LOGI("[weapon.tracer] smoke_spread=%d%%", desired);
+            return;
+        }
+        current = ClampTracerSmokeSpread(current);
+    }
+}
+
 void SetHdWeaponsEnabled(bool enabled) {
     EnsureGraphicsSettingsLoaded();
     if (g_hdWeaponsEnabled.exchange(enabled, std::memory_order_acq_rel) ==
@@ -28865,6 +29094,10 @@ void ResetGraphicsDefaults() {
     g_dynamicShadowMode.store(kDefaultShadowMode, std::memory_order_release);
     ApplyDynamicShadowPreference();
     g_hdWeaponsEnabled.store(false, std::memory_order_release);
+    g_tracerColorMode.store(kDefaultTracerColorMode,
+                            std::memory_order_release);
+    g_tracerSmokeSpread.store(kDefaultTracerSmokeSpread,
+                              std::memory_order_release);
     for (int i = 0; i < GFXDIST_COUNT; ++i) {
         g_graphicsDistanceChoice[i].store(
             kGraphicsDistanceSpecs[i].defaultChoice,

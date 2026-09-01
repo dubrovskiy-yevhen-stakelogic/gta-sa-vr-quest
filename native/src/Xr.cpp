@@ -63,11 +63,11 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.1.2.0";  // internal build id (4th digit)
+constexpr char kModVersion[] = "0.1.3.0";  // internal build id (4th digit)
 #ifdef SAVR_DEV
-constexpr const char* kModVersionShown = "0.1.2";
+constexpr const char* kModVersionShown = "0.1.3";
 #else
-constexpr const char* kModVersionShown = "0.1.2";
+constexpr const char* kModVersionShown = "0.1.3";
 #endif
 
 JavaVM*   g_hudTextVm{};
@@ -658,7 +658,7 @@ ThrowableTrajectory g_stereoThrowableTrajectory[kStereoSets][2]{};
 // Keep the streak close to the muzzle: a stock-SA random 2..5 m slice can land
 // tens of metres away and is effectively invisible at headset resolution.
 constexpr int kMaxBulletTracers = 16;
-constexpr float kBulletTracerMaxLength = 45.0f;
+constexpr float kBulletTracerMaxLength = 32.0f;
 struct BulletTracer {
     bool valid{false};
     XrVector3f start{};
@@ -5602,9 +5602,10 @@ void AddBulletTracer(const float start[3], const float end[3], int weaponType) {
     const float rayLength = std::sqrt(lengthSq);
     const XrVector3f direction{dx / rayLength, dy / rayLength, dz / rayLength};
     // Begin just beyond the weapon shell and preserve the exact physical ray.
-    // 45 m is long enough to read the impact direction outdoors without turning
-    // a 300 m miss into a permanent laser across the whole map.
-    const float along = std::min(0.12f, rayLength * 0.05f);
+    // The old 45 m / 0.75-2 s untextured quad looked like a large grey strip in
+    // VR.  Keep enough length to read the shot direction but make it a genuine
+    // short-lived tracer rather than a persistent laser across the map.
+    const float along = std::min(0.18f, rayLength * 0.05f);
     const float streakLength = std::min(kBulletTracerMaxLength, rayLength) - along;
     if (streakLength < 0.01f) return;
     const XrVector3f streakStart{
@@ -5622,18 +5623,18 @@ void AddBulletTracer(const float start[3], const float end[3], int weaponType) {
     tracer.end = streakEnd;
     tracer.weaponType = weaponType;
     tracer.bornNs = now;
-    // Vice City class tuning, mapped onto SA weapon ids: shotguns get the
-    // short fat puff, rifles/minigun the long streak, everything else the
-    // default pistol trace.
-    float thickness = 0.4f, visibility = 150.0f, lifetimeMs = 750.0f;
+    // The VC smoke trail needs enough lifetime to visibly expand and dissipate.
+    // Keep the dimensions in metres and the pool bounded, so automatic weapons
+    // cannot leave the stock multi-second, metre-wide trails behind them.
+    float thickness = 0.018f, visibility = 0.90f, lifetimeMs = 180.0f;
     if (weaponType == 25 || weaponType == 26 || weaponType == 27) {
-        thickness = 0.7f; visibility = 200.0f; lifetimeMs = 1000.0f;
+        thickness = 0.028f; visibility = 0.95f; lifetimeMs = 220.0f;
     } else if (weaponType == 30 || weaponType == 31 || weaponType == 33 ||
                weaponType == 34 || weaponType == 38) {
-        thickness = 1.0f; visibility = 220.0f; lifetimeMs = 2000.0f;
+        thickness = 0.022f; visibility = 1.00f; lifetimeMs = 150.0f;
     }
     tracer.maxThickness = thickness;
-    tracer.visibility = visibility / 255.0f;
+    tracer.visibility = visibility;
     tracer.expiresNs = now +
         static_cast<std::uint64_t>(lifetimeMs * 1.0e6);
 }
@@ -7893,9 +7894,9 @@ void BuildCalibMenu() {
     PanelText(hdr, cx, 44, 2, 255, 200, 120);
     PanelText("LEFT USES THE SAME MIRRORED PROFILE", cx, 64, 2, 145, 185, 205);
 
-    // 24 rows (0..23) in a scrolling window that keeps the selection centred, so the
+    // 26 rows (0..25) in a scrolling window that keeps the selection centred, so the
     // fixed panel stays readable at arm's length instead of shrinking the font.
-    constexpr int kRows = 24, kWin = 9;
+    constexpr int kRows = 26, kWin = 9;
     int start = sel - kWin / 2;
     if (start < 0)              start = 0;
     if (start > kRows - kWin)   start = kRows - kWin;
@@ -7908,8 +7909,14 @@ void BuildCalibMenu() {
         if (r == sel) PanelFillRect(18, y - 3, kPanelW - 18, y + 18, 120, 40, 110, 235);
         const int c = (r == sel) ? 255 : 200;
         char row[64];
-        if (r == 23) {
+        if (r == 25) {
             std::snprintf(row, sizeof(row), "BACK");
+        } else if (r == 24) {
+            std::snprintf(row, sizeof(row), "TRACER SMOKE   < %d%% >",
+                          vrcam::GetTracerSmokeSpreadPercent());
+        } else if (r == 23) {
+            std::snprintf(row, sizeof(row), "TRACER COLOR   < %s >",
+                          vrcam::GetTracerColorModeName());
         } else if (r == 22) {
             std::snprintf(row, sizeof(row), "WEAPON RECOIL   < %s >",
                           savr::calib::RecoilLevelName());
@@ -8725,6 +8732,8 @@ GLuint g_markerProg = 0, g_markerVbo = 0, g_markerEbo = 0;
 GLint  g_markerMvpLoc = -1, g_markerColLoc = -1;
 GLuint g_arrowProg = 0;
 GLint  g_arrowMvpLoc = -1, g_arrowColLoc = -1;
+GLuint g_tracerProg = 0, g_tracerVbo = 0, g_tracerEbo = 0;
+GLint  g_tracerMvpLoc = -1, g_tracerColLoc = -1, g_tracerOpacityLoc = -1;
 float          g_markerVerts[8 * 3 * 8];   // up to 8 cubes x 8 corners x xyz
 unsigned short g_markerIdx[8 * 36];
 
@@ -8745,6 +8754,46 @@ void EnsureMarkerProgram() {
     g_markerMvpLoc = glGetUniformLocation(g_markerProg, "uMVP");
     g_markerColLoc = glGetUniformLocation(g_markerProg, "uCol");
     glGenBuffers(1, &g_markerVbo); glGenBuffers(1, &g_markerEbo);
+}
+
+// Vice City's bullet trace is a textured four-sided smoke volume, not a flat
+// beam. The late Quest pass cannot safely borrow the game's smoketrail TXD, so
+// reproduce its soft radial density procedurally. The pattern is evaluated from
+// object UVs and is therefore identical in both eyes and does not shimmer.
+void EnsureTracerProgram() {
+    if (g_tracerProg) return;
+    const char* vs = "#version 300 es\n"
+                     "layout(location=0) in vec3 aPos;\n"
+                     "layout(location=1) in vec2 aSmoke;\n"
+                     "layout(location=2) in float aAlpha;\n"
+                     "uniform mat4 uMVP; out vec2 vSmoke; out float vAlpha;\n"
+                     "void main(){ vSmoke=aSmoke; vAlpha=aAlpha; "
+                     "gl_Position=uMVP*vec4(aPos,1.0); }\n";
+    const char* fs = "#version 300 es\n"
+                     "precision mediump float;\n"
+                     "uniform vec3 uCol; uniform float uOpacity;\n"
+                     "in vec2 vSmoke; in float vAlpha; out vec4 o;\n"
+                     "void main(){\n"
+                     "  float soft=1.0-smoothstep(0.04,1.0,vSmoke.x);\n"
+                     "  float w0=0.84+0.16*sin(vSmoke.y*37.0+vSmoke.x*9.0);\n"
+                     "  float w1=0.90+0.10*sin(vSmoke.y*83.0-vSmoke.x*15.0);\n"
+                     "  float a=clamp(soft*w0*w1*vAlpha*uOpacity,0.0,1.0);\n"
+                     "  o=vec4(uCol,a);\n"
+                     "}\n";
+    const GLuint v = CompileHandShader(GL_VERTEX_SHADER, vs);
+    const GLuint f = CompileHandShader(GL_FRAGMENT_SHADER, fs);
+    g_tracerProg = glCreateProgram();
+    glAttachShader(g_tracerProg, v);
+    glAttachShader(g_tracerProg, f);
+    glLinkProgram(g_tracerProg);
+    glDeleteShader(v);
+    glDeleteShader(f);
+    g_tracerMvpLoc = glGetUniformLocation(g_tracerProg, "uMVP");
+    g_tracerColLoc = glGetUniformLocation(g_tracerProg, "uCol");
+    g_tracerOpacityLoc = glGetUniformLocation(g_tracerProg, "uOpacity");
+    glGenBuffers(1, &g_tracerVbo);
+    glGenBuffers(1, &g_tracerEbo);
+    LOGI("[tracer] Vice City smoke-volume program ready");
 }
 
 void EnsureArrowProgram() {
@@ -9883,29 +9932,49 @@ void DrawWeaponLaser(const float* mvp, const LaserRay& ray) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
-// Vice City-style depth-tested smoke streak: it thickens as the white trace
-// fades, instead of reading as a second amber laser.
+// Depth-tested Vice City smoke trail. VC uses ten vertices (a centre line plus
+// four radial fins), repeats the smoke texture along the middle, and gives the
+// first/last eighth a zero-alpha endpoint. Recreate that exact three-section
+// volume with a procedural soft-smoke shader, then add only a thin bright core.
 void DrawBulletTracers(const float* mvp, XrVector3f eyePosition,
                        const BulletTracer* tracers, int count) {
     if (!tracers || count <= 0) return;
     count = std::min(count, kMaxBulletTracers);
     const std::uint64_t now = MonotonicNowNs();
-    static const unsigned short indices[6] = {0, 1, 2, 2, 1, 3};
+    static const unsigned short smokeSectionIndices[48] = {
+        0,5,7, 0,7,2, 0,7,5, 0,2,7,
+        0,4,9, 0,9,5, 0,9,4, 0,5,9,
+        0,1,6, 0,6,5, 0,6,1, 0,5,6,
+        0,3,8, 0,8,5, 0,8,3, 0,5,8};
+    static const unsigned short coreIndices[12] = {
+        0, 1, 2, 1, 3, 2, 2, 3, 4, 3, 5, 4};
 
-    EnsureMarkerProgram();
-    glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glBlendEquation(GL_FUNC_ADD);
-    glUseProgram(g_markerProg);
-    glUniformMatrix4fv(g_markerMvpLoc, 1, GL_FALSE, mvp);
-    glBindBuffer(GL_ARRAY_BUFFER, g_markerVbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_markerEbo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices,
-                 GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
-                          reinterpret_cast<void*>(0));
+    struct SmokeVertex {
+        float x, y, z;
+        float radial, along;
+        float alpha;
+    };
+    constexpr int kSmokeVerticesPerTracer = 30;
+    constexpr int kSmokeIndicesPerTracer = 144;
+    SmokeVertex smokeVertices[kMaxBulletTracers * kSmokeVerticesPerTracer]{};
+    unsigned short smokeIndices[kMaxBulletTracers * kSmokeIndicesPerTracer]{};
+    SmokeVertex coreVertices[kMaxBulletTracers * 6]{};
+    unsigned short coreDrawIndices[kMaxBulletTracers * 12]{};
+    int smokeVertexCount = 0, smokeIndexCount = 0;
+    int coreVertexCount = 0, coreIndexCount = 0;
+    int visibleCount = 0;
+    const bool viceCity =
+        vrcam::GetTracerColorMode() == vrcam::TRACER_COLOR_VICE_CITY;
+    const float smokeSpread =
+        vrcam::GetTracerSmokeSpreadPercent() * 0.01f;
+    const float smokeColor[3] = {
+        viceCity ? 0.30f : 1.0f,
+        viceCity ? 0.32f : 0.62f,
+        viceCity ? 0.35f : 0.20f};
+    const float coreColor[3] = {
+        viceCity ? 0.55f : 1.0f,
+        viceCity ? 0.58f : 0.88f,
+        viceCity ? 0.62f : 0.42f};
 
     for (int t = 0; t < count; ++t) {
         const BulletTracer& tracer = tracers[t];
@@ -9916,46 +9985,153 @@ void DrawBulletTracers(const float* mvp, XrVector3f eyePosition,
             continue;
         }
         const XrVector3f direction = vnorm(delta);
-        XrVector3f side = vcross(vnorm(vsub(tracer.start, eyePosition)),
-                                 direction);
-        if (vdot(side, side) < 1.0e-5f)
-            side = vcross(direction, {0.0f, 1.0f, 0.0f});
-        if (vdot(side, side) < 1.0e-5f)
-            side = vcross(direction, {1.0f, 0.0f, 0.0f});
-        side = vnorm(side);
-
         const float age = std::clamp(
             static_cast<float>(now - tracer.bornNs) /
                 static_cast<float>(tracer.expiresNs - tracer.bornNs),
             0.0f, 1.0f);
         const float fade = tracer.visibility * (1.0f - age);
-        const float half = std::max(0.010f, tracer.maxThickness * age);
-        const float widths[2] = {half, std::max(0.006f, half * 0.30f)};
-        const float alphas[2] = {0.40f * fade, 0.95f * fade};
-        for (int layer = 0; layer < 2; ++layer) {
-            const XrVector3f offset = vscale(side, widths[layer]);
-            const XrVector3f p[4] = {
-                vsub(tracer.start, offset), vadd(tracer.start, offset),
-                vsub(tracer.end, offset),   vadd(tracer.end, offset),
-            };
-            float verts[12]{};
-            for (int i = 0; i < 4; ++i) {
-                verts[i * 3 + 0] = p[i].x;
-                verts[i * 3 + 1] = p[i].y;
-                verts[i * 3 + 2] = p[i].z;
+        // VC deliberately lets the smoke volume bloom far beyond the bright
+        // bullet core (up to roughly half a world metre for rifle traces).
+        // That broad late-life expansion is what makes it read as displaced
+        // air rather than another beam in motion.
+        const float smokeRadius = smokeSpread * std::max(
+            0.040f, tracer.maxThickness * (2.0f + 20.0f * age));
+        ++visibleCount;
+
+        XrVector3f axisA = vcross(direction, {0.0f, 0.0f, 1.0f});
+        if (vdot(axisA, axisA) < 1.0e-5f)
+            axisA = vcross(direction, {1.0f, 0.0f, 0.0f});
+        axisA = vscale(vnorm(axisA), smokeRadius);
+        const XrVector3f axisB = vscale(
+            vnorm(vcross(direction, axisA)), smokeRadius);
+        const XrVector3f sectionPoints[4] = {
+            tracer.start,
+            vadd(tracer.start, vscale(delta, 0.125f)),
+            vadd(tracer.start, vscale(delta, 0.875f)),
+            tracer.end};
+        const float sectionAlpha[4] = {0.0f, fade, fade, 0.0f};
+        const float sectionAlong[4] = {0.0f, 0.125f, 0.875f, 1.0f};
+        for (int section = 0; section < 3; ++section) {
+            const int base = smokeVertexCount;
+            for (int endIndex = 0; endIndex < 2; ++endIndex) {
+                const int pointIndex = section + endIndex;
+                const XrVector3f center = sectionPoints[pointIndex];
+                const XrVector3f points[5] = {
+                    center, vadd(center, axisA), vadd(center, axisB),
+                    vsub(center, axisA), vsub(center, axisB)};
+                for (int radial = 0; radial < 5; ++radial) {
+                    SmokeVertex& vertex = smokeVertices[smokeVertexCount++];
+                    vertex.x = points[radial].x;
+                    vertex.y = points[radial].y;
+                    vertex.z = points[radial].z;
+                    vertex.radial = radial == 0 ? 0.0f : 1.0f;
+                    vertex.along = sectionAlong[pointIndex];
+                    vertex.alpha = sectionAlpha[pointIndex];
+                }
             }
-            glUniform4f(g_markerColLoc, 1.0f, 1.0f, 1.0f, alphas[layer]);
-            glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
-            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+            for (unsigned short index : smokeSectionIndices) {
+                smokeIndices[smokeIndexCount++] =
+                    static_cast<unsigned short>(base + index);
+            }
         }
+
+        // A narrow view-facing core supplies the instantaneous flash without
+        // overpowering the smoke volume as the previous full-width beam did.
+        XrVector3f coreSide = vcross(
+            vnorm(vsub(tracer.start, eyePosition)), direction);
+        if (vdot(coreSide, coreSide) < 1.0e-5f)
+            coreSide = vnorm(axisA);
+        coreSide = vscale(vnorm(coreSide),
+                          std::max(0.0035f, tracer.maxThickness * 0.18f));
+        const XrVector3f shoulder0 = vadd(tracer.start, vscale(delta, 0.08f));
+        const XrVector3f shoulder1 = vadd(tracer.start, vscale(delta, 0.92f));
+        const XrVector3f core[6] = {
+            tracer.start,
+            vsub(shoulder0, coreSide), vadd(shoulder0, coreSide),
+            vsub(shoulder1, coreSide), vadd(shoulder1, coreSide),
+            tracer.end};
+        const int coreBase = coreVertexCount;
+        for (const XrVector3f& point : core) {
+            SmokeVertex& vertex = coreVertices[coreVertexCount];
+            vertex.x = point.x;
+            vertex.y = point.y;
+            vertex.z = point.z;
+            vertex.radial = 0.0f;
+            vertex.along = static_cast<float>(coreVertexCount - coreBase) / 5.0f;
+            vertex.alpha = fade;
+            ++coreVertexCount;
+        }
+        for (unsigned short index : coreIndices)
+            coreDrawIndices[coreIndexCount++] =
+                static_cast<unsigned short>(coreBase + index);
     }
 
+    if (smokeIndexCount <= 0 || visibleCount <= 0) return;
+
+    const GLboolean cullWasEnabled = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+
+    EnsureTracerProgram();
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_tracerProg);
+    glUniformMatrix4fv(g_tracerMvpLoc, 1, GL_FALSE, mvp);
+    glUniform3f(g_tracerColLoc, smokeColor[0], smokeColor[1], smokeColor[2]);
+    glUniform1f(g_tracerOpacityLoc, 0.78f);
+    glBindBuffer(GL_ARRAY_BUFFER, g_tracerVbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 smokeVertexCount * sizeof(SmokeVertex), smokeVertices,
+                 GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_tracerEbo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                 smokeIndexCount * sizeof(unsigned short), smokeIndices,
+                 GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(SmokeVertex),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SmokeVertex),
+                          reinterpret_cast<void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(SmokeVertex),
+                          reinterpret_cast<void*>(5 * sizeof(float)));
+    glDrawElements(GL_TRIANGLES, smokeIndexCount, GL_UNSIGNED_SHORT, nullptr);
+    glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(0);
+
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glUniform3f(g_tracerColLoc, coreColor[0], coreColor[1], coreColor[2]);
+    glUniform1f(g_tracerOpacityLoc, viceCity ? 0.28f : 0.42f);
+    glBindBuffer(GL_ARRAY_BUFFER, g_tracerVbo);
+    glBufferData(GL_ARRAY_BUFFER, coreVertexCount * sizeof(SmokeVertex),
+                 coreVertices, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_tracerEbo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                 coreIndexCount * sizeof(unsigned short), coreDrawIndices,
+                 GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(SmokeVertex),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SmokeVertex),
+                          reinterpret_cast<void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(SmokeVertex),
+                          reinterpret_cast<void*>(5 * sizeof(float)));
+    glDrawElements(GL_TRIANGLES, coreIndexCount, GL_UNSIGNED_SHORT, nullptr);
+
+    glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(0);
     glUseProgram(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
+    if (cullWasEnabled) glEnable(GL_CULL_FACE);
 }
 
 // ---- Stage 1 weapon rendering: object-space geometry -> right-hand pose ----

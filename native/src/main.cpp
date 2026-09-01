@@ -1207,9 +1207,10 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_CALIB: {
-            // 24 rows: 0..18 fields, 19 WEAPON LASER (global), 20 LASER BEAM
-            // mode, 21 LOCK LASER, 22 WEAPON RECOIL, 23 BACK.
-            constexpr int ROWS = 24;
+            // 26 rows: 0..18 fields, 19 WEAPON LASER (global), 20 LASER BEAM
+            // mode, 21 LOCK LASER, 22 WEAPON RECOIL, 23 TRACER COLOR,
+            // 24 TRACER SMOKE SPREAD, 25 BACK.
+            constexpr int ROWS = 26;
             if (navUp)   calibSel = (calibSel - 1 + ROWS) % ROWS;
             if (navDown) calibSel = (calibSel + 1) % ROWS;
             const int type = calibWeaponType;
@@ -1227,8 +1228,14 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             const int  mult      = (calAdjHeld < 45) ? 1 : (calAdjHeld < 105) ? 3 : 10;  // x1/x3/x10
             const bool firstTick = fire && calAdjHeld == 1;
 
-            if (calibSel == 23) {                                  // BACK
+            if (calibSel == 25) {                                  // BACK
                 if (enter || firstTick || back) { savr::calib::Save(); menuPage = PG_MAIN; }
+            } else if (calibSel == 24) {                           // TRACER SMOKE SPREAD
+                if (enter) vrcam::AdjustTracerSmokeSpread(+1);
+                else if (firstTick) vrcam::AdjustTracerSmokeSpread(dir);
+            } else if (calibSel == 23) {                           // TRACER COLOR
+                if (enter) vrcam::AdjustTracerColorMode(+1);
+                else if (firstTick) vrcam::AdjustTracerColorMode(dir);
             } else if (calibSel == 22) {                           // WEAPON RECOIL
                 if (enter) savr::calib::CycleRecoil(+1);
                 else if (firstTick) savr::calib::CycleRecoil(dir);

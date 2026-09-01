@@ -7,19 +7,19 @@ the public build/install safety layer. This is a source-only sync; signed APKs,
 original game files, audio, signing keys, diagnostics and local build products
 are intentionally not part of the repository.
 
-- `native/src/VrCamera.cpp`: `18456CECAF9F29B6CFEB5C888FFD370C60A577C04786A267265D869ADBF67E5E`
-- `native/src/Xr.cpp`: `CDB006DE12AE756FE4CF44AF628B73E4D8948FB8EBAC35BB3F10339F91EAF917`
+- `native/src/VrCamera.cpp`: `89F1BB767675CE79AF79F09D4744DA95FCF9EA9B27E8E97E4966139F42247D30`
+- `native/src/Xr.cpp`: `B3622A2AB4778800F1099AC54E37CF272FA4FDE995A4D25B1AC8F61936D7064E`
 - `native/src/Xr.h`: `47F9BB1226C0FC84774FA31A26D4735A9B4E1E774EC4A7004EF16D3D8E57E491`
-- `native/src/main.cpp`: `35144B5B47BF7D4E26C1E0CA3BA13D73901205FD85310148DFA8AF8472C9F5D2`
+- `native/src/main.cpp`: `F0AF48FB863C4DB229BBD17FAF1B419B922183FBDCE1FCB7B040E59248C9275F`
 - `native/src/Driving.cpp`: `1370ECF0E14BB06D4F9E0F7EE3355FBD9BF8F207F1D4CA9F7DF737717ED2A392`
 - `native/src/Basketball.cpp`: `9A5CD65721A08E58A2A942F08DBCEDBB1C5F6314CB8B48F711C765E029E032A1`
 - `native/src/Locomotion.cpp`: `FA3618C8B6C5C48D30E178BEFA3C3CB660437A883F5A3B7C7CA8D554E308D602`
-- `native/src/HudSettings.cpp`: `CD1492FF999159CEE7882B1B358A8F5CB5F5D81BDE71268E659BDD99AA661395`
+- `native/src/HudSettings.cpp`: `B2E9D54DAD9A94EC85BD288433509DCADCC4FD00829DD6299F4874FF0B251771`
 - `native/src/PerfTelemetry.cpp`: `42F2BA988C5E9E19CF02CD7B4D0E7E92FFA3FD99BE9DC4AE38F3EB57554A05A8`
-- `defaults/quest/vr_hud.ini`: `F13C41DACD151A767B1B1E9C150D7B7279C5410BA56EAD093A2C114B26082EC7`
+- `defaults/quest/vr_hud.ini`: `777632D404B0B13987323B9F7E5C6D1558179C0098C82BAFB2F54B732C416D6A`
 - Aircraft HLOD input: `9DBA3B2D040E663D0EA495052CDCF3B0721F4EE560F6509504C13A77BA4CA1E3`
 - Full player-config (`SAVR_DEV=OFF`) `BuildOnly` `libsavr.so`:
-  `65660A181D95CD1B96DC8C891092BAEC66AA05C4F71F6AEB124E9857194CF95A`
+  `6A3CE1520864DAB773B237EE695270C66289BA042D85410223578485D7E83FFD`
 
 The runtime contains the accepted stereo RenderQueue retirement/backing work,
 adaptive fresh-pair wait, absolute 72 Hz deadline pacing, full-resolution menu
@@ -51,7 +51,7 @@ hand calibration use the author's tested values.
 This kit was prepared from the active GTA San Andreas VR Quest source tree on
 2026-08-25.
 
-- Mod version: `0.1.2 alpha`
+- Mod version: `0.1.3 alpha`
 - Active snapshot boundary: native build completed at `2026-08-25 23:39:12`
   (Europe/Kiev)
 - Canonical author-source set before public-kit adaptations: 51 files
@@ -67,7 +67,7 @@ under `native/src`, the Java loader, and `tools/build.ps1`. It records the
 private active-tree provenance before the public adaptations below; the release
 audit treats it as documentation rather than a hash of the adapted kit.
 
-The public-kit adaptation publishes version `0.1.2 alpha`, hardens the build
+The public-kit adaptation publishes version `0.1.3 alpha`, hardens the build
 scripts and `native/CMakeLists.txt`, sanitizes internal-only wording, and adds
 reset/support tooling. No compiled OpenXR loader, APK, extracted game binary,
 audio, signing key, or local absolute toolchain path is required in the

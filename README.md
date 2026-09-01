@@ -1,6 +1,6 @@
 # GTA San Andreas VR for Quest — Source Kit
 
-Version `0.1.2 alpha`.
+Version `0.1.3 alpha`. See the [changelog](CHANGELOG.md).
 
 This repository contains the source code and build/install tools for the GTA
 San Andreas VR Quest mod. It does **not** contain GTA San Andreas, Rockstar
@@ -206,13 +206,26 @@ word `RESET`. It then stops GTA SA, removes only the nine exact VR settings
 files listed in [BUILDING.md](BUILDING.md), and verifies the result. Saves,
 `audio`, `vrhands`, game data, APKs, and performance CSV files remain intact.
 The game is not launched; new compiled defaults take effect after the next
-manual start. Version 0.1.2 embeds the author's release-Quest menu,
+manual start. Version 0.1.3 embeds the author's release-Quest menu,
 weapon, HUD, holster, and vehicle calibration as its defaults. The sole quality
 override is the eye-buffer resolution, which resets to `100%`.
 
 For automation, use `-Yes -NonInteractive` in PowerShell or
 `--yes --non-interactive` in Bash. With multiple devices, specify
 `-Serial`/`--serial`.
+
+### Exporting VR settings for support or calibration sharing
+
+Windows users can run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\tools\export-savr-settings.ps1
+```
+
+The helper copies the current VR `.ini` files into a timestamped folder on the
+PC. It deliberately excludes saves, logs, screenshots, game assets, and the raw
+Quest serial number. Add `-DrivingOnly` when only vehicle calibration is needed.
 
 ## HD weapon models (optional)
 
@@ -224,9 +237,9 @@ and load only while the option is on, so you can turn them off any time.
 
 1. Install and run the mod once (`BUILD_AND_INSTALL.bat`) so Python and adb are
    available and the game has been started at least once.
-2. Download a weapon model pack — an archive that contains the weapon `.dff`
-   files (for example the "Original HD Weapons" mobile pack).
-   `<< add the exact download link here >>`
+2. Download a compatible mobile weapon model pack containing the weapon `.dff`
+   files (for example an "Original HD Weapons" mobile pack). The models are
+   third-party content and are intentionally not redistributed by this kit.
 3. Connect the Quest and double-click **`INSTALL_HD_WEAPONS.bat`**. Drag the
    downloaded pack into the window when it asks, and press Enter. The installer
    builds the weapon image + textures and copies everything to the headset on

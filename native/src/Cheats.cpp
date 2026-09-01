@@ -166,8 +166,43 @@ bool (*g_isPlayerOnAMission)() = nullptr;
 int* g_currentMissionPage = nullptr;
 int* g_currentSkipToMissionNumber = nullptr;
 int* g_skipToMissionNumber = nullptr;
+int* g_numMissions = nullptr;
 std::atomic<int> g_missionPageSel{0};
 std::atomic<int> g_missionNumberSel{0};
+constexpr int kMissionPageCount = 6;
+constexpr int kLegacyMissionCountFallback = 20;
+
+int MissionCountForPage(int page) {
+    page = std::clamp(page, 0, kMissionPageCount - 1);
+    if (g_numMissions != nullptr) {
+        const int count = g_numMissions[page];
+        // Retail lays out six consecutive counts immediately before its
+        // mission-label storage. Fail closed if another binary has a
+        // different or not-yet-initialized layout.
+        if (count > 0 && count <= 512) return count;
+    }
+    return kLegacyMissionCountFallback;
+}
+
+void StepMissionSelection(bool pageRow, int direction) {
+    const int step = direction < 0 ? -1 : 1;
+    if (pageRow) {
+        const int current = g_missionPageSel.load(std::memory_order_acquire);
+        const int page = (current + kMissionPageCount + step) %
+            kMissionPageCount;
+        g_missionPageSel.store(page, std::memory_order_release);
+        const int count = MissionCountForPage(page);
+        const int number = g_missionNumberSel.load(std::memory_order_acquire);
+        g_missionNumberSel.store(std::clamp(number, 0, count - 1),
+                                 std::memory_order_release);
+        return;
+    }
+    const int count = MissionCountForPage(
+        g_missionPageSel.load(std::memory_order_acquire));
+    const int current = g_missionNumberSel.load(std::memory_order_acquire);
+    g_missionNumberSel.store((current + count + step) % count,
+                             std::memory_order_release);
+}
 // After LAUNCH: watch whether main.scm consumes (clears) the skip flag.
 std::atomic<std::uintptr_t> g_missionLaunchProbe{0};
 std::atomic<int> g_missionLaunchTicks{-1};
@@ -391,11 +426,14 @@ void Init(void* handle) {
         dlsym(handle, "currentSkipToMissionNumber"));
     g_skipToMissionNumber = static_cast<int*>(
         dlsym(handle, "SkipToMissionNumber"));
+    g_numMissions = static_cast<int*>(dlsym(handle, "numMissions"));
     if (g_nativeInvincible != nullptr)
         g_godMode.store(*g_nativeInvincible, std::memory_order_release);
-    LOGI("cheats: resolved %d/%d handlers, native god state=%s", ok,
+    LOGI("cheats: resolved %d/%d handlers, native god state=%s mission counts=%s",
+         ok,
          static_cast<int>(std::size(g_cheats)),
-         g_nativeInvincible != nullptr ? "yes" : "no");
+         g_nativeInvincible != nullptr ? "yes" : "no",
+         g_numMissions != nullptr ? "retail" : "legacy-20");
 }
 
 void Tick() {
@@ -457,10 +495,15 @@ const char* Name(int index) {
         static char label[2][48];
         const bool pageRow =
             std::strcmp(g_cheats[index].label, "MISSION GROUP") == 0;
-        std::snprintf(label[pageRow ? 0 : 1], sizeof(label[0]),
-                      "%s   < %d >", g_cheats[index].label,
-                      pageRow ? g_missionPageSel.load()
-                              : g_missionNumberSel.load());
+        if (pageRow) {
+            std::snprintf(label[0], sizeof(label[0]), "%s   < %d >",
+                          g_cheats[index].label, g_missionPageSel.load());
+        } else {
+            const int count = MissionCountForPage(g_missionPageSel.load());
+            std::snprintf(label[1], sizeof(label[1]), "%s   < %d / %d >",
+                          g_cheats[index].label, g_missionNumberSel.load(),
+                          count - 1);
+        }
         return label[pageRow ? 0 : 1];
     }
     if (g_cheats[index].kind != Kind::GodMode) return g_cheats[index].label;
@@ -728,9 +771,7 @@ void Activate(int index) {
     }
     if (cheat.kind == Kind::MissionSelect) {
         const bool pageRow = std::strcmp(cheat.label, "MISSION GROUP") == 0;
-        auto& sel = pageRow ? g_missionPageSel : g_missionNumberSel;
-        const int limit = pageRow ? 6 : 20;
-        sel.store((sel.load() + 1) % limit);
+        StepMissionSelection(pageRow, +1);
         return;
     }
     if (cheat.kind == Kind::MissionLaunch) {
@@ -739,10 +780,14 @@ void Activate(int index) {
             LOGW("mission launch unavailable (symbols missing)");
             return;
         }
-        *g_currentMissionPage = g_missionPageSel.load();
-        *g_currentSkipToMissionNumber = g_missionNumberSel.load();
+        const int page = std::clamp(g_missionPageSel.load(), 0,
+                                    kMissionPageCount - 1);
+        const int number = std::clamp(g_missionNumberSel.load(), 0,
+                                      MissionCountForPage(page) - 1);
+        *g_currentMissionPage = page;
+        *g_currentSkipToMissionNumber = number;
         if (g_skipToMissionNumber != nullptr)
-            *g_skipToMissionNumber = g_missionNumberSel.load();
+            *g_skipToMissionNumber = number;
         // The poll that consumes the launch runs inside main.scm's debug
         // thread, which is active only while script global $6132 is 1 (the
         // debug-menu toggle). Arm it for the launch; the Tick probe below
@@ -757,14 +802,14 @@ void Activate(int index) {
             std::memory_order_release);
         g_missionLaunchTicks.store(0, std::memory_order_release);
         LOGI("mission launch: page=%d number=%d flag=%p page@%p num@%p",
-             g_missionPageSel.load(), g_missionNumberSel.load(),
+             page, number,
              cheat.fn, static_cast<void*>(g_currentMissionPage),
              static_cast<void*>(g_currentSkipToMissionNumber));
         if (FILE* f = std::fopen(
                 "/sdcard/Android/data/com.rockstargames.gtasa/files/savr_debug.txt",
                 "a")) {
             std::fprintf(f, "launch page=%d num=%d\n",
-                         g_missionPageSel.load(), g_missionNumberSel.load());
+                         page, number);
             std::fclose(f);
         }
         return;
@@ -913,9 +958,7 @@ bool CycleCategoryItem(int category,int item,int direction) {
             g_cheats[source].kind==Kind::MissionSelect) {
             const bool pageRow =
                 std::strcmp(g_cheats[source].label, "MISSION GROUP") == 0;
-            auto& sel = pageRow ? g_missionPageSel : g_missionNumberSel;
-            const int limit = pageRow ? 6 : 20;
-            sel.store((sel.load() + limit + (direction<0?-1:1)) % limit);
+            StepMissionSelection(pageRow, direction);
             return true;
         }
     }

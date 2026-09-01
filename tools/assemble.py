@@ -78,6 +78,8 @@ SUPPORTED_AUDIO_PAGE = (
 HAND_FILES = (
     "BigHandLeft.uxrh",
     "BigHandRight.uxrh",
+    "BigHandLeftPalm.uxrh",
+    "BigHandRightPalm.uxrh",
     "BigHandsAlbedo.rgba",
 )
 OFFICIAL_ARM64_LIBS = {
