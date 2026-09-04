@@ -1,6 +1,7 @@
 #include "Holster.h"
 
 #include "Calib.h"
+#include "Jetpack.h"
 #include "Log.h"
 #include "Symbols.h"
 #include "VrCamera.h"
@@ -40,8 +41,10 @@ const PointMetadata kMetadata[POINT_COUNT] = {
 };
 
 std::atomic<int> gPointSlots[POINT_COUNT] = {4, 2, 3, 1, 8, 7, 5};
-std::atomic<bool> gPointVisible[POINT_COUNT] = {
-    true, true, true, true, true, true, true};
+// Per-point visibility/interaction state: 0=SHOWN (marker + on-body weapon
+// model + grabbable), 1=HIDDEN (no marker/model, STILL grabbable), 2=OFF (no
+// marker/model, NOT grabbable). Defaults to SHOWN.
+std::atomic<int> gPointState[POINT_COUNT] = {0, 0, 0, 0, 0, 0, 0};
 std::atomic<bool> gGripMarkersEnabled{true};
 // Reach for pulling a weapon off a body socket. The old fixed 27cm sphere
 // kept catching a holster during ordinary hand movement, so it is smaller by
@@ -155,7 +158,7 @@ void LoadSettings() {
     bool markers = true;
     int grabRadiusCm = kDefaultGrabRadiusCm;
     bool gripLock = false;
-    bool visible[POINT_COUNT] = {true, true, true, true, true, true, true};
+    int state[POINT_COUNT] = {0, 0, 0, 0, 0, 0, 0};
 
     FILE* f = std::fopen(kSettingsPath, "r");
     const bool hadFile = f != nullptr;
@@ -178,11 +181,20 @@ void LoadSettings() {
                 gripLock = lock != 0;
                 continue;
             }
+            int statePoint = -1, stateValue = 0;
+            if (std::sscanf(line, "state %d %d", &statePoint,
+                            &stateValue) == 2) {
+                if (ValidPoint(statePoint))
+                    state[statePoint] = std::clamp(stateValue, 0, 2);
+                continue;
+            }
             int visiblePoint = -1, visibleValue = 1;
             if (std::sscanf(line, "visible %d %d", &visiblePoint,
                             &visibleValue) == 2) {
+                // Legacy v2 files: visible=1 -> SHOWN, visible=0 -> HIDDEN
+                // (the old "hidden" was still grabbable).
                 if (ValidPoint(visiblePoint))
-                    visible[visiblePoint] = visibleValue != 0;
+                    state[visiblePoint] = visibleValue != 0 ? 0 : 1;
                 continue;
             }
             int point = -1;
@@ -212,7 +224,7 @@ void LoadSettings() {
     for (int i = 0; i < POINT_COUNT; ++i)
         gPointSlots[i].store(proposed[i], std::memory_order_release);
     for (int i = 0; i < POINT_COUNT; ++i)
-        gPointVisible[i].store(visible[i], std::memory_order_release);
+        gPointState[i].store(state[i], std::memory_order_release);
     gGripMarkersEnabled.store(markers, std::memory_order_release);
 
     if (hadFile) LOGI("[holster] loaded %s", kSettingsPath);
@@ -237,8 +249,8 @@ void SaveSettingsLocked() {
             ? kCenterThrowableSlot
             : gPointSlots[point].load(std::memory_order_acquire);
         std::fprintf(f, "p %d %d\n", point, slot);
-        std::fprintf(f, "visible %d %d\n", point,
-                     gPointVisible[point].load(std::memory_order_acquire) ? 1 : 0);
+        std::fprintf(f, "state %d %d\n", point,
+                     gPointState[point].load(std::memory_order_acquire));
     }
     std::fclose(f);
 }
@@ -266,24 +278,43 @@ const char* PointName(int point) {
 
 bool IsPointFixed(int point) { return point == CHEST_CENTER; }
 
+int PointVisibilityState(int point) {
+    Init();
+    return ValidPoint(point)
+        ? gPointState[point].load(std::memory_order_acquire)
+        : POINT_OFF;
+}
+
+// Marker + on-body weapon-model render only in the SHOWN state.
 bool PointVisible(int point) {
-    Init();
-    return ValidPoint(point) &&
-           gPointVisible[point].load(std::memory_order_acquire);
+    return PointVisibilityState(point) == POINT_SHOWN;
 }
 
-void SetPointVisible(int point, bool visible) {
+// SHOWN and HIDDEN can be grabbed; OFF cannot.
+bool PointGrabbable(int point) {
+    return PointVisibilityState(point) != POINT_OFF;
+}
+
+const char* PointVisibilityName(int point) {
+    switch (PointVisibilityState(point)) {
+        case POINT_SHOWN:  return "SHOW";
+        case POINT_HIDDEN: return "HIDE";
+        default:           return "OFF";
+    }
+}
+
+void CyclePointVisibility(int point, int dir) {
     Init();
-    if (!ValidPoint(point) ||
-        gPointVisible[point].exchange(visible, std::memory_order_acq_rel) == visible)
+    if (!ValidPoint(point)) return;
+    const int cur  = gPointState[point].load(std::memory_order_acquire);
+    const int next = ((cur + (dir < 0 ? -1 : 1)) % 3 + 3) % 3;
+    if (gPointState[point].exchange(next, std::memory_order_acq_rel) == next)
         return;
-    std::lock_guard<std::mutex> lock(gSettingsMutex);
-    SaveSettingsLocked();
-    LOGI("[holster] %s %s", PointName(point), visible ? "shown" : "hidden");
-}
-
-void TogglePointVisible(int point) {
-    if (ValidPoint(point)) SetPointVisible(point, !PointVisible(point));
+    {
+        std::lock_guard<std::mutex> lock(gSettingsMutex);
+        SaveSettingsLocked();
+    }
+    LOGI("[holster] %s -> %s", PointName(point), PointVisibilityName(point));
 }
 
 int PointSlot(int point) {
@@ -523,6 +554,11 @@ void Update() {
         ResetRuntimeState();
         return;
     }
+    // While flying the jetpack you can still draw a weapon so missions stay
+    // playable: fly with one hand (turbine) and shoot with the other. Holster
+    // grabbing uses the GRIP; the jetpack thrust uses the TRIGGER, so the two
+    // gesture systems don't fight, and the thrust/turbine skip a hand that ends
+    // up holding a weapon (see VrCamera::ApplyJetpackThrust + the turbine draw).
     void* ped = g.FindPlayerPed(-1);
     if (ped == nullptr || (g.FindPlayerVehicle && g.FindPlayerVehicle(-1, false))) {
         ResetRuntimeState();
@@ -544,12 +580,13 @@ void Update() {
         }
 
         const int slot = PointSlot(point);
-        if (!PointVisible(point)) {
-            available[point] = false;
-            continue;
-        }
-        available[point] = slot > 0 && slot != activeSlot && WeaponTypeInSlot(ped, slot) != 0;
-        if (available[point]) {
+        // GRABBABILITY and VISIBILITY are separate: a HIDDEN point still holds
+        // and still gives back its weapon (only OFF refuses), it just draws no
+        // marker. Gating the draw-from search on PointVisible made a HIDDEN
+        // socket accept a weapon it could never return.
+        available[point] = PointGrabbable(point) && slot > 0 &&
+            slot != activeSlot && WeaponTypeInSlot(ped, slot) != 0;
+        if (available[point] && PointVisible(point)) {
             for (int c = 0; c < 3; ++c) markers[markerCount][c] = anchors[point][c];
             ++markerCount;
         }
@@ -558,7 +595,10 @@ void Update() {
         xr::SetHolsterMarkers(markerCount > 0 ? markers : nullptr, markerCount);
     else
         xr::SetHolsterMarkers(nullptr, 0);
-    if (markerCount == 0) {
+    bool anyAvailable = false;
+    for (int point = 0; point < POINT_COUNT; ++point)
+        if (available[point]) { anyAvailable = true; break; }
+    if (!anyAvailable) {
         gGripDown[0] = false;
         gGripDown[1] = false;
         return;

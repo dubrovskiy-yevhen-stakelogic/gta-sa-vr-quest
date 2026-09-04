@@ -8,6 +8,8 @@
 #include "GraphicsEffects.h"
 #include "Holster.h"
 #include "HudSettings.h"
+#include "Hydraulics.h"
+#include "Jetpack.h"
 #include "Locomotion.h"
 #include "Log.h"
 #include "PerfTelemetry.h"
@@ -3349,6 +3351,33 @@ bool ActorHasPosedHead(void* actor) {
     return g.RpHAnimHierarchyGetMatrixArray(hierarchy) != nullptr;
 }
 
+int StageCutsceneCameraActors(void** actors, int capacity);
+
+// CJ's cutscene stand-in always uses the dedicated MODEL_CSPLAY model id: the
+// engine hard-maps the "csplay" entry in CCutsceneMgr::LoadCutsceneData. Vice
+// City had to guess, because Tommy could not be told apart from the other
+// actors - here we CAN name CJ exactly, so first person starts in his eyes
+// instead of whichever object happens to be first in the cutscene array (which
+// is what put the camera inside props or under the ground).
+constexpr int kModelCsplay = 1;   // MODEL_CSPLAY
+
+bool ActorIsCj(void* actor) {
+    if (!actor) return false;
+    const int modelId = *reinterpret_cast<const std::int16_t*>(
+        static_cast<const std::uint8_t*>(actor) + 0x32);
+    return modelId == kModelCsplay;
+}
+
+// 1-based camera index of CJ among the staged actors, or 0 when he is absent.
+int CjCutsceneCameraIndex() {
+    void* actors[kMaxCutsceneCameraActors]{};
+    const int staged = StageCutsceneCameraActors(actors,
+                                                 kMaxCutsceneCameraActors);
+    for (int i = 0; i < staged; ++i)
+        if (ActorIsCj(actors[i])) return i + 1;
+    return 0;
+}
+
 int StageCutsceneCameraActors(void** actors, int capacity) {
     if (!actors || capacity <= 0) return 0;
     int staged = 0;
@@ -3416,9 +3445,18 @@ void RefreshCutsceneCameraState() {
         const int remembered = locomotion::RememberedCutsceneCamera(scene);
         const int mode = FormalCutsceneRunning()
             ? locomotion::CutsceneMode() : locomotion::GameCutsceneMode();
-        g_cutsceneCameraIndex = remembered >= 0 ? remembered : (mode == 2 ? 1 : 0);
-        LOGI("[cutscene.camera] scene=%s selected=%d remembered=%d",
-             scene, g_cutsceneCameraIndex, remembered >= 0 ? 1 : 0);
+        // A remembered L3 choice always wins (Vice City behaviour). Otherwise
+        // first person starts on CJ, and only falls back to the first posed
+        // actor when he is genuinely not in this scene.
+        int cjCamera = 0;
+        if (remembered < 0 && mode == 2) {
+            cjCamera = CjCutsceneCameraIndex();
+            g_cutsceneCameraIndex = cjCamera > 0 ? cjCamera : 1;
+        } else {
+            g_cutsceneCameraIndex = remembered >= 0 ? remembered : 0;
+        }
+        LOGI("[cutscene.camera] scene=%s selected=%d remembered=%d cj=%d",
+             scene, g_cutsceneCameraIndex, remembered >= 0 ? 1 : 0, cjCamera);
     }
     void* actors[kMaxCutsceneCameraActors]{};
     const int staged = StageCutsceneCameraActors(
@@ -3895,10 +3933,17 @@ void OnCopyCameraMatrixToRWCam(void* self, bool alsoPlayerCam) {
                                 &mappedMoveX,&mappedMoveY,
                                 &mappedTurnX,&mappedTurnY);
                             // Thumbrest D-pad mode owns the right stick: no
-                            // snap/smooth turning while it is active.
+                            // snap/smooth turning while it is active. EXCEPT on
+                            // the jetpack: the turbine grip rests a thumb on the
+                            // pad, which silently froze the VR turn (the
+                            // intermittent "sometimes it turns, sometimes it
+                            // sticks"), and the D-pad has nothing to drive while
+                            // flying anyway.
+                            const bool thumbrestOwnsTurn =
+                                (in.thumbrest[0] || in.thumbrest[1]) &&
+                                !jetpack::IsActive();
                             const float rx =
-                                (in.thumbrest[0] || in.thumbrest[1])
-                                    ? 0.0f : mappedTurnX;
+                                thumbrestOwnsTurn ? 0.0f : mappedTurnX;
                             const double now=NowMs();
                             static double previousTurnMs=now;
                             const float dt=static_cast<float>(
@@ -4673,6 +4718,56 @@ bool OnWidgetReleased(int widgetId, void* outTouchPos, int touchIndex) {
     return original;
 }
 
+// Immersive jetpack REALISTIC mode: the two controllers are handheld jet
+// engines. Each firing hand's thrust reaction opposes where it points (fire
+// down -> rise, fire ahead of you -> move back, fire behind -> move forward);
+// both hands sum, so one hand can fly and the second adds. Applied as real
+// force on the ped (true momentum); the task itself only provides the hover.
+void ApplyJetpackThrust() {
+    if (!g_vrBaseValid || !g_origin.valid) return;
+    if (!jetpack::IsActive() || !jetpack::IsVectoredMode()) return;
+    if (g.FindPlayerPed == nullptr || g.CPhysical_ApplyMoveForce == nullptr)
+        return;
+    void* ped = g.FindPlayerPed(-1);
+    if (ped == nullptr) return;
+
+    xr::HandPose hp[2]{};
+    xr::GetHandPoses(hp);
+    const Q inv{-g_origin.ori.x, -g_origin.ori.y, -g_origin.ori.z,
+                g_origin.ori.w};
+    V3 thrust{0.f, 0.f, 0.f};
+    float total = 0.f;
+    for (int hand = 0; hand < 2; ++hand) {
+        if (!hp[hand].valid) continue;
+        // A hand holding a weapon is aiming/firing that weapon, not thrusting —
+        // exclude it so shooting never shoves the player. You then fly with the
+        // free hand (and can hold a gun in the other for missions).
+        if (physicalweapon::HeldSlot(hand) > 0) continue;
+        const float trig = hp[hand].trigger;
+        if (trig < 0.12f) continue;
+        const float* o = hp[hand].aimValid ? hp[hand].aimOri : hp[hand].gripOri;
+        const Q rel = Normalized(Multiply(inv, Q{o[0], o[1], o[2], o[3]}));
+        // Nozzle points OUT THE BACK of the controller (+Z), like a jet's rear
+        // exhaust: holding the turbines naturally (pointing forward) then thrusts
+        // you forward. Reaction opposes the nozzle, so thrust = the point dir.
+        const V3 nozzle = TrackingToGame(g_vrBase, Rotate(rel, {0.f, 0.f, 1.f}));
+        thrust = thrust + nozzle * (-trig);   // reaction opposes the nozzle
+        total += trig;
+    }
+    if (total < 0.12f) return;
+
+    float mass = *reinterpret_cast<const float*>(
+        static_cast<const std::uint8_t*>(ped) + 0xb0);   // CPhysical::m_fMass
+    if (!(mass > 1.0f && mass < 5000.0f)) mass = 70.0f;
+    const float dt = g.CTimer_ms_fTimeStep ? *g.CTimer_ms_fTimeStep : 1.0f;
+    // ApplyMoveForce divides by mass, so multiply it back in to get a
+    // mass-independent acceleration; kThrust tunes the strength, scaled by the
+    // TURBINE POWER menu setting.
+    const float kThrust = 0.026f * jetpack::TurbinePower();
+    const float k = kThrust * mass * dt;
+    g.CPhysical_ApplyMoveForce(ped, thrust.x * k, thrust.y * k, thrust.z * k);
+}
+
 void OnUpdatePads() {
     g_origUpdatePads();
 
@@ -4716,6 +4811,17 @@ void OnUpdatePads() {
     // NewState is the first member of CPad; LeftStickX at +0x00, LeftStickY at
     // +0x02, both int16 in [-128,127]. Forward (stick pushed up) must be negative.
     auto* ns = reinterpret_cast<int16_t*>(pad);
+
+    // Immersive jetpack: while the rocket-belt task owns the player the two
+    // controllers ARE the belt's handles. This fully replaces the on-foot
+    // stick/dpad/drive-by writes below (holster grabbing is suppressed
+    // separately), so it computes its own pad and returns.
+    if (jetpack::IsActive()) {
+        jetpack::WritePad(ns, in, CurrentLocalHeadYaw());
+        ApplyJetpackThrust();   // realistic-mode vectored hand thrust (physics)
+        return;
+    }
+
     float moveX=mappedMoveX,moveY=mappedMoveY;
     locomotion::TransformMoveStick(CurrentLocalHeadYaw(),&moveX,&moveY);
     ns[0] = static_cast<int16_t>(std::clamp(moveX,-1.0f,1.0f) *  127.0f);
@@ -4848,6 +4954,76 @@ void OnUpdatePads() {
             static unsigned int boostLog = 0;
             if ((++boostLog % 180u) == 1u)
                 LOGI("[driving] aircraft climb boost mass=%.0f", mass);
+        }
+    }
+
+    // LOWRIDER HYDRAULICS. Holding BOTH grips in a hydraulics-equipped car
+    // turns the right stick into the hydraulics control (that stick is unused
+    // while driving: steering is the left stick and drive-by needs a SINGLE
+    // grip, whose block is already suppressed when both are held).
+    //
+    // Writing NewState.RightStick* here does NOT work on this port: the stock
+    // accessors CPad::GetCarGunLeftRight/GetCarGunUpDown only fall through to
+    // the stick when CHID::GetInputType()==1 and otherwise read the on-screen
+    // touch widgets. So the value is published to savr::hydraulics, which hooks
+    // those two accessors directly (see Hydraulics.cpp).
+    //
+    // LOWRIDERS ONLY: the handling byte at vehicle+0x4ba carries the hydraulic
+    // handling flags (bit0 = HydraulicGeom, bit1 = HydraulicInst, bit2 =
+    // HydraulicNone - bit2 is the very gate CAutomobile::HydraulicControl tests
+    // at 0x6a2018). Requiring bit1 keeps the chord inert in ordinary cars, and
+    // in particular stops it from slewing a tank turret, which shares the same
+    // CarGun axes.
+    {
+        bool hydroActive = false;
+        float hydroX = 0.0f, hydroY = 0.0f;
+        if (vehicle && bothGrips && !openChord &&
+            flightAppearance != 3 && flightAppearance != 5) {
+            // Handling flags are a 32-bit word at vehicle+0x4b8; bit16
+            // HydraulicGeom, bit17 HydraulicInst, bit18 HydraulicNone (the
+            // CAutomobile::ProcessControl disasm at 0x6a85cc tests bit 17 there).
+            // Do NOT require "installed": the game reaches HydraulicControl
+            // regardless and SETS bit 17 itself (0x6a85d4), so a genuine lowrider
+            // reads geom=1/inst=0 until then - which is exactly the car that
+            // looked "not a lowrider" and had the feature refused.
+            const std::uint32_t hydroFlags = *reinterpret_cast<const std::uint32_t*>(
+                reinterpret_cast<const char*>(vehicle) + 0x4b8);
+            const bool hydroGeom = (hydroFlags & (1u << 16)) != 0;
+            const bool hydroInst = (hydroFlags & (1u << 17)) != 0;
+            const bool hydroNone = (hydroFlags & (1u << 18)) != 0;
+            const bool installed = (hydroGeom || hydroInst) && !hydroNone;
+            static std::uint32_t loggedFlags = 0xffffffffu;
+            if (hydroFlags != loggedFlags) {
+                loggedFlags = hydroFlags;
+                LOGI("[driving.hydraulics] handling +0x4b8=0x%08x "
+                     "(geom=%d inst=%d none=%d) -> %s",
+                     hydroFlags, hydroGeom ? 1 : 0, hydroInst ? 1 : 0,
+                     hydroNone ? 1 : 0, installed ? "LOWRIDER" : "not a lowrider");
+            }
+            if (installed) {
+                const auto hydroDeadzone = [](float v) {
+                    return std::abs(v) < 0.18f ? 0.0f : v;
+                };
+                // RAW right stick on purpose: a direct physical mapping, so the
+                // turn-axis invert/swap comfort options must never flip which
+                // corner of the car rises.
+                hydroX = hydroDeadzone(in.rightStick[0]);
+                hydroY = hydroDeadzone(in.rightStick[1]);
+                // Engage for the WHOLE chord, not only while deflected, so the
+                // stock accessor (and its touch widget) never sneaks back in
+                // between flicks.
+                hydroActive = true;
+            }
+        }
+        hydraulics::SetStick(hydroActive, hydroX, hydroY);
+        // Rhythm prompt: publish the next required direction so the compositor
+        // can draw an arrow (the stock SCM arrows never reach the VR eyes).
+        int beatMs = 0;
+        xr::SetBeatArrow(hydraulics::PollBeat(&beatMs), beatMs);
+        if (hydroActive) {
+            static unsigned int hydroLog = 0;
+            if ((++hydroLog % 120u) == 1u)
+                LOGI("[driving.hydraulics] stick=%.2f,%.2f", hydroX, hydroY);
         }
     }
 
@@ -20101,6 +20277,24 @@ void RenderGameplayHudPass() {
             }
         }
     }
+    // Lowrider dance score. Its stock counters live in the mobile touch-HUD
+    // widget layer and never reach the VR eyes, so print them on the existing
+    // APK-font TIMERS layer, which is already published every frame.
+    {
+        int dancePlayer=0,danceRival=0;
+        if (hydraulics::GetDanceScore(&dancePlayer,&danceRival)) {
+            if (timersLength>0&&timersLength<static_cast<int>(sizeof(timersText))-1)
+                timersText[timersLength++]='\n';
+            const int room=static_cast<int>(sizeof(timersText))-timersLength;
+            if (room>1) {
+                const int written=std::snprintf(timersText+timersLength,
+                    static_cast<std::size_t>(room),"YOU %d   RIVAL %d",
+                    dancePlayer,danceRival);
+                if (written>0)
+                    timersLength+=written<room-1?written:room-1;
+            }
+        }
+    }
     while (timersLength>0&&timersText[timersLength-1]=='\n') --timersLength;
     timersText[timersLength]='\0';
     xr::PublishMissionTimersText(timersText);
@@ -20630,6 +20824,45 @@ void OnRenderScene(bool underwater) {
     xr::SetRenderedHandPoses(renderedHandPoses);
     const bool playerInVehicle = g.FindPlayerVehicle && g.FindPlayerVehicle(-1, false);
 
+    // Jetpack belt: draw the game's belt clump, but anchored to the VR BODY
+    // (the recentered head/torso frame), NOT to CJ's separate ped body. CJ does
+    // not turn with the headset and his arm bone bobs with the walk cycle, so
+    // attaching there made the belt drift in front of the player and jump up and
+    // down. g_vrBase follows the player like the holstered weapons and parachute
+    // do, so the belt now stays put on the back. Position/rotation below are
+    // tunable — the belt sits on the upper back facing forward.
+    // Hand-thruster turbines + flames (present thread) show in REALISTIC mode.
+    // The weapon-hand mask tells the compositor which hand holds a gun so it
+    // draws the weapon there instead of a turbine (fly one-handed + shoot).
+    const bool vectored = jetpack::IsActive() && jetpack::IsVectoredMode();
+    xr::SetJetpackThrusterMode(vectored);
+    xr::SetJetpackGloveMode(false);   // IRONMAN gauntlets disabled for now
+    xr::SetJetpackWeaponHandMask(
+        vectored ? physicalweapon::HeldHandMaskRelaxed() : 0u);
+    if (jetpack::IsActive() && g_vrBaseValid) {
+        void* jpTask  = jetpack::ActiveTask();
+        void* jpClump = jpTask ? *reinterpret_cast<void**>(
+            static_cast<std::uint8_t*>(jpTask) + 0x48) : nullptr;   // m_JetPackClump
+        if (jpClump) {
+            constexpr float kBackDepth  = -0.16f;  // behind the chest (metres)
+            constexpr float kBackHeight = -0.22f;  // down onto the upper back
+            constexpr float kD2R = 3.14159265358979323846f / 180.0f;
+            constexpr float kRotX = 0.0f, kRotY = 0.0f, kRotZ = 0.0f;  // tune
+            const V3 bodyRight = g_vrBase.right * -1.0f;   // CamBasis.right = left
+            Mat34 m{};
+            m.right = bodyRight;
+            m.fwd   = g_vrBase.forward;
+            m.up    = g_vrBase.up;
+            m.pos   = g_vrBase.pos + g_vrBase.forward * kBackDepth +
+                      g_vrBase.up * kBackHeight;
+            m = MatMul34(m, SetRotate34(kRotX * kD2R, kRotY * kD2R,
+                                        kRotZ * kD2R));
+            RwMat jp{};
+            SetMatBasis(jp, m.right, m.fwd, m.up, m.pos);
+            queueWeapon(jpClump, jp);
+        }
+    }
+
     // DEFAULT driving keeps the stock seated body — players want to see
     // themselves at the wheel — but the VR camera sits inside that head.
     // Vice City zero-scales the head bone exactly like a shot-off one; same
@@ -20972,15 +21205,23 @@ void OnRenderScene(bool underwater) {
     // the cheap mobile fog plane neutral at the projection edge and do not draw
     // any replacement geometry.  HLOD remains the distant colour underlay.
     const bool aircraftRadialFogActive = false;
-    const float eyeFogPlane=groundFogActive
+    float eyeFogPlane=groundFogActive
         ?g_aircraftGroundFogBaseline.start
         :(worldFogNeutralActive
             ?(aircraftRadialFogActive
                 ?aircraftFogOuterRadius
                 :eyeFarClip-aircraftFogFarMargin)
             :savedFogPlane);
-    const float eyeFogEnd=groundFogActive
+    float eyeFogEnd=groundFogActive
         ?g_aircraftGroundFogBaseline.end:eyeFarClip;
+    // FOG DISTANCE (JETPACK menu): step the fog volume outward while FLYING so
+    // the draw-distance headroom that already exists becomes visible. This never
+    // touches the far clip, so no extra geometry is drawn or streamed; the fade
+    // is clamped to the far clip so the world can never end in a hard unfogged
+    // edge. At 100% every value below is identical to the retail path above.
+    // (The in-flight FOG DISTANCE knob was removed: scaling this pair had no
+    // visible effect, because what the player actually sees is driven by the
+    // mobile distance-fog emulator applied further down, not by these values.)
     float renderedNear[2] = {eyeNearClip, eyeNearClip};
     float renderedFar[2] = {eyeFarClip, eyeFarClip};
 

@@ -1,4 +1,7 @@
+#include "AnimatedTextures.h"
 #include "Appearance.h"
+#include "Hydraulics.h"
+#include "Jetpack.h"
 #include "Calib.h"
 #include "Cheats.h"
 #include "Driving.h"
@@ -989,7 +992,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
            PG_HUD_WRIST, PG_CHEATS, PG_GRAPHICS, PG_GRAPHICS_DISTANCES,
            PG_CONTROLS, PG_CONTROLS_TIPS, PG_ABOUT, PG_BASKETBALL,
            PG_BASKETBALL_CALIB,
-           PG_VEHICLE_CAMERA };
+           PG_VEHICLE_CAMERA, PG_JETPACK };
     static int  menuPage = PG_NONE;
     static int  mainSel = 0, cheatSel = 0, cheatCategory = -1, calibSel = 0;
     static int  calibWeaponType = 0;
@@ -999,6 +1002,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
     static int  hudWristMode = 0;   // 0 auto (hand/dash), 4 weapon, 5 two-hand
     static int  basketballSel = 0, basketballCalibSel = 0;
     static int  vehicleCameraSel = 0;
+    static int  jetpackSel = 0;
     static int  locomotionSel = 0, hudSel = 0, hudCropSel = 0, hudWristSel = 0,
                 gfxSel = 0, gfxDistanceSel = 0, controlsSel = 0;
     static bool aboutFirstRun = false, aboutArmed = false;
@@ -1057,6 +1061,22 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         const bool recenterChord = !cutsceneCameras && in.l3 && in.r3;
         if (recenterChord && !recenterPrev) vrcam::RequestRecenter();
         recenterPrev = recenterChord;
+
+        // Auto-recenter on the on-foot -> in-vehicle transition: getting into a
+        // car often leaves the driver yawed off the wheel, and players were
+        // reaching for the manual L3+R3 recenter every time they sat down. The
+        // player naturally faces the windshield as they take the seat, so
+        // snapping "straight ahead" to the current head yaw on the rising edge
+        // puts the wheel in front of them. Edge-triggered (fires once per
+        // entry); exiting is left alone — on-foot forward is body-relative.
+        static bool inVehiclePrev = false;
+        const bool inVehicleNow =
+            g.FindPlayerVehicle && g.FindPlayerVehicle(-1, false) != nullptr;
+        if (inVehicleNow && !inVehiclePrev) {
+            vrcam::RequestRecenter();
+            LOGI("[vr] auto-recenter on vehicle entry");
+        }
+        inVehiclePrev = inVehicleNow;
 
         // Both grips + R3: quick first/third person toggle for the CURRENT
         // vehicle, no VR-menu trip. Only in a vehicle; L3+R3 keeps priority
@@ -1294,7 +1314,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 if (plus) savr::holster::CyclePointSlot(holsterSel, +1);
                 // A is the per-socket visibility switch. The category remains
                 // assigned, so hiding a bulky back/waist weapon is reversible.
-                if (enter) savr::holster::TogglePointVisible(holsterSel);
+                if (enter) savr::holster::CyclePointVisibility(holsterSel, +1);
             } else if (holsterSel == savr::holster::PointCount()) {
                 if (minus) savr::holster::AdjustGrabRadiusCm(-1);
                 if (plus)  savr::holster::AdjustGrabRadiusCm(+1);
@@ -1440,7 +1460,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_LOCOMOTION: {
-            constexpr int ROWS=15;
+            constexpr int ROWS=14;   // cutscene rows moved to GRAPHICS
             if (navUp) locomotionSel=(locomotionSel-1+ROWS)%ROWS;
             if (navDown) locomotionSel=(locomotionSel+1)%ROWS;
             const int step=minus?-1:(plus?1:0);
@@ -1468,15 +1488,30 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
                 menuPage=PG_VEHICLE_CAMERA;
                 vehicleCameraSel=0;
             }
-            else if (locomotionSel==11&&(step||enter))
-                savr::locomotion::CycleCutsceneMode(step<0?-1:+1);
-            else if (locomotionSel==12&&(step||enter))
-                savr::locomotion::CycleGameCutsceneMode(step<0?-1:+1);
-            else if (locomotionSel==13&&enter)
+            else if (locomotionSel==11&&enter)
                 vrcam::RequestRecenter();
-            else if (locomotionSel==14&&enter)
+            else if (locomotionSel==12&&enter) {
+                menuPage=PG_JETPACK; jetpackSel=0;
+            }
+            else if (locomotionSel==13&&enter)
                 menuPage=PG_MAIN;
             if (back) menuPage=PG_MAIN;
+            break;
+        }
+        case PG_JETPACK: {
+            constexpr int ROWS=4;   // FOG DISTANCE removed: it had no effect
+            if (navUp)   jetpackSel=(jetpackSel-1+ROWS)%ROWS;
+            if (navDown) jetpackSel=(jetpackSel+1)%ROWS;
+            const int step=minus?-1:(plus?1:0);
+            if (jetpackSel==0&&(step||enter))
+                savr::jetpack::CycleMode();
+            else if (jetpackSel==1&&(step||enter))
+                savr::jetpack::ToggleLockInAir();
+            else if (jetpackSel==2&&step)
+                savr::jetpack::AdjustTurbinePower(step);
+            else if (jetpackSel==3&&enter)
+                menuPage=PG_LOCOMOTION;
+            if (back) menuPage=PG_LOCOMOTION;
             break;
         }
         case PG_HUD: {
@@ -1611,9 +1646,10 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_GRAPHICS: {
-            // scale, CPU, GPU, world effects, neon, grading, dynamic shadows,
-            // weapon models, distances, defaults, Back
-            const int N = 11;
+            // scale, CPU, GPU, world effects, neon, grading, animated textures,
+            // dynamic shadows, weapon models, cutscenes, game cutscenes,
+            // distances, defaults, Back
+            const int N = 14;
             if (navUp)   gfxSel = (gfxSel - 1 + N) % N;
             if (navDown) gfxSel = (gfxSel + 1) % N;
             const int step = minus ? -1 : (plus ? 1 : 0);
@@ -1631,8 +1667,10 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             } else if (step && gfxSel == 5) {
                 vrcam::SetColorGradingEnabled(step > 0);
             } else if (step && gfxSel == 6) {
+                savr::animtex::SetEnabled(step > 0);
+            } else if (step && gfxSel == 7) {
                 vrcam::AdjustDynamicShadowMode(step);
-            } else if (step && gfxSel == 7 && savr::hdweapons::Available()) {
+            } else if (step && gfxSel == 8 && savr::hdweapons::Available()) {
                 vrcam::SetHdWeaponsEnabled(step > 0);
             }
             if (enter && !step && gfxSel == 3) {
@@ -1643,17 +1681,23 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             } else if (enter && !step && gfxSel == 5) {
                 vrcam::SetColorGradingEnabled(!vrcam::IsColorGradingEnabled());
             } else if (enter && !step && gfxSel == 6) {
-                vrcam::AdjustDynamicShadowMode(1);
+                savr::animtex::SetEnabled(!savr::animtex::IsEnabled());
             } else if (enter && !step && gfxSel == 7) {
+                vrcam::AdjustDynamicShadowMode(1);
+            } else if (enter && !step && gfxSel == 8) {
                 if (savr::hdweapons::Available())
                     vrcam::SetHdWeaponsEnabled(!vrcam::IsHdWeaponsEnabled());
-            } else if (enter && gfxSel == 8) {
+            } else if ((step || enter) && gfxSel == 9) {
+                savr::locomotion::CycleCutsceneMode(step < 0 ? -1 : +1);
+            } else if ((step || enter) && gfxSel == 10) {
+                savr::locomotion::CycleGameCutsceneMode(step < 0 ? -1 : +1);
+            } else if (enter && gfxSel == 11) {
                 menuPage = PG_GRAPHICS_DISTANCES;
                 gfxDistanceSel = 0;
-            } else if (enter && gfxSel == 9) {
+            } else if (enter && gfxSel == 12) {
                 vrcam::ResetGraphicsDefaults();
                 xr::SetPerfLevels(3, 3);
-            } else if (enter && gfxSel == 10) {
+            } else if (enter && gfxSel == 13) {
                 menuPage = PG_MAIN;
             }
             if (back) menuPage = PG_MAIN;
@@ -1743,6 +1787,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         xr::SetDrivingCalibrationMenu(menuPage == PG_DRIVING_CALIB,
                                       drivingCalibSel,drivingCalibHand);
         xr::SetLocomotionMenu(menuPage == PG_LOCOMOTION,locomotionSel);
+        xr::SetJetpackMenu(menuPage == PG_JETPACK,jetpackSel);
         xr::SetVehicleCameraMenu(menuPage == PG_VEHICLE_CAMERA,
                                  vehicleCameraSel);
         xr::SetBasketballMenu(menuPage == PG_BASKETBALL, basketballSel);
@@ -1773,6 +1818,14 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             menuPage == PG_GRAPHICS_DISTANCES, gfxDistanceSel);
     }
     const bool anyMenu = (menuPage != PG_NONE);
+    // Publish "any VR menu page open" so gameplay actions (e.g. jetpack B-drop)
+    // can suppress their button while the player is navigating any menu page,
+    // not only the cheat page (g_menuVisible).
+    xr::SetAnyMenuOpen(anyMenu);
+    // Arm the jetpack B-drop lockout HERE (this menu loop runs every frame, even
+    // while game input is blocked and WritePad is skipped). This is what finally
+    // stops closing a menu with B from also dropping the belt.
+    savr::jetpack::NoteMenuInput(anyMenu, in.b);
 
     // The Android port can leave its global pause state latched after the shell
     // loses focus (Meta menu), and the same stale state has been observed at the
@@ -1832,6 +1885,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         savr::physicalweapon::AutoAssignGadgetPoint();
         savr::cheats::Tick();
         savr::pickups::Tick();
+        savr::animtex::Tick();
         savr::basketball::Update();
     }
     else {
@@ -2450,6 +2504,9 @@ void* WaitForGameLibrary(void*) {
     vrfire::Install();
     throwable::Install();
     savr::pickups::Install(handle);  // physical world-pickup rise/grab
+    savr::animtex::Install(handle);  // re-enable frozen UV-scrolling textures
+    savr::jetpack::Init(handle);     // immersive rocket-belt control
+    savr::hydraulics::Install(handle);  // lowrider hydraulics on the right stick
     savr::braindiag::Install(handle);  // basketball brain-chain diagnostics
     savr::basketball::Install(handle);  // custom immersive basketball
     savr::mapzoom::Install(handle);  // pause-map zoom on the grips

@@ -52,6 +52,7 @@ add_library(savr SHARED
     src/main.cpp
     src/AircraftHlod.cpp
     src/AircraftHlodData.S
+    src/AnimatedTextures.cpp
     src/Appearance.cpp
     src/Symbols.cpp
     src/SetupMapDrawDistanceBridge.S
@@ -61,6 +62,8 @@ add_library(savr SHARED
     src/Xr.cpp
     src/Cheats.cpp
     src/HudSettings.cpp
+    src/Hydraulics.cpp
+    src/Jetpack.cpp
     src/Locomotion.cpp
     src/Driving.cpp
     src/GestureMove.cpp

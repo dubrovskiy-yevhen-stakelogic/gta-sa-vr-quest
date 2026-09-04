@@ -34,11 +34,21 @@ const PointMetadata* Metadata(int point);
 const char* PointName(int point);
 bool IsPointFixed(int point);
 
-// Per-socket visibility/interaction switch. Hidden sockets render no weapon,
-// publish no marker and cannot grab invisibly; their slot assignment is kept.
-bool PointVisible(int point);
-void SetPointVisible(int point, bool visible);
-void TogglePointVisible(int point);
+// Per-socket visibility/interaction switch with three states (cycled from the
+// holster menu). SHOWN renders the marker + on-body weapon model and can be
+// grabbed; HIDDEN renders neither but can STILL be grabbed (for players who
+// know their layout); OFF renders neither and cannot be grabbed at all. The
+// slot assignment is preserved across all three.
+enum PointVisibility : int {
+    POINT_SHOWN  = 0,
+    POINT_HIDDEN = 1,
+    POINT_OFF    = 2,
+};
+int  PointVisibilityState(int point);
+bool PointVisible(int point);          // == SHOWN (marker + on-body model)
+bool PointGrabbable(int point);        // != OFF
+const char* PointVisibilityName(int point);   // "SHOW" / "HIDE" / "OFF"
+void CyclePointVisibility(int point, int dir);
 
 // Configured SA eWeaponSlot for a body point. -1 means EMPTY. The centre chest
 // point is always slot 8 (THROWABLE), even if an old/malformed file says

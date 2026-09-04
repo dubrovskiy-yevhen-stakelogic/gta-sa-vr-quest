@@ -133,6 +133,8 @@ bool ResolveGameSymbols(void* handle) {
         {"_Z29GetAnimHierarchyFromSkinClumpP7RpClump",                          reinterpret_cast<void**>(&g.GetAnimHierarchyFromSkinClump),         false},
         {"_Z17RpHAnimIDGetIndexP16RpHAnimHierarchyi",                           reinterpret_cast<void**>(&g.RpHAnimIDGetIndex),                     false},
         {"_Z30RpHAnimHierarchyGetMatrixArrayP16RpHAnimHierarchy",               reinterpret_cast<void**>(&g.RpHAnimHierarchyGetMatrixArray),        false},
+        {"_Z17RwMatrixTranslateP11RwMatrixTagPK5RwV3d15RwOpCombineType",         reinterpret_cast<void**>(&g.RwMatrixTranslate),                     false},
+        {"_Z14RwMatrixRotateP11RwMatrixTagPK5RwV3df15RwOpCombineType",           reinterpret_cast<void**>(&g.RwMatrixRotate),                        false},
         {"_ZN15CTouchInterface10m_pWidgetsE",                                   reinterpret_cast<void**>(&g.CTouchInterface_m_pWidgets),            false},
         {"_ZTV17CWidgetPlayerInfo",                                             reinterpret_cast<void**>(&g.CWidgetPlayerInfo_vtable),              false},
         {"_ZN17CWidgetPlayerInfo4DrawEv",                                       reinterpret_cast<void**>(&g.CWidgetPlayerInfo_Draw),                false},

@@ -131,7 +131,7 @@ function Invoke-DownloadWithProgress {
     $handler.AllowAutoRedirect = $true
     $client = [System.Net.Http.HttpClient]::new($handler)
     $client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
-    $client.DefaultRequestHeaders.UserAgent.ParseAdd('GTASAVR-SourceKit/0.1.3')
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('GTASAVR-SourceKit/0.2.0')
 
     $response = $null
     $source = $null

@@ -1,6 +1,6 @@
 # GTA San Andreas VR for Quest — Source Kit
 
-Version `0.1.3 alpha`. See the [changelog](CHANGELOG.md).
+Version `0.2.0 alpha`. See the [changelog](CHANGELOG.md).
 
 This repository contains the source code and build/install tools for the GTA
 San Andreas VR Quest mod. It does **not** contain GTA San Andreas, Rockstar
@@ -206,7 +206,7 @@ word `RESET`. It then stops GTA SA, removes only the nine exact VR settings
 files listed in [BUILDING.md](BUILDING.md), and verifies the result. Saves,
 `audio`, `vrhands`, game data, APKs, and performance CSV files remain intact.
 The game is not launched; new compiled defaults take effect after the next
-manual start. Version 0.1.3 embeds the author's release-Quest menu,
+manual start. Version 0.2.0 embeds the author's release-Quest menu,
 weapon, HUD, holster, and vehicle calibration as its defaults. The sole quality
 override is the eye-buffer resolution, which resets to `100%`.
 

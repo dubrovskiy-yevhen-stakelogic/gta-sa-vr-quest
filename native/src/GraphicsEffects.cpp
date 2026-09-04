@@ -2494,6 +2494,13 @@ void* OnCreateFxSystem(void* manager, char* name, void* position,
                        void* parentMatrix, std::uint8_t ignoreBoundingChecks) {
     if (!g_origCreateFxSystem) return nullptr;
 
+    // The held molotov's lit-rag flame ("molotov_flame") is spawned on the
+    // player's R_HAND bone (CPed::AddWeaponModel). In first person CJ's body is
+    // hidden but this world FX is not, so it floats in front of the player.
+    // Suppress it — purely cosmetic; the THROWN molotov's impact fire is a
+    // separate system and is untouched.
+    if (name && std::strcmp(name, "molotov_flame") == 0) return nullptr;
+
     // The ground fire producer is independent from CWeapon::m_FxSystem.  A flat
     // retail frustum can therefore reject the muzzle blueprint while creeping
     // fire still appears at the correctly routed impact point.  Preserve the

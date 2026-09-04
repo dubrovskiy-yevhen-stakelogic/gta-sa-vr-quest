@@ -503,7 +503,26 @@ void ChooseFiringHandLocked(void* ped) {
         gPreferredHand = selected;
 
     const int firing = AnyHeldHandLocked();
-    if (firing >= 0) SelectCurrentSlot(ped, gHeldSlot[firing]);
+    // Edge-triggered: only force fists on the frame a weapon LEAVES the hands.
+    // Doing it every frame continuously overrode the engine's own selection on
+    // foot (scripted mission weapons, and the parachute the canopy-deploy path
+    // needs selected during a skydive).
+    static bool sHadHeld = false;
+    if (firing >= 0) {
+        sHadHeld = true;
+        SelectCurrentSlot(ped, gHeldSlot[firing]);
+    } else if (sHadHeld && g.CPed_SetCurrentWeaponSlot != nullptr &&
+               CurrentWeaponSlot(ped) != 0) {
+        sHadHeld = false;
+        // Nothing is in either hand: fall back to fists. Weapons in this port
+        // are only ever equipped by a physical grab, so a put-away or a thrown
+        // molotov/grenade must return CJ to unarmed instead of leaving the
+        // stale weapon "stuck" in hand (Vice City parity). SelectCurrentSlot
+        // rejects slot 0 (ValidSlot is 1..12), so poke the game directly.
+        g.CPed_SetCurrentWeaponSlot(ped, 0);
+    } else if (firing < 0) {
+        sHadHeld = false;
+    }
 }
 
 // One-handed guns a seated driver can realistically draw and aim — the Vice
@@ -538,7 +557,8 @@ int ClosestAvailableHolsterSlotLocked(
     const std::uint32_t occupied = OccupiedSlotMaskLocked();
     for (int point = 0; point < holster::PointCount(); ++point) {
         const int slot = holster::PointSlot(point);
-        if (!anchorValid[point] || !OwnedConfiguredSlot(ped, slot) ||
+        if (!anchorValid[point] || !holster::PointGrabbable(point) ||
+            !OwnedConfiguredSlot(ped, slot) ||
             (occupied & (1u << slot)) != 0)
             continue;
         if (inVehicle &&

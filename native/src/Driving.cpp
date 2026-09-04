@@ -2,6 +2,7 @@
 
 #include "Locomotion.h"
 
+#include "Hydraulics.h"
 #include "Log.h"
 #include "PhysicalWeapon.h"
 #include "Symbols.h"
@@ -344,8 +345,16 @@ int ClampControlValue(int field, int value) {
 
 void Save() {
     std::lock_guard<std::mutex> lock(g_saveMutex);
-    FILE* file = std::fopen(kPath, "w");
-    if (!file) { LOGW("[driving] could not save %s", kPath); return; }
+    // Write to a temp file and rename over the target instead of reopening the
+    // target with "w". A settings file deployed with `adb push` is owned by
+    // `shell` and mode 0644, so the app CANNOT reopen it for writing and every
+    // change was silently lost on restart ("the setting doesn't stick"). The
+    // app DOES own the directory, so rename() succeeds and also replaces the
+    // foreign file with an app-owned one, fixing it permanently from then on.
+    char tmpPath[256];
+    std::snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", kPath);
+    FILE* file = std::fopen(tmpPath, "w");
+    if (!file) { LOGW("[driving] could not save %s", tmpPath); return; }
     std::fprintf(file, "DrivingConfigVersion=%d\n", kDrivingConfigVersion);
     // Keep DrivingMode for backward compatibility with 0.7/0.8.0, while the
     // two authoritative values match current Quest Vice City.
@@ -451,7 +460,25 @@ void Save() {
                              model, field, calibration.wheel[field]);
         }
     }
+    const bool wrote = std::fflush(file) == 0;
     std::fclose(file);
+    if (!wrote) {
+        LOGW("[driving] write failed, keeping previous %s", kPath);
+        std::remove(tmpPath);
+        return;
+    }
+    if (std::rename(tmpPath, kPath) != 0) {
+        // Extremely defensive: if rename is refused, drop the old entry first
+        // (the directory is ours) and retry once before giving up.
+        std::remove(kPath);
+        if (std::rename(tmpPath, kPath) != 0) {
+            LOGW("[driving] could not replace %s - settings will not persist",
+                 kPath);
+            std::remove(tmpPath);
+            return;
+        }
+    }
+    LOGI("[driving] settings saved");
 }
 
 void Load() {
@@ -2133,6 +2160,12 @@ bool AircraftRightStickActive() {
 
 int OnGetCarGunUpDown(void* pad, int ignoreDucking, void* vehicle,
                       float range, int useSecondary) {
+    // Lowrider hydraulics: both grips held in a hydraulics-equipped car turn the
+    // right stick into the suspension control. CAutomobile::HydraulicControl
+    // reads exactly this accessor, so answering here bypasses the touch/input
+    // -type gate entirely. Ground-only, so it can never fight the aircraft case.
+    if (savr::hydraulics::IsActive())
+        return savr::hydraulics::AxisUpDown();
     if (AircraftRightStickActive()) {
         xr::InputState input{}; xr::GetInput(input);
         float moveX=0.0f,moveY=0.0f,turnX=0.0f,turnY=0.0f;
@@ -2148,6 +2181,8 @@ int OnGetCarGunUpDown(void* pad, int ignoreDucking, void* vehicle,
 }
 
 int OnGetCarGunLeftRight(void* pad, int ignoreDucking, int useSecondary) {
+    if (savr::hydraulics::IsActive())
+        return savr::hydraulics::AxisLeftRight();
     if (AircraftRightStickActive()) {
         xr::InputState input{}; xr::GetInput(input);
         float moveX=0.0f,moveY=0.0f,turnX=0.0f,turnY=0.0f;

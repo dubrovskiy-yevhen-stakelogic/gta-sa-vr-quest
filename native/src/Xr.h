@@ -276,9 +276,37 @@ void SetFrameMs(double ms);
 // category's items. count includes the explicit BACK row.
 void SetMenuState(bool visible, int selection, int count, int category);
 
+// Publish whether ANY VR menu page is open (menuPage != PG_NONE), each frame
+// from the menu update. IsMenuVisible() reads this.
+void SetAnyMenuOpen(bool open);
+
+// True while ANY VR menu page is open. Other subsystems query this to keep
+// button presses used for menu navigation (e.g. B) from also firing gameplay
+// actions such as dropping the jetpack.
+bool IsMenuVisible();
+
 // VR holster marker anchors (XR world space), published by the GameThread; the
 // present thread draws a small cube at each. Up to 8.
 void SetHolsterMarkers(const float positions[][3], int count);
+
+// Rhythm-minigame direction prompt (lowrider dance). dir: 0 none, 1 UP, 2 DOWN,
+// 3 LEFT, 4 RIGHT; msUntil counts down to the beat. Drawn head-locked because
+// the stock SCM arrow sprites never reach the VR eyes.
+void SetBeatArrow(int dir, int msUntil);
+
+// Immersive jetpack REALISTIC mode: when on, the present thread draws a jet
+// flame from each controller's nozzle (scaled by that hand's trigger). Publish
+// each frame from the GameThread; false hides both flames.
+void SetJetpackThrusterMode(bool on);
+
+// IronMan jetpack sub-mode: when on, the present thread draws Iron Man repulsor
+// gauntlets in place of the procedural turbines (both still emit palm flame).
+void SetJetpackGloveMode(bool on);
+
+// Bitmask (bit h) of hands currently holding a weapon while the jetpack is worn;
+// the present thread skips the turbine/flame on those hands so the drawn weapon
+// shows instead. Lets the player fly one-handed and shoot with the other.
+void SetJetpackWeaponHandMask(unsigned int mask);
 
 // Parachute brake toggles (canopy open): two handles and their upper riser
 // anchors in LOCAL tracking space. visible=false hides the complete assembly.
@@ -363,6 +391,7 @@ void SetHolsterCalibMenu(bool active, int selection);
 void SetDrivingMenu(bool active, int selection, int vehicleType);
 void SetDrivingCalibrationMenu(bool active, int selection, int hand);
 void SetLocomotionMenu(bool active, int selection);
+void SetJetpackMenu(bool active, int selection);
 void SetVehicleCameraMenu(bool active, int selection);
 void SetBasketballMenu(bool active, int selection);
 void SetBasketballCalibMenu(bool active, int selection);

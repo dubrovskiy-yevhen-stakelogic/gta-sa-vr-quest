@@ -152,6 +152,12 @@ struct GameSymbols {
     void* (*GetAnimHierarchyFromSkinClump)(void* clump);
     int   (*RpHAnimIDGetIndex)(void* hierarchy, int boneId);
     void* (*RpHAnimHierarchyGetMatrixArray)(void* hierarchy);
+    // RenderWare matrix ops (combine: 0=replace,1=preconcat,2=postconcat).
+    // Used to place the jetpack clump at the ped's arm bone exactly like the
+    // game's CTaskSimpleJetPack::RenderJetPack.
+    void* (*RwMatrixTranslate)(void* matrix, const void* offset, int combine);
+    void* (*RwMatrixRotate)(void* matrix, const void* axis, float degrees,
+                            int combine);
     // Android SA draws player status through a mobile widget rather than the
     // desktop CHud path. CLASSIC renders only this widget, never touch buttons.
     void** CTouchInterface_m_pWidgets;

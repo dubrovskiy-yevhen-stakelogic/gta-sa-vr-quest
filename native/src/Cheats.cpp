@@ -25,7 +25,8 @@ namespace {
 enum class Kind : unsigned char { Plain, Vehicle, GodMode, UnlockCities, Reset,
                                   MissionSkip, TutorialSkip, MissionSelect,
                                   MissionLaunch, Respect, NeverTired,
-                                  Teleport, Basketball };
+                                  Teleport, Basketball, SpawnByButton,
+                                  InstallHydraulics };
 
 struct Entry {
     const char* label;
@@ -154,10 +155,18 @@ Entry g_cheats[] = {
     // front of the player — grab with a hand, throw with the hand's motion,
     // dribble off the ground. No story script involved.
     {"SPAWN BASKETBALL",       "_ZN7CObject6CreateEib",                -1, Kind::Basketball, nullptr},
-
+    {"INSTALL HYDRAULICS",     "_ZN8CVehicle17AddVehicleUpgradeEi",    -1, Kind::InstallHydraulics, nullptr},
+#ifdef SAVR_DEV
+    // Hidden developer toggle (never compiled into player builds). While ON,
+    // the grips+A chord cycle-spawns vehicle model 400..611 for calibration.
+    {"SPAWN VEHICLE BY BUTTON","",                                      -1, Kind::SpawnByButton, nullptr},
+#endif
 };
 
 std::atomic<bool> g_godMode{false};
+// Dev-only: while ON, the grips+A chord cycle-spawns vehicles (see
+// ProcessDevVehicleRequest). Its menu row is compiled out of player builds.
+std::atomic<bool> g_spawnByButton{false};
 bool* g_nativeInvincible = nullptr;
 bool* g_playerIsOffTheMap = nullptr;
 float (*g_getStatValue)(unsigned short) = nullptr;
@@ -366,11 +375,40 @@ void* VehicleCheatFunction() {
     return nullptr;
 }
 
+// Dev-only grips+A vehicle cycler. RequestNextVehicle bumps this counter from
+// the XR thread; ProcessDevVehicleRequest consumes it on the GameThread (in
+// Tick), where the engine's own CCheat::VehicleCheat can safely stream a fresh
+// model. Steps 400..611 with wraparound so every drivable is checkable in
+// sequence. Dormant in player builds (nothing ever bumps the counter and the
+// toggle stays false).
+std::atomic<unsigned int> g_nextVehicleReq{0};
+unsigned int g_nextVehicleSeen = 0;
+constexpr int kDevVehicleFirst = 400;
+constexpr int kDevVehicleLast  = 611;
+int g_devVehicleModel = kDevVehicleFirst - 1;
+
+void ProcessDevVehicleRequest() {
+    const unsigned int req = g_nextVehicleReq.load(std::memory_order_acquire);
+    if (req == g_nextVehicleSeen) return;
+    g_nextVehicleSeen = req;
+    if (!g_spawnByButton.load(std::memory_order_acquire)) return;
+    if (g.FindPlayerPed == nullptr || g.FindPlayerPed(-1) == nullptr) return;
+    void* const fn = VehicleCheatFunction();
+    if (fn == nullptr) return;
+    g_devVehicleModel = (g_devVehicleModel >= kDevVehicleLast)
+                        ? kDevVehicleFirst : g_devVehicleModel + 1;
+    LOGI("[cheat.dev] spawn vehicle model %d", g_devVehicleModel);
+    reinterpret_cast<void (*)(int)>(fn)(g_devVehicleModel);
+}
+
 int CategoryForIndex(int index) {
     if (index < 0 || index >= static_cast<int>(std::size(g_cheats)))
         return CATEGORY_GENERAL;
-    if (g_cheats[index].kind == Kind::Vehicle || index == 25 ||
-        (index >= 61 && index <= 67))
+    // Categorise by KIND where possible: index ranges below are positional and
+    // must not be relied on for entries appended at the end of the table.
+    if (g_cheats[index].kind == Kind::Vehicle ||
+        g_cheats[index].kind == Kind::InstallHydraulics ||
+        index == 25 || (index >= 61 && index <= 67))
         return CATEGORY_VEHICLES;
     if (index >= 20 && index <= 24)
         return CATEGORY_WEAPONS;
@@ -437,6 +475,7 @@ void Init(void* handle) {
 }
 
 void Tick() {
+    ProcessDevVehicleRequest();
     const std::uintptr_t probe =
         g_missionLaunchProbe.load(std::memory_order_acquire);
     if (probe != 0) {
@@ -506,27 +545,43 @@ const char* Name(int index) {
         }
         return label[pageRow ? 0 : 1];
     }
+    if (g_cheats[index].kind == Kind::SpawnByButton)
+        return g_spawnByButton.load(std::memory_order_acquire)
+            ? "SPAWN VEHICLE BY BUTTON   ON"
+            : "SPAWN VEHICLE BY BUTTON   OFF";
     if (g_cheats[index].kind != Kind::GodMode) return g_cheats[index].label;
     return g_godMode.load(std::memory_order_acquire) ? "GOD MODE   ON" : "GOD MODE   OFF";
 }
 
 bool Available(int index) {
     if (index >= 0 && index < Count() &&
-        g_cheats[index].kind == Kind::MissionSelect)
+        (g_cheats[index].kind == Kind::MissionSelect ||
+         g_cheats[index].kind == Kind::SpawnByButton))
         return true;
     return index >= 0 && index < Count() && g_cheats[index].fn != nullptr;
 }
 
 bool ToggleState(int index, bool* enabled) {
-    if (enabled == nullptr || index < 0 || index >= Count() ||
-        g_cheats[index].kind != Kind::GodMode)
-        return false;
-    *enabled = g_godMode.load(std::memory_order_acquire);
-    return true;
+    if (enabled == nullptr || index < 0 || index >= Count()) return false;
+    if (g_cheats[index].kind == Kind::GodMode) {
+        *enabled = g_godMode.load(std::memory_order_acquire);
+        return true;
+    }
+    if (g_cheats[index].kind == Kind::SpawnByButton) {
+        *enabled = g_spawnByButton.load(std::memory_order_acquire);
+        return true;
+    }
+    return false;
 }
 
 void Activate(int index) {
     if (index < 0 || index >= Count()) return;
+    if (g_cheats[index].kind == Kind::SpawnByButton) {
+        const bool on = !g_spawnByButton.load(std::memory_order_relaxed);
+        g_spawnByButton.store(on, std::memory_order_release);
+        LOGI("[cheat.dev] spawn-vehicle-by-button %s", on ? "ON" : "OFF");
+        return;
+    }
     if (g.FindPlayerPed == nullptr || g.FindPlayerPed(-1) == nullptr) {
         LOGW("cheat '%s' ignored (not in gameplay)", g_cheats[index].label);
         return;
@@ -535,6 +590,39 @@ void Activate(int index) {
     if (cheat.kind == Kind::Basketball) {
         savr::basketball::SpawnBall();
         LOGI("cheat: basketball spawn requested");
+        return;
+    }
+    if (cheat.kind == Kind::InstallHydraulics) {
+        // Fit the hydraulics upgrade to the car the player is sitting in, the
+        // same way a mod garage does: CVehicle::AddVehicleUpgrade(1087). Doing
+        // it through the game's own upgrade path is what allocates the special
+        // collision model and hydraulic data that CAutomobile::HydraulicControl
+        // requires - just flipping the handling flag would not, and the control
+        // would still bail before it ever reads the stick.
+        if (cheat.fn == nullptr) {
+            LOGW("cheat: AddVehicleUpgrade unavailable");
+            return;
+        }
+        void* vehicle = g.FindPlayerVehicle ? g.FindPlayerVehicle(-1, false)
+                                            : nullptr;
+        if (vehicle == nullptr) {
+            LOGW("cheat: INSTALL HYDRAULICS needs you to be IN a car");
+            return;
+        }
+        // Bikes/boats/planes have no hydraulics; refuse instead of corrupting
+        // an upgrade slot on a vehicle that cannot use it.
+        const std::uint32_t flags = *reinterpret_cast<const std::uint32_t*>(
+            static_cast<const std::uint8_t*>(vehicle) + 0x4b8);
+        if ((flags & (1u << 18)) != 0) {   // HydraulicNone
+            LOGW("cheat: this vehicle cannot take hydraulics");
+            return;
+        }
+        using AddUpgradeFn = void (*)(void*, int);
+        reinterpret_cast<AddUpgradeFn>(cheat.fn)(vehicle, 1087);  // MODEL_HYDRALICS
+        const std::uint32_t after = *reinterpret_cast<const std::uint32_t*>(
+            static_cast<const std::uint8_t*>(vehicle) + 0x4b8);
+        LOGI("cheat: hydraulics fitted (handling 0x%08x -> 0x%08x, inst=%d)",
+             flags, after, (after & (1u << 17)) ? 1 : 0);
         return;
     }
     if (cheat.kind == Kind::Teleport) {
@@ -976,6 +1064,14 @@ bool CycleCategoryItem(int category,int item,int direction) {
         return true;
     }
     return false;
+}
+
+void RequestNextVehicle() {
+    g_nextVehicleReq.fetch_add(1, std::memory_order_release);
+}
+
+bool SpawnByButtonEnabled() {
+    return g_spawnByButton.load(std::memory_order_acquire);
 }
 
 }  // namespace savr::cheats

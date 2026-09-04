@@ -40,6 +40,14 @@ bool ToggleState(int index, bool* enabled);
 // Activate the cheat at `index`. No-op unless in gameplay (a player ped exists).
 void Activate(int index);
 
+// Dev-only vehicle-spawn-by-button (calibration aid). The hidden cheat row
+// "SPAWN VEHICLE BY BUTTON" flips SpawnByButtonEnabled(); while it is on, the
+// grips+A chord calls RequestNextVehicle() to cycle model 400..611 on the
+// GameThread. Both are inert in player builds (the row is not compiled and the
+// chord never calls them).
+void RequestNextVehicle();
+bool SpawnByButtonEnabled();
+
 // Sorted VR presentation. The original flat indices stay internal so every
 // entry still invokes the same audited Rockstar handler.
 const char* CategoryName(int category);

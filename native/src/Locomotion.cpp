@@ -47,13 +47,13 @@ std::atomic<bool> g_flightCameraTilt{false};
 // comfort default.
 // 0 = CINEMA (theater), 1 = CINEMATIC (head-tracked director camera),
 // 2 = FIRST PERSON (anchored on cutscene-CJ's head bone).
-std::atomic<int> g_cutsceneMode{0};
+std::atomic<int> g_cutsceneMode{1};   // CINEMATIC (head-tracked 3D camera)
 // GAMEPLAY cutscenes: scripted mission cameras that run mid-gameplay
 // (player controls disabled + widescreen borders, CCutsceneMgr NOT running).
 // Separate knob from story cutscenes because players commonly want
 // cinematic story scenes but first-person in-mission shots. Default is
 // FIRST PERSON: stay in CJ's head instead of dropping to the theater.
-std::atomic<int> g_gameCutsceneMode{2};
+std::atomic<int> g_gameCutsceneMode{1};   // CINEMATIC, same as story scenes
 std::atomic<bool> g_welcomeSeen{false};
 std::map<std::string, int> g_cutsceneCameras;
 // Gameplay bindings. L3/R3 are included but raw stick-click chords used by
@@ -110,8 +110,8 @@ void Load() {
     int movement=MOVEMENT_HEAD,turn=TURN_SMOOTH,sensitivity=100,snap=30,bob=0;
     int chuteFollow=1,autoChute=0,chuteImmersive=0,flightTilt=0;
     int gestureRun=1,gestureSwim=1;
-    int cutsceneMode=0;
-    int gameCutsceneMode=2;
+    int cutsceneMode=1;   // CINEMATIC
+    int gameCutsceneMode=1;   // CINEMATIC
     int welcomeSeen=0;
     int bind[BIND_SRC_COUNT]={kBindingDefault[0],kBindingDefault[1],
                               kBindingDefault[2],kBindingDefault[3],
@@ -387,7 +387,7 @@ void CycleCutsceneMode(int direction) {
 const char* CutsceneModeName() {
     switch (CutsceneMode()) {
         case 1:  return "CINEMATIC";
-        case 2:  return "FIRST PERSON";
+        case 2:  return "FIRST PERSON + R3";
         default: return "CINEMA";
     }
 }
@@ -400,7 +400,7 @@ void CycleGameCutsceneMode(int direction) {
 const char* GameCutsceneModeName() {
     switch (GameCutsceneMode()) {
         case 1:  return "CINEMATIC";
-        case 2:  return "FIRST PERSON";
+        case 2:  return "FIRST PERSON + R3";
         default: return "CINEMA";
     }
 }

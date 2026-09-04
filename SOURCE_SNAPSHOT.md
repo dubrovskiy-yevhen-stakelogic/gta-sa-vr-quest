@@ -51,7 +51,7 @@ hand calibration use the author's tested values.
 This kit was prepared from the active GTA San Andreas VR Quest source tree on
 2026-08-25.
 
-- Mod version: `0.1.3 alpha`
+- Mod version: `0.2.0 alpha`
 - Active snapshot boundary: native build completed at `2026-08-25 23:39:12`
   (Europe/Kiev)
 - Canonical author-source set before public-kit adaptations: 51 files
@@ -67,7 +67,7 @@ under `native/src`, the Java loader, and `tools/build.ps1`. It records the
 private active-tree provenance before the public adaptations below; the release
 audit treats it as documentation rather than a hash of the adapted kit.
 
-The public-kit adaptation publishes version `0.1.3 alpha`, hardens the build
+The public-kit adaptation publishes version `0.2.0 alpha`, hardens the build
 scripts and `native/CMakeLists.txt`, sanitizes internal-only wording, and adds
 reset/support tooling. No compiled OpenXR loader, APK, extracted game binary,
 audio, signing key, or local absolute toolchain path is required in the

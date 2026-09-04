@@ -4,10 +4,12 @@
 #include "Basketball.h"
 #include "Calib.h"
 #include "BuildStamp.h"
+#include "AnimatedTextures.h"
 #include "Cheats.h"
 #include "Driving.h"
 #include "FrameTarget.h"
 #include "HdWeapons.h"
+#include "Jetpack.h"
 #include "Holster.h"
 #include "HudSettings.h"
 #include "Locomotion.h"
@@ -63,11 +65,11 @@
 namespace savr::xr {
 namespace {
 
-constexpr char kModVersion[] = "0.1.3.0";  // internal build id (4th digit)
+constexpr char kModVersion[] = "0.2.0.0";  // internal build id (4th digit)
 #ifdef SAVR_DEV
-constexpr const char* kModVersionShown = "0.1.3";
+constexpr const char* kModVersionShown = "0.2.0";
 #else
-constexpr const char* kModVersionShown = "0.1.3";
+constexpr const char* kModVersionShown = "0.2.0";
 #endif
 
 JavaVM*   g_hudTextVm{};
@@ -537,7 +539,8 @@ std::atomic<uint32_t> g_gameFrames{0};
 std::atomic<int>      g_fpsValue{0};
 std::atomic<int>      g_profRecMs{0}, g_profScene{0}, g_profSky{0}, g_profEnd{0}, g_profEnt{0}, g_profDynamic{0};
 std::atomic<int>      g_profFrameMs{0};          // whole game-frame work (ms)
-std::atomic<bool>     g_menuVisible{false};      // cheat menu shown
+std::atomic<bool>     g_menuVisible{false};      // cheat page shown (compositor draw)
+std::atomic<bool>     g_anyMenuOpen{false};      // ANY VR menu page open (menuPage!=PG_NONE)
 std::atomic<int>      g_menuSelection{0}, g_menuCount{0};
 std::atomic<int>      g_menuCategory{-1};
 std::atomic<bool>     g_calibActive{false};      // calibration page shown
@@ -558,6 +561,10 @@ std::atomic<int>      g_drivingCalibSel{0};
 std::atomic<int>      g_drivingCalibHand{0};
 std::atomic<bool>     g_locomotionActive{false}; // movement/turning submenu
 std::atomic<int>      g_locomotionSel{0};
+std::atomic<int>      g_beatDir{0};              // rhythm prompt: 0/1U/2D/3L/4R
+std::atomic<int>      g_beatMs{0};
+std::atomic<bool>     g_jetpackMenuActive{false}; // jetpack settings submenu
+std::atomic<int>      g_jetpackSel{0};
 std::atomic<bool>     g_basketballActive{false};
 std::atomic<int>      g_basketballSel{0};
 std::atomic<bool>     g_basketballCalibActive{false};
@@ -5158,6 +5165,15 @@ void SetMenuState(bool visible, int selection, int count, int category) {
     g_menuCategory.store(category, std::memory_order_relaxed);
 }
 
+void SetAnyMenuOpen(bool open) {
+    g_anyMenuOpen.store(open, std::memory_order_relaxed);
+}
+
+// "Menu open" for gameplay-gating purposes means ANY VR menu page is up, not
+// just the cheat page (g_menuVisible). The jetpack B-drop is gated on this so B
+// used to navigate/close any page never also strips the belt.
+bool IsMenuVisible() { return g_anyMenuOpen.load(std::memory_order_relaxed); }
+
 void SetPerfLevels(int cpuIdx, int gpuIdx) {
     g_cpuPerfIdx.store(cpuIdx < 0 ? 0 : (cpuIdx > 3 ? 3 : cpuIdx), std::memory_order_relaxed);
     g_gpuPerfIdx.store(gpuIdx < 0 ? 0 : (gpuIdx > 3 ? 3 : gpuIdx), std::memory_order_relaxed);
@@ -5267,6 +5283,16 @@ void SetDrivingCalibrationMenu(bool active, int selection, int hand) {
 void SetLocomotionMenu(bool active, int selection) {
     g_locomotionActive.store(active,std::memory_order_relaxed);
     g_locomotionSel.store(selection,std::memory_order_relaxed);
+}
+
+void SetBeatArrow(int dir, int msUntil) {
+    g_beatDir.store(dir, std::memory_order_relaxed);
+    g_beatMs.store(msUntil, std::memory_order_relaxed);
+}
+
+void SetJetpackMenu(bool active, int selection) {
+    g_jetpackMenuActive.store(active,std::memory_order_relaxed);
+    g_jetpackSel.store(selection,std::memory_order_relaxed);
 }
 
 void SetVehicleCameraMenu(bool active, int selection) {
@@ -6959,7 +6985,13 @@ void BuildControlsTipsMenu() {
         "HORN: PRESS PALM ON THE WHEEL HUB",
         "ANSWER PHONE: BOTH GRIPS + R2",
         "CUTSCENE: R3 CAMERA / L3 REMEMBER",
-        "L3+R3 RECENTER   GRIPS+R3 CAMERA VIEW",
+        "L3+R3 RECENTER",
+        "GRIPS+R3 IN A CAR: FIRST / THIRD PERSON",
+        "  (VICE CITY STYLE VIEW TOGGLE)",
+        "LOWRIDER HYDRAULICS: BOTH GRIPS +",
+        "  RIGHT STICK (NEEDS HYDRAULICS FITTED -",
+        "  CHEATS > VEHICLES > INSTALL HYDRAULICS)",
+        "CUTSCENE STYLE: GRAPHICS MENU",
     };
     const int count = static_cast<int>(sizeof(kTips) / sizeof(kTips[0]));
     const int top = 44, rowH = 21;
@@ -7128,7 +7160,7 @@ void BuildHolsterMenu() {
             const int slot = holster::PointSlot(i);
             std::snprintf(row, sizeof(row), "%s   < %s >  [%s]%s",
                           holster::PointName(i), holster::SlotName(slot),
-                          holster::PointVisible(i) ? "SHOW" : "HIDE",
+                          holster::PointVisibilityName(i),
                           holster::IsPointFixed(i) ? "  [FIXED]" : "");
         }
         PanelText(row, cx, y, 2, c, c, (i == sel) ? 120 : c);
@@ -7173,7 +7205,7 @@ void BuildGraphicsMenu() {
         activeHeight =
             (static_cast<int>(baseHeight * renderScalePercent / 100.0f + 0.5f)) & ~1;
     }
-    char rows[11][64];
+    char rows[14][64];
     if (renderScalePending) {
         std::snprintf(rows[0], sizeof(rows[0]),
                       "RESOLUTION  < %d%% >  [APPLYING]",
@@ -7194,24 +7226,31 @@ void BuildGraphicsMenu() {
                   vrcam::AreNeonSignsEnabled() ? "ON" : "OFF");
     std::snprintf(rows[5], sizeof(rows[5]), "COLOR GRADING  < %s >",
                   vrcam::IsColorGradingEnabled() ? "ON" : "OFF");
-    std::snprintf(rows[6], sizeof(rows[6]), "DYNAMIC SHADOWS  < %s >",
+    std::snprintf(rows[6], sizeof(rows[6]), "ANIMATED TEXTURES  < %s >",
+                  savr::animtex::IsEnabled() ? "ON" : "OFF");
+    std::snprintf(rows[7], sizeof(rows[7]), "DYNAMIC SHADOWS  < %s >",
                   vrcam::GetDynamicShadowModeName());
     if (!hdweapons::Available()) {
-        std::snprintf(rows[7], sizeof(rows[7]),
+        std::snprintf(rows[8], sizeof(rows[8]),
                       "WEAPON MODELS  < NO FILES >");
     } else {
         const bool hd = vrcam::IsHdWeaponsEnabled();
-        std::snprintf(rows[7], sizeof(rows[7]), "WEAPON MODELS  < %s >%s",
+        std::snprintf(rows[8], sizeof(rows[8]), "WEAPON MODELS  < %s >%s",
                       hd ? "HD" : "ORIGINAL",
                       hd != hdweapons::Applied() ? "  [RESTART]" : "");
     }
-    std::snprintf(rows[8], sizeof(rows[8]), "DRAW DISTANCES");
-    std::snprintf(rows[9], sizeof(rows[9]), "RESET DEFAULTS");
-    std::snprintf(rows[10], sizeof(rows[10]), "BACK");
-    const int top = 62, rowH = 37;
-    for (int i = 0; i < 11; ++i) {
+    std::snprintf(rows[9], sizeof(rows[9]), "CUTSCENES  < %s >",
+                  locomotion::CutsceneModeName());
+    std::snprintf(rows[10], sizeof(rows[10]), "GAME CUTSCENES  < %s >",
+                  locomotion::GameCutsceneModeName());
+    std::snprintf(rows[11], sizeof(rows[11]), "DRAW DISTANCES");
+    std::snprintf(rows[12], sizeof(rows[12]), "RESET DEFAULTS");
+    std::snprintf(rows[13], sizeof(rows[13]), "BACK");
+    // 14 rows now: tighten the pitch so the last one still clears the hint line.
+    const int top = 54, rowH = 30;
+    for (int i = 0; i < 14; ++i) {
         const int y = top + i * rowH;
-        if (i == sel) PanelFillRect(40, y - 6, kPanelW - 40, y + 30, 120, 40, 110, 235);
+        if (i == sel) PanelFillRect(40, y - 5, kPanelW - 40, y + 25, 120, 40, 110, 235);
         const int c = (i == sel) ? 255 : 200;
         PanelText(rows[i], cx, y, 2, c, c, (i == sel) ? 120 : c);
     }
@@ -7613,7 +7652,7 @@ void BuildLocomotionMenu() {
     const int cx=kPanelW/2;
     PanelText("LOCOMOTION",cx,16,5,100,225,255);
     const int sel=g_locomotionSel.load(std::memory_order_relaxed);
-    char rows[15][72]{};
+    char rows[14][72]{};
     std::snprintf(rows[0],sizeof(rows[0]),"MOVE DIRECTION   < %s >",
                   locomotion::MovementModeName());
     std::snprintf(rows[1],sizeof(rows[1]),"TURNING   < %s >",
@@ -7635,16 +7674,14 @@ void BuildLocomotionMenu() {
     std::snprintf(rows[9],sizeof(rows[9]),"AUTO PARACHUTE   < %s >",
                   locomotion::AutoParachuteEnabled()?"ON":"OFF");
     std::snprintf(rows[10],sizeof(rows[10]),"VEHICLE CAMERA");
-    std::snprintf(rows[11],sizeof(rows[11]),"CUTSCENES   < %s >",
-                  locomotion::CutsceneModeName());
-    std::snprintf(rows[12],sizeof(rows[12]),"GAME CUTSCENES   < %s >",
-                  locomotion::GameCutsceneModeName());
-    std::snprintf(rows[13],sizeof(rows[13]),"RECENTER VIEW");
-    std::snprintf(rows[14],sizeof(rows[14]),"BACK");
-    // 15 rows on the 512px panel: a 30px pitch from y=56 keeps the last row
+    std::snprintf(rows[11],sizeof(rows[11]),"RECENTER VIEW");
+    std::snprintf(rows[12],sizeof(rows[12]),"JETPACK   < %s >",
+                  jetpack::ModeName());
+    std::snprintf(rows[13],sizeof(rows[13]),"BACK");
+    // 16 rows on the 512px panel: a 27px pitch from y=56 keeps the last row
     // and the hint line inside the panel.
-    const int top=56,rowH=30;
-    for (int i=0;i<15;++i) {
+    const int top=56,rowH=27;
+    for (int i=0;i<14;++i) {
         const int y=top+i*rowH;
         if (i==sel) PanelFillRect(26,y-4,kPanelW-26,y+22,120,40,110,235);
         if (i==10) {
@@ -7654,6 +7691,34 @@ void BuildLocomotionMenu() {
             const int c=i==sel?255:200;
             PanelText(rows[i],cx,y,2,c,c,i==sel?120:c);
         }
+    }
+    PanelText("STICK SEL   L2/R2 ADJUST   A ACTION",cx,kPanelH-18,
+              2,150,185,150);
+}
+
+// JETPACK settings: control scheme, the anti-accidental-drop lock, and the
+// turbine (thrust) power for EXPERIMENTAL mode.
+void BuildJetpackMenu() {
+    PanelClear();
+    const int cx=kPanelW/2;
+    PanelText("JETPACK",cx,16,5,100,225,255);
+    PanelText("EXPERIMENTAL = HAND TURBINES   SIMPLE = STICKS",cx,46,2,
+              150,190,210);
+    const int sel=g_jetpackSel.load(std::memory_order_relaxed);
+    char rows[4][72]{};
+    std::snprintf(rows[0],sizeof(rows[0]),"CONTROL   < %s >",
+                  jetpack::ModeName());
+    std::snprintf(rows[1],sizeof(rows[1]),"LOCK IN AIR   < %s >",
+                  jetpack::LockInAir()?"ON":"OFF");
+    std::snprintf(rows[2],sizeof(rows[2]),"TURBINE POWER   < %d%% >",
+                  jetpack::TurbinePowerPercent());
+    std::snprintf(rows[3],sizeof(rows[3]),"BACK");
+    const int top=96,rowH=34;
+    for (int i=0;i<4;++i) {
+        const int y=top+i*rowH;
+        if (i==sel) PanelFillRect(26,y-4,kPanelW-26,y+24,120,40,110,235);
+        const int c=i==sel?255:200;
+        PanelText(rows[i],cx,y,2,c,c,i==sel?120:c);
     }
     PanelText("STICK SEL   L2/R2 ADJUST   A ACTION",cx,kPanelH-18,
               2,150,185,150);
@@ -7961,6 +8026,7 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
     const bool drivingCalibMenu =
         g_drivingCalibActive.load(std::memory_order_relaxed);
     const bool locomotionMenu = g_locomotionActive.load(std::memory_order_relaxed);
+    const bool jetpackMenu = g_jetpackMenuActive.load(std::memory_order_relaxed);
     const bool vehicleCameraMenu =
         g_vehicleCameraActive.load(std::memory_order_relaxed);
     const bool basketballMenu =
@@ -7977,7 +8043,7 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
     const bool aboutMenuA = g_aboutActive.load(std::memory_order_relaxed);
     const bool profilerPanel = !(mainMenu || calibMenu || holsterCalibMenu ||
         holsterMenu || drivingMenu || drivingCalibMenu || locomotionMenu ||
-        vehicleCameraMenu ||
+        jetpackMenu || vehicleCameraMenu ||
         basketballMenu || basketballCalibMenu || hudMenu ||
         graphicsMenu || graphicsDistanceMenu || cheatMenu ||
         controlsMenuA || controlsTipsA || aboutMenuA);
@@ -8011,6 +8077,7 @@ bool PresentDebugPanel(XrCompositionLayerQuad& quad) {
         else if (drivingMenu)       BuildDrivingMenu();
         else if (drivingCalibMenu)  BuildDrivingCalibrationMenu();
         else if (locomotionMenu)    BuildLocomotionMenu();
+        else if (jetpackMenu)       BuildJetpackMenu();
         else if (vehicleCameraMenu) BuildVehicleCameraMenu();
         else if (basketballCalibMenu) BuildBasketballCalibMenu();
         else if (basketballMenu)    BuildBasketballMenu();
@@ -9307,6 +9374,445 @@ void DrawHolsterMarkers(const float* mvp) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
+// ---- immersive jetpack: handheld-thruster flames ---------------------------
+// In REALISTIC mode the two controllers are jet engines; each pulls fire out of
+// its nozzle (the way it points) scaled by that hand's trigger. Drawn here in
+// the eye pass so it bakes into the same image/depth as the hands, additive.
+std::atomic<bool> g_jetpackThrusters{false};
+void SetJetpackThrusterMode(bool on) {
+    g_jetpackThrusters.store(on, std::memory_order_relaxed);
+}
+
+// IRONMAN sub-mode: draw repulsor gauntlets instead of the procedural turbines.
+std::atomic<bool> g_jetpackGloves{false};
+void SetJetpackGloveMode(bool on) {
+    g_jetpackGloves.store(on, std::memory_order_relaxed);
+}
+
+// Hands holding a weapon while jetpacking: skip the turbine/flame on those hands.
+std::atomic<unsigned int> g_jetpackWeaponHands{0};
+void SetJetpackWeaponHandMask(unsigned int mask) {
+    g_jetpackWeaponHands.store(mask, std::memory_order_relaxed);
+}
+
+GLuint g_flameProg = 0, g_flameVbo = 0;
+GLint  g_flameMvpLoc = -1;
+void EnsureFlameProgram() {
+    if (g_flameProg) return;
+    const char* vs = "#version 300 es\n"
+        "layout(location=0) in vec3 aPos;\n"
+        "layout(location=1) in float aHeat;\n"
+        "uniform mat4 uMVP; out float vHeat;\n"
+        "void main(){ vHeat=aHeat; gl_Position=uMVP*vec4(aPos,1.0); }\n";
+    const char* fs = "#version 300 es\n"
+        "precision mediump float;\n"
+        "in float vHeat; out vec4 o;\n"
+        // additive: bright yellow-white core -> orange/red tip, weighted by heat
+        "void main(){ vec3 c=mix(vec3(1.0,0.20,0.02), vec3(1.0,0.92,0.55), vHeat);\n"
+        "  o=vec4(c*vHeat, 1.0); }\n";
+    const GLuint v = CompileHandShader(GL_VERTEX_SHADER, vs);
+    const GLuint f = CompileHandShader(GL_FRAGMENT_SHADER, fs);
+    g_flameProg = glCreateProgram();
+    glAttachShader(g_flameProg, v); glAttachShader(g_flameProg, f);
+    glLinkProgram(g_flameProg);
+    glDeleteShader(v); glDeleteShader(f);
+    g_flameMvpLoc = glGetUniformLocation(g_flameProg, "uMVP");
+    glGenBuffers(1, &g_flameVbo);
+}
+
+XrVector3f FlameQuatRotate(const float q[4], XrVector3f v) {
+    const float x=q[0], y=q[1], z=q[2], w=q[3];
+    const float tx=2.f*(y*v.z-z*v.y), ty=2.f*(z*v.x-x*v.z), tz=2.f*(x*v.y-y*v.x);
+    return { v.x+w*tx+(y*tz-z*ty), v.y+w*ty+(z*tx-x*tz), v.z+w*tz+(x*ty-y*tx) };
+}
+
+void DrawJetpackThrusters(const float* mvp, const HandPose bakedHands[2]) {
+    if (!g_jetpackThrusters.load(std::memory_order_relaxed)) return;
+    EnsureFlameProgram();
+
+    // Time-based flicker so the plume lives instead of being a solid cone.
+    const float t = static_cast<float>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() % 100000)
+        * 0.001f;
+
+    float verts[2 * 4 * 3 * 4];   // 2 hands * 4 tongues * 3 verts * (xyz+heat)
+    int fc = 0;   // float cursor
+    int vc = 0;   // vertex count
+    const unsigned int weaponHandsF =
+        g_jetpackWeaponHands.load(std::memory_order_relaxed);
+    for (int hand = 0; hand < 2; ++hand) {
+        if (weaponHandsF & (1u << hand)) continue;   // that hand holds a weapon
+        const HandPose& hp = bakedHands[hand];
+        if (!hp.valid || hp.trigger < 0.12f) continue;
+        // Use the SAME basis as DrawJetpackTurbines: axis from aim/grip ori,
+        // origin at gripPos. Emit from the turbine's flared nozzle mouth
+        // (gripPos + axis*exit) so the plume comes straight out of the barrel,
+        // centred — not from aimPos, which sat at the turbine's edge.
+        const float* ori = hp.aimValid ? hp.aimOri : hp.gripOri;
+        // +Z: flame shoots out the BACK (rear exhaust), matching the physics.
+        const XrVector3f nozzle = vnorm(FlameQuatRotate(ori, {0.f, 0.f, 1.f}));
+        const XrVector3f ref = std::fabs(nozzle.y) < 0.9f ? XrVector3f{0,1,0}
+                                                          : XrVector3f{1,0,0};
+        const XrVector3f s1 = vnorm(vcross(nozzle, ref));
+        const XrVector3f s2 = vnorm(vcross(nozzle, s1));
+        // Emit from the turbine nozzle lip (0.16) or, in IRONMAN, from the palm
+        // repulsor on the gauntlet's front face (~0.066).
+        const float kNozzleExit =
+            g_jetpackGloves.load(std::memory_order_relaxed) ? 0.072f : 0.16f;
+        const XrVector3f grip{hp.gripPos[0], hp.gripPos[1], hp.gripPos[2]};
+        const XrVector3f o = vadd(grip, vscale(nozzle, kNozzleExit));
+        const float flick = 0.85f + 0.15f * std::sin(t * 37.f + hand * 2.f);
+        const float len = (0.10f + hp.trigger * 0.34f) * flick;
+        const float wid = 0.045f * (0.6f + hp.trigger * 0.4f);
+        const XrVector3f tip = vadd(o, vscale(nozzle, len));
+        const XrVector3f sides[4] = {s1, vscale(s1,-1.f), s2, vscale(s2,-1.f)};
+        for (int k = 0; k < 4; ++k) {
+            const XrVector3f a = vadd(o, vscale(sides[k], wid));
+            auto push = [&](XrVector3f p, float heat) {
+                verts[fc++]=p.x; verts[fc++]=p.y; verts[fc++]=p.z; verts[fc++]=heat;
+                ++vc;
+            };
+            push(a, 1.0f);
+            push(o, 1.0f);
+            push(tip, 0.0f);
+        }
+    }
+    if (vc == 0) return;
+
+    GLboolean depthMask = GL_TRUE; glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+    const GLboolean blendWas = glIsEnabled(GL_BLEND);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);          // additive glow
+    glDepthMask(GL_FALSE);                 // emissive: do not occlude, still tested
+    glUseProgram(g_flameProg);
+    glUniformMatrix4fv(g_flameMvpLoc, 1, GL_FALSE, mvp);
+    glBindBuffer(GL_ARRAY_BUFFER, g_flameVbo);
+    glBufferData(GL_ARRAY_BUFFER, fc * sizeof(float), verts, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 4*sizeof(float),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 4*sizeof(float),
+                          reinterpret_cast<void*>(3*sizeof(float)));
+    glDrawArrays(GL_TRIANGLES, 0, vc);
+    glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+    glUseProgram(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDepthMask(depthMask);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (!blendWas) glDisable(GL_BLEND);
+}
+
+// Procedural handheld turbine (jet engine) drawn in place of the hand while the
+// jetpack is worn in REALISTIC mode: a shaded metal cylinder with a flared
+// nozzle, pointing along the same axis the flame shoots from.
+GLuint g_turbineProg = 0, g_turbineVbo = 0;
+GLint  g_turbineMvpLoc = -1;
+void EnsureTurbineProgram() {
+    if (g_turbineProg) return;
+    const char* vs = "#version 300 es\n"
+        "layout(location=0) in vec3 aPos;\n"
+        "layout(location=1) in vec3 aNrm;\n"
+        "uniform mat4 uMVP; out vec3 vN;\n"
+        "void main(){ vN=aNrm; gl_Position=uMVP*vec4(aPos,1.0); }\n";
+    const char* fs = "#version 300 es\n"
+        "precision mediump float;\n"
+        "in vec3 vN; out vec4 o;\n"
+        "void main(){\n"
+        "  float d=max(dot(normalize(vN),normalize(vec3(0.35,0.85,0.4))),0.0);\n"
+        "  vec3 base=vec3(0.33,0.35,0.40);\n"           // metallic grey
+        "  o=vec4(base*(0.30+0.75*d), 1.0); }\n";
+    const GLuint v = CompileHandShader(GL_VERTEX_SHADER, vs);
+    const GLuint f = CompileHandShader(GL_FRAGMENT_SHADER, fs);
+    g_turbineProg = glCreateProgram();
+    glAttachShader(g_turbineProg, v); glAttachShader(g_turbineProg, f);
+    glLinkProgram(g_turbineProg);
+    glDeleteShader(v); glDeleteShader(f);
+    g_turbineMvpLoc = glGetUniformLocation(g_turbineProg, "uMVP");
+    glGenBuffers(1, &g_turbineVbo);
+}
+
+void DrawJetpackTurbines(const float* mvp, const HandPose bakedHands[2]) {
+    if (!g_jetpackThrusters.load(std::memory_order_relaxed)) return;
+    if (g_jetpackGloves.load(std::memory_order_relaxed)) return;  // IRONMAN uses gloves
+    EnsureTurbineProgram();
+    constexpr int N = 10;                       // segments around the barrel
+    const float ringS[3] = {-0.06f, 0.08f, 0.15f};   // along the nozzle axis
+    const float ringR[3] = { 0.030f, 0.033f, 0.052f}; // intake, body, nozzle lip
+    static float verts[2 * 2 * N * 6 * 6];      // 2 hands*2 bands*N*6 verts*(p+n)
+    int fc = 0, vcount = 0;
+    const unsigned int weaponHands =
+        g_jetpackWeaponHands.load(std::memory_order_relaxed);
+    for (int hand = 0; hand < 2; ++hand) {
+        if (weaponHands & (1u << hand)) continue;   // that hand holds a weapon
+        const HandPose& hp = bakedHands[hand];
+        if (!hp.valid) continue;
+        const float* ori = hp.aimValid ? hp.aimOri : hp.gripOri;
+        // +Z: turbine exhaust/flame faces the BACK (jet with rear exhaust).
+        const XrVector3f axis = vnorm(FlameQuatRotate(ori, {0.f, 0.f, 1.f}));
+        const XrVector3f ref = std::fabs(axis.y) < 0.9f ? XrVector3f{0,1,0}
+                                                        : XrVector3f{1,0,0};
+        const XrVector3f u = vnorm(vcross(axis, ref));
+        const XrVector3f w = vnorm(vcross(axis, u));
+        const XrVector3f O{hp.gripPos[0], hp.gripPos[1], hp.gripPos[2]};
+        XrVector3f center[3];
+        for (int r = 0; r < 3; ++r) center[r] = vadd(O, vscale(axis, ringS[r]));
+        auto ringPoint = [&](int r, int seg) -> XrVector3f {
+            const float a = static_cast<float>(seg) / N * 6.2831853f;
+            const XrVector3f rad = vadd(vscale(u, std::cos(a)),
+                                        vscale(w, std::sin(a)));
+            return vadd(center[r], vscale(rad, ringR[r]));
+        };
+        auto ringNormal = [&](int seg) -> XrVector3f {
+            const float a = static_cast<float>(seg) / N * 6.2831853f;
+            return vnorm(vadd(vscale(u, std::cos(a)), vscale(w, std::sin(a))));
+        };
+        auto push = [&](XrVector3f p, XrVector3f n) {
+            verts[fc++]=p.x; verts[fc++]=p.y; verts[fc++]=p.z;
+            verts[fc++]=n.x; verts[fc++]=n.y; verts[fc++]=n.z; ++vcount;
+        };
+        for (int band = 0; band < 2; ++band) {
+            const int r0 = band, r1 = band + 1;
+            for (int seg = 0; seg < N; ++seg) {
+                const int s1 = (seg + 1) % N;
+                const XrVector3f p00=ringPoint(r0,seg), p01=ringPoint(r0,s1);
+                const XrVector3f p10=ringPoint(r1,seg), p11=ringPoint(r1,s1);
+                const XrVector3f n0=ringNormal(seg), n1=ringNormal(s1);
+                push(p00,n0); push(p10,n0); push(p01,n1);
+                push(p01,n1); push(p10,n0); push(p11,n1);
+            }
+        }
+    }
+    if (vcount == 0) return;
+    const GLboolean blendWas = glIsEnabled(GL_BLEND);
+    glDisable(GL_BLEND);                          // opaque metal
+    glUseProgram(g_turbineProg);
+    glUniformMatrix4fv(g_turbineMvpLoc, 1, GL_FALSE, mvp);
+    glBindBuffer(GL_ARRAY_BUFFER, g_turbineVbo);
+    glBufferData(GL_ARRAY_BUFFER, fc*sizeof(float), verts, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),
+                          reinterpret_cast<void*>(3*sizeof(float)));
+    glDrawArrays(GL_TRIANGLES, 0, vcount);
+    glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+    glUseProgram(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (blendWas) glEnable(GL_BLEND);
+}
+
+// ---- IRONMAN jetpack: procedural repulsor gauntlet ------------------------
+// Drawn in place of the hand (and the turbine) while the jetpack is worn in
+// IRONMAN mode: a stylised low-poly red/gold Iron Man gauntlet with a glowing
+// repulsor in the palm, from which the same DrawJetpackThrusters flame shoots.
+// Per-vertex colour + emissive flag (alpha): emissive parts ignore lighting.
+GLuint g_gloveProg = 0, g_gloveVbo = 0;
+GLint  g_gloveMvpLoc = -1;
+void EnsureIronGloveProgram() {
+    if (g_gloveProg) return;
+    const char* vs = "#version 300 es\n"
+        "layout(location=0) in vec3 aPos;\n"
+        "layout(location=1) in vec3 aNrm;\n"
+        "layout(location=2) in vec4 aCol;\n"
+        "uniform mat4 uMVP; out vec3 vN; out vec4 vCol;\n"
+        "void main(){ vN=aNrm; vCol=aCol; gl_Position=uMVP*vec4(aPos,1.0); }\n";
+    const char* fs = "#version 300 es\n"
+        "precision mediump float;\n"
+        "in vec3 vN; in vec4 vCol; out vec4 o;\n"
+        "void main(){\n"
+        "  float d=max(dot(normalize(vN),normalize(vec3(0.3,0.9,0.35))),0.0);\n"
+        "  vec3 lit=vCol.rgb*(0.35+0.75*d);\n"
+        "  o=vec4(mix(lit, vCol.rgb*1.35, vCol.a), 1.0); }\n";  // a=1 -> emissive
+    const GLuint v = CompileHandShader(GL_VERTEX_SHADER, vs);
+    const GLuint f = CompileHandShader(GL_FRAGMENT_SHADER, fs);
+    g_gloveProg = glCreateProgram();
+    glAttachShader(g_gloveProg, v); glAttachShader(g_gloveProg, f);
+    glLinkProgram(g_gloveProg);
+    glDeleteShader(v); glDeleteShader(f);
+    g_gloveMvpLoc = glGetUniformLocation(g_gloveProg, "uMVP");
+    glGenBuffers(1, &g_gloveVbo);
+}
+
+void DrawIronGloves(const float* mvp, const HandPose bakedHands[2]) {
+    if (!g_jetpackGloves.load(std::memory_order_relaxed)) return;
+    EnsureIronGloveProgram();
+
+    static const float kRed[4]  = {0.70f, 0.09f, 0.07f, 0.0f};
+    static const float kGold[4] = {0.85f, 0.65f, 0.13f, 0.0f};
+    static const float kSteel[4]= {0.28f, 0.30f, 0.34f, 0.0f};
+    static const float kCyan[4] = {0.55f, 0.85f, 1.00f, 1.0f};   // emissive core
+    static const float kCyanR[4]= {0.35f, 0.70f, 1.00f, 1.0f};   // emissive ring
+
+    static float verts[2 * 640 * 10];   // 2 hands * verts * (pos3+nrm3+rgba4)
+    int fc = 0, vcount = 0;
+    auto pushV = [&](XrVector3f p, XrVector3f n, const float c[4]) {
+        verts[fc++]=p.x; verts[fc++]=p.y; verts[fc++]=p.z;
+        verts[fc++]=n.x; verts[fc++]=n.y; verts[fc++]=n.z;
+        verts[fc++]=c[0]; verts[fc++]=c[1]; verts[fc++]=c[2]; verts[fc++]=c[3];
+        ++vcount;
+    };
+
+    for (int hand = 0; hand < 2; ++hand) {
+        const HandPose& hp = bakedHands[hand];
+        if (!hp.valid) continue;
+        const float* ori = hp.aimValid ? hp.aimOri : hp.gripOri;
+        // axis = fire / palm-forward direction (same as the turbine/flame).
+        const XrVector3f axis = vnorm(FlameQuatRotate(ori, {0.f, 0.f, -1.f}));
+        XrVector3f up0 = std::fabs(axis.y) < 0.9f ? XrVector3f{0,1,0}
+                                                  : XrVector3f{1,0,0};
+        const XrVector3f u = vnorm(vcross(up0, axis));   // right
+        const XrVector3f w = vnorm(vcross(axis, u));     // up
+        const XrVector3f O{hp.gripPos[0], hp.gripPos[1], hp.gripPos[2]};
+
+        auto at = [&](float a, float x, float y) -> XrVector3f {
+            return vadd(O, vadd(vscale(axis, a),
+                        vadd(vscale(u, x), vscale(w, y))));
+        };
+        auto pushQuad = [&](XrVector3f a, XrVector3f b, XrVector3f c,
+                            XrVector3f d, XrVector3f n, const float col[4]) {
+            pushV(a,n,col); pushV(b,n,col); pushV(c,n,col);
+            pushV(a,n,col); pushV(c,n,col); pushV(d,n,col);
+        };
+        // Axis-aligned (in the hand frame) box centred at (ca,cx,cy).
+        auto box = [&](float ca, float cx, float cy,
+                       float hA, float hU, float hW, const float col[4]) {
+            const XrVector3f nA=axis, nU=u, nW=w;
+            const XrVector3f nAn=vscale(axis,-1), nUn=vscale(u,-1), nWn=vscale(w,-1);
+            const XrVector3f p000=at(ca-hA,cx-hU,cy-hW), p100=at(ca+hA,cx-hU,cy-hW);
+            const XrVector3f p010=at(ca-hA,cx+hU,cy-hW), p110=at(ca+hA,cx+hU,cy-hW);
+            const XrVector3f p001=at(ca-hA,cx-hU,cy+hW), p101=at(ca+hA,cx-hU,cy+hW);
+            const XrVector3f p011=at(ca-hA,cx+hU,cy+hW), p111=at(ca+hA,cx+hU,cy+hW);
+            pushQuad(p100,p110,p111,p101, nA,  col);   // +axis (front)
+            pushQuad(p010,p000,p001,p011, nAn, col);   // -axis (back)
+            pushQuad(p010,p110,p100,p000, nUn, col);   // -u
+            pushQuad(p110,p010,p011,p111, nU,  col);   // +u
+            pushQuad(p001,p101,p111,p011, nW,  col);   // +w (top)
+            pushQuad(p000,p010,p110,p100, nWn, col);   // -w (bottom)
+        };
+        auto disc = [&](float ca, float rad, const float col[4]) {
+            const int seg = 14;
+            const XrVector3f c = at(ca, 0.f, 0.f);
+            XrVector3f prev = at(ca, rad, 0.f);
+            for (int i = 1; i <= seg; ++i) {
+                const float a = static_cast<float>(i) / seg * 6.2831853f;
+                const XrVector3f cur = at(ca, std::cos(a)*rad, std::sin(a)*rad);
+                pushV(c, axis, col); pushV(prev, axis, col); pushV(cur, axis, col);
+                prev = cur;
+            }
+        };
+
+        // Forearm cuff (red) + gold band, hand/fist block (red), gold knuckle
+        // plate, four short fingers, and the palm repulsor on the front face.
+        box(-0.095f, 0.f, 0.f, 0.035f, 0.045f, 0.040f, kRed);   // cuff
+        box(-0.055f, 0.f, 0.f, 0.010f, 0.048f, 0.043f, kGold);  // gold band
+        box( 0.010f, 0.f, 0.f, 0.055f, 0.050f, 0.038f, kRed);   // fist
+        box( 0.030f, 0.f, 0.043f, 0.038f, 0.050f, 0.010f, kGold); // knuckle plate
+        for (int fgr = 0; fgr < 4; ++fgr) {
+            const float x = -0.033f + fgr * 0.022f;
+            box(0.075f, x, 0.020f, 0.020f, 0.009f, 0.013f, kRed);
+        }
+        // Repulsor: steel bezel, gold ring, glowing cyan core on the front face.
+        disc(0.062f, 0.030f, kSteel);
+        disc(0.064f, 0.024f, kCyanR);
+        disc(0.066f, 0.015f, kCyan);
+    }
+    if (vcount == 0) return;
+
+    const GLboolean blendWas = glIsEnabled(GL_BLEND);
+    const GLboolean cullWas  = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);                    // flat panels, winding-agnostic
+    glUseProgram(g_gloveProg);
+    glUniformMatrix4fv(g_gloveMvpLoc, 1, GL_FALSE, mvp);
+    glBindBuffer(GL_ARRAY_BUFFER, g_gloveVbo);
+    glBufferData(GL_ARRAY_BUFFER, fc*sizeof(float), verts, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,10*sizeof(float),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,10*sizeof(float),
+                          reinterpret_cast<void*>(3*sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2,4,GL_FLOAT,GL_FALSE,10*sizeof(float),
+                          reinterpret_cast<void*>(6*sizeof(float)));
+    glDrawArrays(GL_TRIANGLES, 0, vcount);
+    glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(2);
+    glUseProgram(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (cullWas)  glEnable(GL_CULL_FACE);
+    if (blendWas) glEnable(GL_BLEND);
+}
+
+// Rhythm minigame (lowrider dance) direction prompt. The stock arrows are SCM
+// DRAW_SPRITE rectangles: they are issued into the HUD capture, but no HUD
+// element samples that band AND script sprites are baked in OS_ScreenGet* pixel
+// space (not RsGlobal), so they land squeezed in a corner of the raster. Drawing
+// our own head-locked arrow sidesteps both problems and works in CLASSIC and
+// IMMERSIVE alike.
+void DrawBeatArrow(const float* mvp, const XrPosef& head) {
+    const int dir = g_beatDir.load(std::memory_order_relaxed);
+    if (dir <= 0) return;
+    const int ms = g_beatMs.load(std::memory_order_relaxed);
+    EnsureMarkerProgram();
+
+    const XrVector3f fwd   = QuatRotate(head.orientation, {0.f, 0.f, -1.f});
+    const XrVector3f right = QuatRotate(head.orientation, {1.f, 0.f, 0.f});
+    const XrVector3f up    = QuatRotate(head.orientation, {0.f, 1.f, 0.f});
+    // Slightly below the line of sight, but high enough to clear the mission
+    // feedback text ("BAD!"/"GOOD!") that the game prints lower down.
+    const XrVector3f centre = vadd(vadd(XrVector3f{head.position.x,
+                                                   head.position.y,
+                                                   head.position.z},
+                                       vscale(fwd, 1.8f)),
+                                   vscale(up, -0.14f));
+    XrVector3f point{}, side{};
+    switch (dir) {
+        case 1: point = up;                     side = right; break;
+        case 2: point = vscale(up, -1.f);       side = right; break;
+        case 3: point = vscale(right, -1.f);    side = up;    break;
+        default: point = right;                 side = up;    break;
+    }
+    // A rhythm game needs a PRECISE "now" cue, not a slow fade: the arrow grows
+    // as the beat approaches and snaps to a bright white flash on the beat
+    // itself, so the player can hit the window instead of guessing.
+    const float msf = static_cast<float>(ms);
+    const float approach = std::clamp(1.0f - msf / 1200.0f, 0.f, 1.f);
+    const bool  onBeat = msf < 126.0f;   // exactly LOWGAME's PERFECT window
+    const float grow = onBeat ? 1.45f : (0.85f + 0.35f * approach);
+    const float kLen = 0.20f * grow, kHalf = 0.13f * grow, kTail = 0.05f * grow;
+    const XrVector3f tip  = vadd(centre, vscale(point, kLen));
+    const XrVector3f base = vadd(centre, vscale(point, -kTail));
+    const XrVector3f b1   = vadd(base, vscale(side,  kHalf));
+    const XrVector3f b2   = vadd(base, vscale(side, -kHalf));
+    const float verts[9] = {tip.x, tip.y, tip.z, b1.x, b1.y, b1.z,
+                            b2.x, b2.y, b2.z};
+    const float t = approach;
+
+    const GLboolean depthWas = glIsEnabled(GL_DEPTH_TEST);
+    glDisable(GL_DEPTH_TEST);            // always readable, never occluded
+    glUseProgram(g_markerProg);
+    glUniformMatrix4fv(g_markerMvpLoc, 1, GL_FALSE, mvp);
+    if (onBeat)
+        glUniform4f(g_markerColLoc, 1.0f, 1.0f, 1.0f, 1.0f);        // HIT NOW
+    else
+        glUniform4f(g_markerColLoc, 0.15f + 0.10f * t, 0.85f,
+                    1.0f - 0.55f * t, 1.0f);
+    glBindBuffer(GL_ARRAY_BUFFER, g_markerVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
+                          reinterpret_cast<void*>(0));
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisableVertexAttribArray(0);
+    glUseProgram(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (depthWas) glEnable(GL_DEPTH_TEST);
+}
+
 // Parachute brake toggles: two small handles and their riser straps while the
 // canopy is open. Orange when free, green while that hand pulls it.
 void DrawParachuteToggles(const float* mvp) {
@@ -10441,6 +10947,10 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
         glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
         glEnableVertexAttribArray(2); glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), reinterpret_cast<void*>(6 * sizeof(float)));
         for (int hand = 0; hand < 2; ++hand) {
+            // Turbine replaces the hand — but NOT a hand holding a weapon, so the
+            // player can fly one-handed and keep the gun visible in the other.
+            if (g_jetpackThrusters.load(std::memory_order_relaxed) &&
+                (weaponHandMask & (1u << hand)) == 0) continue;
             if (!usingGameDepth && (weaponHandMask & (1u << hand)) != 0) continue;
             if (g_hIndexCount[hand] <= 0) continue;
             const std::uintptr_t byteOffset =
@@ -10466,6 +10976,10 @@ void DrawHandsForEye(const XrPosef& rp, int e, int fbW, int fbH,
     if (chuteRingVisual)
         DrawParachuteDeployRing(mvp);
     DrawBulletTracers(mvp, eyePos, tracers, tracerCount); // original-SA short streak, same stereo depth
+    DrawBeatArrow(mvp, rp);                // lowrider/dance rhythm prompt
+    DrawJetpackTurbines(mvp, bakedHands);  // REALISTIC jetpack: turbines replace the hands
+    DrawIronGloves(mvp, bakedHands);       // IRONMAN jetpack: repulsor gauntlets replace the hands
+    DrawJetpackThrusters(mvp, bakedHands); // vectored jetpack: fire from each hand's nozzle/palm
     // IMMERSIVE preset: radar + status crops worn on the wrists (or the
     // dashboard while driving), same baked poses as the hand meshes, same
     // depth pass (arm/weapon occlude the panel).
@@ -11038,15 +11552,23 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
     SyncInput(frameState.predictedDisplayTime);
 
 #ifdef SAVR_DEV
-    // Developer builds: the Vice City grips+A chord toggles the FPS panel.
+    // Developer builds: the Vice City grips+A chord. Normally toggles the FPS
+    // panel; while the hidden cheat "SPAWN VEHICLE BY BUTTON" is ON it instead
+    // cycle-spawns the next vehicle model (400..611) so wheel/HUD calibration
+    // can be walked through fast without diving into the menu each time.
     {
         InputState in{};
         GetInput(in);
         const bool chord = in.grip[0] >= 0.75f && in.grip[1] >= 0.75f && in.a;
         static bool chordDown = false;
         if (chord && !chordDown) {
-            s.debugVisible = !s.debugVisible;
-            LOGI("[vr] debug panel %s", s.debugVisible ? "ON" : "OFF");
+            if (savr::cheats::SpawnByButtonEnabled()) {
+                savr::cheats::RequestNextVehicle();
+                LOGI("[vr] grips+A -> spawn next vehicle (dev)");
+            } else {
+                s.debugVisible = !s.debugVisible;
+                LOGI("[vr] debug panel %s", s.debugVisible ? "ON" : "OFF");
+            }
         }
         chordDown = chord;
     }
@@ -11416,6 +11938,7 @@ void RenderFrame(double consumerUpdateMs, double consumerUpdateCpuMs) {
              g_drivingActive.load(std::memory_order_relaxed) ||
              g_drivingCalibActive.load(std::memory_order_relaxed) ||
              g_locomotionActive.load(std::memory_order_relaxed) ||
+             g_jetpackMenuActive.load(std::memory_order_relaxed) ||
              g_vehicleCameraActive.load(std::memory_order_relaxed) ||
              g_basketballActive.load(std::memory_order_relaxed) ||
              g_basketballCalibActive.load(std::memory_order_relaxed) ||
