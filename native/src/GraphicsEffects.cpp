@@ -2490,16 +2490,44 @@ bool InstallTrafficLightQualityGate(void* handle) {
     return hooked;
 }
 
+// True when `matrix` is one of the local player's skinned bone matrices. The
+// FX manager receives the parent bone matrix, and the player's matrices live in
+// one contiguous RpHAnim array, so a bounds test identifies CJ without guessing
+// from the effect name. Anything else (NPCs, world effects) returns false.
+bool ParentMatrixIsLocalPlayer(void* matrix) {
+    if (matrix == nullptr || g.FindPlayerPed == nullptr ||
+        g.GetAnimHierarchyFromSkinClump == nullptr ||
+        g.RpHAnimHierarchyGetMatrixArray == nullptr) {
+        return false;
+    }
+    void* ped = g.FindPlayerPed(-1);
+    if (ped == nullptr) return false;
+    void* clump = *reinterpret_cast<void**>(
+        static_cast<std::uint8_t*>(ped) + 0x20);
+    void* hierarchy = clump ? g.GetAnimHierarchyFromSkinClump(clump) : nullptr;
+    if (hierarchy == nullptr) return false;
+    void* matrices = g.RpHAnimHierarchyGetMatrixArray(hierarchy);
+    if (matrices == nullptr) return false;
+    // RwMatrix is 64 bytes; a ped skeleton is well under 64 bones.
+    const auto base = reinterpret_cast<std::uintptr_t>(matrices);
+    const auto probe = reinterpret_cast<std::uintptr_t>(matrix);
+    return probe >= base && probe < base + 64u * 64u;
+}
+
 void* OnCreateFxSystem(void* manager, char* name, void* position,
                        void* parentMatrix, std::uint8_t ignoreBoundingChecks) {
     if (!g_origCreateFxSystem) return nullptr;
 
-    // The held molotov's lit-rag flame ("molotov_flame") is spawned on the
-    // player's R_HAND bone (CPed::AddWeaponModel). In first person CJ's body is
-    // hidden but this world FX is not, so it floats in front of the player.
-    // Suppress it — purely cosmetic; the THROWN molotov's impact fire is a
-    // separate system and is untouched.
-    if (name && std::strcmp(name, "molotov_flame") == 0) return nullptr;
+    // The held molotov's lit-rag flame ("molotov_flame") is spawned on a ped's
+    // R_HAND bone (CPed::AddWeaponModel). For the LOCAL PLAYER that bone is
+    // hidden in VR while the weapon itself is re-drawn on the tracked hand, so
+    // the stock FX would burn in mid-air; suppress only that one. NPC molotovs
+    // keep their flame. The THROWN molotov's impact fire is a separate system
+    // and is untouched either way.
+    if (name && std::strcmp(name, "molotov_flame") == 0 &&
+        ParentMatrixIsLocalPlayer(parentMatrix)) {
+        return nullptr;
+    }
 
     // The ground fire producer is independent from CWeapon::m_FxSystem.  A flat
     // retail frustum can therefore reject the muzzle blueprint while creeping

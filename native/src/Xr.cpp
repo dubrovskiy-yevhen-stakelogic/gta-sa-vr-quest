@@ -582,6 +582,7 @@ std::atomic<int>      g_gfxSel{0};
 std::atomic<bool>     g_controlsMenuActive{false};
 std::atomic<int>      g_controlsSel{0};
 std::atomic<bool>     g_controlsTipsActive{false};
+std::atomic<int>      g_controlsTipsScroll{0};
 std::atomic<bool>     g_aboutActive{false};
 std::atomic<bool>     g_aboutFirstRun{false};
 std::atomic<bool>     g_gfxDistanceActive{false}; // draw-distance submenu shown
@@ -5349,8 +5350,9 @@ void SetControlsMenu(bool active, int selection) {
     g_controlsSel.store(selection, std::memory_order_relaxed);
 }
 
-void SetControlsTipsMenu(bool active) {
+void SetControlsTipsMenu(bool active, int scroll) {
     g_controlsTipsActive.store(active, std::memory_order_relaxed);
+    g_controlsTipsScroll.store(scroll, std::memory_order_relaxed);
 }
 
 void SetAboutMenu(bool active, bool firstRun) {
@@ -6960,44 +6962,100 @@ void BuildAboutMenu() {
 }
 
 void BuildControlsTipsMenu() {
+    // Colour-coded sections so the eye can find an area without reading every
+    // line, at a small font with scrolling: the list outgrew a 512px panel.
+    struct TipLine { const char* text; unsigned char r, g, b; bool header; };
+    static const TipLine kTips[] = {
+        {"VR MENU",                                100, 225, 255, true },
+        {"GRIPS+MENU (OR Y)  OPEN VR MENU",         90, 185, 210, false},
+        {"L3+R3  RECENTER VIEW",                    90, 185, 210, false},
+
+        {"ON FOOT",                                140, 235, 150, true },
+        {"Y ENTER/EXIT   X JUMP   A SPRINT",       120, 195, 130, false},
+        {"L3  CROUCH",                             120, 195, 130, false},
+
+        {"WEAPONS",                                250, 205, 120, true },
+        {"DRAW: GRAB FROM A BODY HOLSTER",         205, 170, 105, false},
+        {"PICK UP: WALK OVER IT ON THE GROUND",    205, 170, 105, false},
+        {"SAME SLOT SWAPS THE HELD WEAPON",        205, 170, 105, false},
+        {"EMPTY HANDS RETURN CJ TO FISTS",         205, 170, 105, false},
+
+        {"VEHICLES",                               255, 170, 110, true },
+        {"B  FIRE HELD WEAPON / TANK GUN",         210, 145,  95, false},
+        {"HORN: PRESS PALM ON THE WHEEL HUB",      210, 145,  95, false},
+        {"GRIPS+R3  FIRST / THIRD PERSON VIEW",    210, 145,  95, false},
+        {"  (VICE CITY STYLE VIEW TOGGLE)",        210, 145,  95, false},
+
+        {"LOWRIDER HYDRAULICS",                    255, 150, 200, true },
+        {"BOTH GRIPS + RIGHT STICK = SUSPENSION",  210, 130, 170, false},
+        {"UP FRONT / DOWN REAR / LEFT / RIGHT",    210, 130, 170, false},
+        {"NEEDS HYDRAULICS FITTED - SEE",          210, 130, 170, false},
+        {"  CHEATS > VEHICLES > INSTALL HYDRAULICS",210, 130, 170, false},
+
+        {"AIRCRAFT",                               150, 195, 255, true },
+        {"PLANES: PULL/PUSH YOKE = PITCH",         125, 165, 210, false},
+        {"HELI: LEFT STICK = ROLL + PITCH",        125, 165, 210, false},
+        {"HYDRA NOZZLES + HELI YAW: RIGHT STICK",  125, 165, 210, false},
+        {"CLIMB BOOST: LEFT GRIP + RIGHT TRIGGER", 125, 165, 210, false},
+
+        {"PARACHUTE",                              200, 160, 255, true },
+        {"JUMP OUT, A = OPEN CANOPY",              165, 135, 210, false},
+        {"HOLD RIGHT TRIGGER = DIVE",              165, 135, 210, false},
+        {"STEER WITH STICKS OR PHYSICAL RISERS",   165, 135, 210, false},
+
+        {"JETPACK",                                255, 200, 140, true },
+        {"B (OUTSIDE MENUS) DROPS THE BELT",       210, 165, 115, false},
+        {"SETTINGS: LOCOMOTION > JETPACK",         210, 165, 115, false},
+
+        {"GROUP & PHONE",                          150, 225, 210, true },
+        {"RECRUIT: LOOK AT GROVE PED + HOLD R2",   125, 185, 175, false},
+        {"DISMISS: LOOK AWAY + HOLD R2",           125, 185, 175, false},
+        {"RECRUITING NEEDS RESPECT",               125, 185, 175, false},
+        {"ANSWER PHONE: BOTH GRIPS + R2",          125, 185, 175, false},
+
+        {"PROMPTS",                                235, 235, 235, true },
+        {"R2 TAP = YES   L2 = NO",                 190, 200, 210, false},
+        {"R2 HOLD = TAP-AND-HOLD PROMPTS",         190, 200, 210, false},
+
+        {"CUTSCENES",                              215, 180, 255, true },
+        {"R3 CHANGE CAMERA / ACTOR",               175, 150, 210, false},
+        {"L3 REMEMBER THIS CAMERA FOR THE SCENE",  175, 150, 210, false},
+        {"STYLE: GRAPHICS > CUTSCENES",            175, 150, 210, false},
+    };
     PanelClear();
     const int cx = kPanelW / 2;
-    PanelText("CONTROL TIPS", cx, 16, 4, 100, 225, 255);
-    static const char* const kTips[] = {
-        "GRIPS+MENU (OR Y)  OPEN VR MENU",
-        "Y ENTER/EXIT   X JUMP   A SPRINT",
-        "B  FIRE HELD WEAPON IN VEHICLES / TANK",
-        "WEAPON PICKUP: WALK OVER IT ON GROUND;",
-        "  SAME SLOT SWAPS - DRAW FROM HOLSTER",
-        "R2 TAP  ANSWER PROMPTS YES   L2  NO",
-        "R2 HOLD  TAP-AND-HOLD PROMPTS",
-        "PLANES: PULL/PUSH YOKE = PITCH",
-        "HYDRA NOZZLES + HELI YAW: RIGHT STICK",
-        "HELI: LEFT STICK = ROLL + PITCH",
-        "CLIMB BOOST: LEFT GRIP + RIGHT TRIGGER",
-        "PARACHUTE: JUMP OUT, A = OPEN CANOPY",
-        "SKYDIVE: HOLD RIGHT TRIGGER = DIVE",
-        "STEER CANOPY WITH STICKS OR RISERS",
-        "RECRUIT: LOOK AT GROVE PED + HOLD R2",
-        "DISMISS GROUP: LOOK AWAY + HOLD R2",
-        "RECRUITING NEEDS RESPECT (MISSIONS OR",
-        "  THE MAX RESPECT CHEAT)",
-        "HORN: PRESS PALM ON THE WHEEL HUB",
-        "ANSWER PHONE: BOTH GRIPS + R2",
-        "CUTSCENE: R3 CAMERA / L3 REMEMBER",
-        "L3+R3 RECENTER",
-        "GRIPS+R3 IN A CAR: FIRST / THIRD PERSON",
-        "  (VICE CITY STYLE VIEW TOGGLE)",
-        "LOWRIDER HYDRAULICS: BOTH GRIPS +",
-        "  RIGHT STICK (NEEDS HYDRAULICS FITTED -",
-        "  CHEATS > VEHICLES > INSTALL HYDRAULICS)",
-        "CUTSCENE STYLE: GRAPHICS MENU",
-    };
+    PanelText("CONTROL TIPS", cx, 12, 3, 100, 225, 255);
+
     const int count = static_cast<int>(sizeof(kTips) / sizeof(kTips[0]));
-    const int top = 44, rowH = 21;
-    for (int i = 0; i < count; ++i)
-        PanelText(kTips[i], cx, top + i * rowH, 2, 210, 225, 235);
-    PanelText("A / B BACK", cx, kPanelH - 18, 2, 150, 185, 150);
+    const int top = 40, rowH = 13;
+    const int visible = (kPanelH - 30 - top) / rowH;
+    int scroll = g_controlsTipsScroll.load(std::memory_order_relaxed);
+    const int maxScroll = count > visible ? count - visible : 0;
+    scroll = std::clamp(scroll, 0, maxScroll);
+
+    for (int row = 0; row < visible && scroll + row < count; ++row) {
+        const TipLine& line = kTips[scroll + row];
+        const int y = top + row * rowH;
+        // Headers keep the larger glyph so a section is findable at a glance;
+        // body lines use the small font that made the whole list fit.
+        PanelText(line.text, cx, y, line.header ? 2 : 1,
+                  line.r, line.g, line.b);
+    }
+
+    // Scrollbar: without it there is no sign that more text exists below.
+    if (maxScroll > 0) {
+        const int trackTop = top, trackBottom = kPanelH - 30;
+        const int trackH = trackBottom - trackTop;
+        const int thumbH = std::max(12, trackH * visible / count);
+        const int thumbY = trackTop +
+            (trackH - thumbH) * scroll / (maxScroll > 0 ? maxScroll : 1);
+        PanelFillRect(kPanelW - 12, trackTop, kPanelW - 8, trackBottom,
+                      60, 70, 80, 180);
+        PanelFillRect(kPanelW - 13, thumbY, kPanelW - 7, thumbY + thumbH,
+                      120, 210, 240, 235);
+    }
+    PanelText(maxScroll > 0 ? "STICK SCROLL   A / B BACK" : "A / B BACK",
+              cx, kPanelH - 18, 2, 150, 185, 150);
 }
 
 void BuildControlsMenu() {
@@ -7678,7 +7736,7 @@ void BuildLocomotionMenu() {
     std::snprintf(rows[12],sizeof(rows[12]),"JETPACK   < %s >",
                   jetpack::ModeName());
     std::snprintf(rows[13],sizeof(rows[13]),"BACK");
-    // 16 rows on the 512px panel: a 27px pitch from y=56 keeps the last row
+    // 14 rows on the 512px panel: a 27px pitch from y=56 keeps the last row
     // and the hint line inside the panel.
     const int top=56,rowH=27;
     for (int i=0;i<14;++i) {

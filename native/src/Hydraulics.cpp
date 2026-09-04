@@ -4,12 +4,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
-#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 #include "Log.h"
 #include "Symbols.h"
@@ -45,21 +42,9 @@
 namespace savr::hydraulics {
 namespace {
 
-constexpr std::uintptr_t kLeftRightRVA = 0x49ce54u;   // CPad::GetCarGunLeftRight(bool,bool)
-constexpr std::uintptr_t kUpDownRVA    = 0x49cb98u;   // CPad::GetCarGunUpDown(bool,CAutomobile*,float,bool)
-constexpr std::uint32_t kLeftRightPrologue[4] = {
-    0xa9bd7bfdu, 0xf9000bf5u, 0xa9024ff4u, 0x910003fdu};
-constexpr std::uint32_t kUpDownPrologue[4] = {
-    0x6dbc23e9u, 0xa9017bfdu, 0xa90257f6u, 0xa9034ff4u};
-
-using LeftRightFn = std::int16_t (*)(void* pad, bool a1, bool a2);
-using UpDownFn    = std::int16_t (*)(void* pad, bool a1, void* automobile,
-                                     float a3, bool a4);
-
 std::atomic<bool>  g_active{false};
 std::atomic<float> g_stickX{0.0f};
 std::atomic<float> g_stickY{0.0f};
-// Diagnostics: whether the hooks took, and whether the game ever calls them.
 
 // Rhythm minigame beat table. CAEAudioHardware keeps the live tBeatInfo at
 // AEAudioHardware+0xCE8: tBeat BeatWindow[20] {u32 timeMs; u32 key;} then
@@ -71,7 +56,6 @@ std::atomic<float> g_stickY{0.0f};
 const std::uint8_t* g_beatInfo = nullptr;
 constexpr int kBeatWindowMid   = 0x50;   // &BeatWindow[10]
 constexpr int kBeatPresent     = 0xA0;
-constexpr int kBeatLookAhead   = 10;
 constexpr unsigned kBeatMaxMs  = 4500u;  // the script ignores beats beyond this
 constexpr int kBeatIndexOff    = 0xA8;   // tBeatInfo::BeatNumber (the graded beat id)
 // LOWGAME grades a beat as PERFECT only within 126 ms of it; anything later in

@@ -59,12 +59,5 @@ int         TurbinePowerPercent();
 float       TurbinePower();          // == percent / 100
 void        AdjustTurbinePower(int step);
 
-// FOG DISTANCE: pushes the distance-fog volume outward WHILE FLYING (jetpack or
-// aircraft) so the draw-distance headroom that already exists becomes visible.
-// Stepped percent in [100,300], default 100 = untouched retail fog. It never
-// moves the far clip, so no extra geometry is drawn.
-int         FogDistancePercent();
-float       FogDistanceScale();      // == percent / 100
-void        AdjustFogDistance(int step);
 
 }  // namespace savr::jetpack

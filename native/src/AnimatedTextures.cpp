@@ -114,8 +114,18 @@ template <typename T> T& At(std::uint8_t* base, int off) {
 // Bounded re-implementation of the engine's ==1 advance for one interpolator.
 void AdvanceInterp(std::uint8_t* interp, float dt) {
     if (!(dt >= 0.f) || dt > 100.f) return;   // NaN/absurd dt would poison time
+    // The slot sweep cannot prove a non-null word is really an interpolator, so
+    // EVERYTHING is validated before we dereference `anim` or write a single
+    // byte: the callback must point into libGame, and both pointers must be
+    // 8-byte aligned. Validating only the indirect call (as this did first) is
+    // not enough - the reads and the kf1/kf2 writes happen before it.
+    if ((reinterpret_cast<std::uintptr_t>(interp) & 7u) != 0) return;
+    InterpCB cbEarly = At<InterpCB>(interp, kInterpCB);
+    const std::uintptr_t cbAddrEarly = reinterpret_cast<std::uintptr_t>(cbEarly);
+    if (g_libLo == 0 || cbAddrEarly < g_libLo || cbAddrEarly >= g_libHi) return;
     std::uint8_t* anim = At<std::uint8_t*>(interp, kInterpAnim);
     if (anim == nullptr) return;
+    if ((reinterpret_cast<std::uintptr_t>(anim) & 7u) != 0) return;
     const int numNodes = At<std::int32_t>(interp, kInterpNumNodes);
     const int interpKF = At<std::int32_t>(interp, kInterpKFSize);
     const int animKF   = At<std::int32_t>(interp, kInterpAnimKF);
@@ -129,12 +139,6 @@ void AdvanceInterp(std::uint8_t* interp, float dt) {
     InterpCB cb            = At<InterpCB>(interp, kInterpCB);
     if (pFrames == nullptr || cb == nullptr) return;
     if (numFrames < 2 * numNodes || numFrames > kMaxFrames) return;
-    // The slot sweep cannot prove a non-null word really is an interpolator, so
-    // never call through it unless it points inside libGame.so. A stray word
-    // (different ext layout, a flags value) would otherwise be an indirect call
-    // to garbage on the render thread.
-    const std::uintptr_t cbAddr = reinterpret_cast<std::uintptr_t>(cb);
-    if (g_libLo == 0 || cbAddr < g_libLo || cbAddr >= g_libHi) return;
     if (!(duration >= 0.f) || !std::isfinite(duration)) return;
     std::uint8_t* const end = pFrames + static_cast<std::size_t>(numFrames) * animKF;
     std::uint8_t* const frames = interp + kInterpFrames;
@@ -153,6 +157,7 @@ void AdvanceInterp(std::uint8_t* interp, float dt) {
 
     // Tick + wrap (bounded), reseed the cursor on every wrap.
     float time = At<float>(interp, kInterpTime) + dt;
+    if (!std::isfinite(time)) time = 0.f;   // a NaN already in the pool
     if (duration > 0.f) {
         bool wrapped = false; int guard = 0;
         while (time > duration && guard++ < 64) { time -= duration; wrapped = true; }
@@ -240,9 +245,12 @@ bool InstallAddAnimTimeHook(void* target) {
     // the window between the two would otherwise reach the hook with a null
     // original.
     g_origAddAnimTime = reinterpret_cast<AddAnimTimeFn>(tramp);
-    code[0] = 0x58000051u;   // LDR X17, #8 (replacement literal)
-    code[1] = 0xD61F0220u;   // BR X17
+    // Publish the literal and the BR first, then arm the branch with a release
+    // store: a thread already executing the target must never see the LDR while
+    // the literal slot still holds the original instructions.
     *reinterpret_cast<void**>(code + 2) = reinterpret_cast<void*>(&OnAddAnimTime);
+    code[1] = 0xD61F0220u;   // BR X17
+    __atomic_store_n(&code[0], 0x58000051u, __ATOMIC_RELEASE);   // LDR X17, #8
     __builtin___clear_cache(reinterpret_cast<char*>(code),
                             reinterpret_cast<char*>(code) + 16);
     return true;
@@ -293,10 +301,6 @@ void Install(void* /*handle*/) {
     LOGI("[animtex] extOffset=%d paramPatch=%s advanceHook=%s default=%s",
          *g_uvGlobals, patched ? "OK" : "FAILED", hooked ? "OK" : "FAILED",
          g_enabled.load(std::memory_order_acquire) ? "ON" : "OFF");
-}
-
-void Tick() {
-    // Nothing per frame: the advance runs inside the AddAnimTime hook.
 }
 
 void SetEnabled(bool enabled) {

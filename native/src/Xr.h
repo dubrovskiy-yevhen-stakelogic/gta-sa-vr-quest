@@ -409,7 +409,7 @@ bool HudSourceScanActive();
 bool HudCalibrationActive();
 void SetGraphicsMenu(bool active, int selection);
 void SetControlsMenu(bool active, int selection);
-void SetControlsTipsMenu(bool active);
+void SetControlsTipsMenu(bool active, int scroll);
 void SetAboutMenu(bool active, bool firstRun);
 void SetGraphicsDistanceMenu(bool active, int selection);
 

@@ -242,12 +242,15 @@ bool InstallUpdateHook(void* target) {
         munmap(tramp, pageSize);
         return false;
     }
-    code[0] = 0x58000051u;   // LDR X17, replacement literal
-    code[1] = 0xD61F0220u;   // BR X17
+    // Trampoline first, then the literal, then arm the branch: a call landing
+    // mid-patch must never reach the hook with a null original, nor branch
+    // through a literal slot that still holds the original instructions.
+    g_origUpdate = reinterpret_cast<UpdateFn>(tramp);
     *reinterpret_cast<void**>(code + 2) = reinterpret_cast<void*>(&OnPickupUpdate);
+    code[1] = 0xD61F0220u;   // BR X17
+    __atomic_store_n(&code[0], 0x58000051u, __ATOMIC_RELEASE);   // LDR X17, #8
     __builtin___clear_cache(reinterpret_cast<char*>(code),
                             reinterpret_cast<char*>(code) + 16);
-    g_origUpdate = reinterpret_cast<UpdateFn>(tramp);
     LOGI("[pickups] CPickup::Update rise hook installed");
     return true;
 }

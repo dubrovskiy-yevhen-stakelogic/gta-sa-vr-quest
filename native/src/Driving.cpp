@@ -107,6 +107,10 @@ const char* const kPath =
     "/sdcard/Android/data/com.rockstargames.gtasa/files/vr_driving.ini";
 
 std::once_flag g_initOnce;
+// Save() is refused until Load() has actually read the file (or proved it
+// absent). Without this a transient read failure leaves defaults in memory
+// and the next menu tweak writes them over the player's real settings.
+std::atomic<bool> g_settingsLoaded{false};
 std::mutex g_saveMutex;
 std::atomic<int> g_carMode{MODE_DEFAULT};
 std::atomic<int> g_bikeMode{MODE_IMMERSIVE};
@@ -344,6 +348,10 @@ int ClampControlValue(int field, int value) {
 }
 
 void Save() {
+    if (!g_settingsLoaded.load(std::memory_order_acquire)) {
+        LOGW("[driving] save refused before a successful load");
+        return;
+    }
     std::lock_guard<std::mutex> lock(g_saveMutex);
     // Write to a temp file and rename over the target instead of reopening the
     // target with "w". A settings file deployed with `adb push` is owned by
@@ -716,6 +724,7 @@ void Load() {
          g_value[F_SIDE].load(), g_value[F_DISTANCE].load(), g_value[F_HEIGHT].load(),
          g_value[F_WHEEL_SIDE].load(), g_value[F_WHEEL_DISTANCE].load(),
          g_value[F_WHEEL_HEIGHT].load(), g_value[F_WHEEL_RADIUS].load());
+    g_settingsLoaded.store(true, std::memory_order_release);
     if (configVersion < kDrivingConfigVersion || !bikeModeSeen ||
         !immersiveCarSeatSeen || !immersiveBikeSeatSeen) Save();
     if (!kImmersiveDrivingEnabled &&

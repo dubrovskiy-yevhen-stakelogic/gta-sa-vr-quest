@@ -33,7 +33,6 @@ const char* const kIniPath =
 std::atomic<Mode> g_mode{Mode::Reliable};   // rock-solid default (SIMPLE)
 std::atomic<bool> g_lockInAir{true};        // block B-drop while airborne (default ON)
 std::atomic<int>  g_turbinePower{100};      // vectored-thrust scale, percent
-std::atomic<int>  g_fogDistance{100};       // in-flight fog push-out, percent
 std::mutex        g_saveMutex;
 // True once the ini has been read successfully (or confirmed absent). Save()
 // is REFUSED before that so start-up defaults can never overwrite the file —
@@ -134,7 +133,6 @@ void Save() {
     std::fprintf(f, "Mode=%d\n", static_cast<int>(g_mode.load()));
     std::fprintf(f, "LockInAir=%d\n", g_lockInAir.load() ? 1 : 0);
     std::fprintf(f, "TurbinePower=%d\n", g_turbinePower.load());
-    std::fprintf(f, "FogDistance=%d\n", g_fogDistance.load());
     const bool wrote = std::fflush(f) == 0;
     std::fclose(f);
     if (!wrote) { std::remove(tmpPath); return; }
@@ -160,7 +158,7 @@ void Load() {
     if (g_loadAttempts > 0 && nowMs - g_lastLoadAttemptMs < 1000) return;
     g_lastLoadAttemptMs = nowMs;
     ++g_loadAttempts;
-    int mode = static_cast<int>(Mode::Reliable), lock = 1, power = 100, fog = 100;
+    int mode = static_cast<int>(Mode::Reliable), lock = 1, power = 100;
     FILE* f = std::fopen(kIniPath, "r");
     if (f == nullptr) {
         const int err = errno;
@@ -182,7 +180,6 @@ void Load() {
         if      (std::sscanf(line, "Mode=%d", &v) == 1)         mode = v;
         else if (std::sscanf(line, "LockInAir=%d", &v) == 1)    lock = v;
         else if (std::sscanf(line, "TurbinePower=%d", &v) == 1) power = v;
-        else if (std::sscanf(line, "FogDistance=%d", &v) == 1)  fog = v;
     }
     std::fclose(f);
     // Store the VALUES first and publish g_loaded only after. g_loaded is what
@@ -193,13 +190,11 @@ void Load() {
                                                             : Mode::Reliable);
     g_lockInAir.store(lock != 0);
     g_turbinePower.store(std::clamp(power, 50, 200));
-    g_fogDistance.store(std::clamp(fog, 100, 300));
     g_loaded.store(true, std::memory_order_release);
     // Logged last: ModeName() -> GetMode() -> Load() must find g_loaded already
     // true so it returns before re-entering this non-recursive lock.
-    LOGI("[jetpack] settings loaded: mode=%s lockInAir=%d power=%d%% fog=%d%%",
-         ModeName(), g_lockInAir.load() ? 1 : 0, g_turbinePower.load(),
-         g_fogDistance.load());
+    LOGI("[jetpack] settings loaded: mode=%s lockInAir=%d power=%d%%",
+         ModeName(), g_lockInAir.load() ? 1 : 0, g_turbinePower.load());
 }
 
 // ---- DropJetPack chokepoint hook ------------------------------------------
@@ -254,9 +249,12 @@ bool InstallDropHook(void* target) {
     // landing in that window reaches OnDropJetPack with a null original and is
     // silently swallowed.
     g_origDropJetPack = reinterpret_cast<DropJetPackFn>(tramp);
-    code[0] = 0x58000051u;   // LDR X17, #8 (replacement literal)
-    code[1] = 0xD61F0220u;   // BR X17
+    // Publish the literal and the BR first, then arm the branch with a release
+    // store: a thread already executing the target must never see the LDR while
+    // the literal slot still holds the original instructions.
     *reinterpret_cast<void**>(code + 2) = reinterpret_cast<void*>(&OnDropJetPack);
+    code[1] = 0xD61F0220u;   // BR X17
+    __atomic_store_n(&code[0], 0x58000051u, __ATOMIC_RELEASE);   // LDR X17, #8
     __builtin___clear_cache(reinterpret_cast<char*>(code),
                             reinterpret_cast<char*>(code) + 16);
     return true;
@@ -335,19 +333,6 @@ void AdjustTurbinePower(int step) {
     Save();
 }
 
-int FogDistancePercent() {
-    Load();
-    return g_fogDistance.load(std::memory_order_acquire);
-}
-float FogDistanceScale() {
-    return static_cast<float>(FogDistancePercent()) / 100.f;
-}
-void AdjustFogDistance(int step) {
-    const int p = std::clamp(FogDistancePercent() + step * 10, 100, 300);
-    g_fogDistance.store(p, std::memory_order_release);
-    LOGI("[jetpack] fog distance -> %d%%", p);
-    Save();
-}
 
 void WritePad(std::int16_t* ns, const xr::InputState& in, float headYaw) {
     (void)headYaw;

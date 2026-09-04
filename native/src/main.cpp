@@ -1003,6 +1003,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
     static int  basketballSel = 0, basketballCalibSel = 0;
     static int  vehicleCameraSel = 0;
     static int  jetpackSel = 0;
+    static int  controlsTipsScroll = 0;
     static int  locomotionSel = 0, hudSel = 0, hudCropSel = 0, hudWristSel = 0,
                 gfxSel = 0, gfxDistanceSel = 0, controlsSel = 0;
     static bool aboutFirstRun = false, aboutArmed = false;
@@ -1460,7 +1461,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_LOCOMOTION: {
-            constexpr int ROWS=14;   // cutscene rows moved to GRAPHICS
+            constexpr int ROWS=14;
             if (navUp) locomotionSel=(locomotionSel-1+ROWS)%ROWS;
             if (navDown) locomotionSel=(locomotionSel+1)%ROWS;
             const int step=minus?-1:(plus?1:0);
@@ -1499,7 +1500,7 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_JETPACK: {
-            constexpr int ROWS=4;   // FOG DISTANCE removed: it had no effect
+            constexpr int ROWS=4;
             if (navUp)   jetpackSel=(jetpackSel-1+ROWS)%ROWS;
             if (navDown) jetpackSel=(jetpackSel+1)%ROWS;
             const int step=minus?-1:(plus?1:0);
@@ -1735,7 +1736,10 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
             break;
         }
         case PG_CONTROLS_TIPS: {
-            if (enter || back) menuPage = PG_CONTROLS;
+            if (navUp)   controlsTipsScroll -= 1;
+            if (navDown) controlsTipsScroll += 1;
+            if (controlsTipsScroll < 0) controlsTipsScroll = 0;
+            if (enter || back) { menuPage = PG_CONTROLS; controlsTipsScroll = 0; }
             break;
         }
         case PG_ABOUT: {
@@ -1812,7 +1816,8 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         xr::SetMenuState(menuPage == PG_CHEATS,cheatSel,cheatRows,cheatCategory);
         xr::SetGraphicsMenu(menuPage == PG_GRAPHICS, gfxSel);
         xr::SetControlsMenu(menuPage == PG_CONTROLS, controlsSel);
-        xr::SetControlsTipsMenu(menuPage == PG_CONTROLS_TIPS);
+        xr::SetControlsTipsMenu(menuPage == PG_CONTROLS_TIPS,
+                                controlsTipsScroll);
         xr::SetAboutMenu(menuPage == PG_ABOUT, aboutFirstRun);
         xr::SetGraphicsDistanceMenu(
             menuPage == PG_GRAPHICS_DISTANCES, gfxDistanceSel);
@@ -1885,7 +1890,6 @@ void SendInputToGame(JNIEnv* env, jclass clazz) {
         savr::physicalweapon::AutoAssignGadgetPoint();
         savr::cheats::Tick();
         savr::pickups::Tick();
-        savr::animtex::Tick();
         savr::basketball::Update();
     }
     else {

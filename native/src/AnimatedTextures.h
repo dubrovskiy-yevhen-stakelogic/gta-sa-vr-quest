@@ -8,13 +8,13 @@
 // for the disassembly evidence.
 namespace savr::animtex {
 
-// Resolve `RunUVAnim` from the loaded libGame.so and turn UV animation on.
+// Install the UV-animation fix: hook RpMaterialUVAnimAddAnimTime and patch
+// the 11 Param-apply words. See AnimatedTextures.cpp for the disassembly
+// evidence and for why the RunUVAnim byte must NOT be poked.
 void Install(void* libGameHandle);
 
 // Game-thread re-assert of the flag (one byte/frame) to the current on/off
 // state. Nothing in the retail binary ever clears it, so this is mostly
-// defensive; it also logs the first successful enable.
-void Tick();
 
 // Live on/off for the ANIMATED TEXTURES graphics-menu row (default ON). OFF
 // re-freezes UV scrolling, which is how the fix is verified visually.

@@ -4803,6 +4803,12 @@ void OnUpdatePads() {
                                 std::memory_order_release);
 
     if (!stereo || g.CPad_GetPad == nullptr || inputBlocked) {
+        // Clear the published hydraulics/beat state on the way out. A latched
+        // g_active would keep Driving's CPad car-gun hooks returning frozen
+        // hydraulics values - and those same hooks own the Hydra nozzles and the
+        // tank turret - besides stranding the rhythm arrow on screen.
+        hydraulics::SetStick(false, 0.0f, 0.0f);
+        xr::SetBeatArrow(0, 0);
         return;   // only drive the pad in gameplay, and not while a menu is up
     }
     void* pad = g.CPad_GetPad(0);
@@ -4817,6 +4823,8 @@ void OnUpdatePads() {
     // stick/dpad/drive-by writes below (holster grabbing is suppressed
     // separately), so it computes its own pad and returns.
     if (jetpack::IsActive()) {
+        hydraulics::SetStick(false, 0.0f, 0.0f);   // never latch across the belt
+        xr::SetBeatArrow(0, 0);
         jetpack::WritePad(ns, in, CurrentLocalHeadYaw());
         ApplyJetpackThrust();   // realistic-mode vectored hand thrust (physics)
         return;
@@ -4968,12 +4976,9 @@ void OnUpdatePads() {
     // touch widgets. So the value is published to savr::hydraulics, which hooks
     // those two accessors directly (see Hydraulics.cpp).
     //
-    // LOWRIDERS ONLY: the handling byte at vehicle+0x4ba carries the hydraulic
-    // handling flags (bit0 = HydraulicGeom, bit1 = HydraulicInst, bit2 =
-    // HydraulicNone - bit2 is the very gate CAutomobile::HydraulicControl tests
-    // at 0x6a2018). Requiring bit1 keeps the chord inert in ordinary cars, and
-    // in particular stops it from slewing a tank turret, which shares the same
-    // CarGun axes.
+    // LOWRIDERS ONLY, so the chord can never slew a tank turret - it shares the
+    // same CarGun axes. The exact flag word and bits are documented at the read
+    // below.
     {
         bool hydroActive = false;
         float hydroX = 0.0f, hydroY = 0.0f;
@@ -21205,23 +21210,20 @@ void OnRenderScene(bool underwater) {
     // the cheap mobile fog plane neutral at the projection edge and do not draw
     // any replacement geometry.  HLOD remains the distant colour underlay.
     const bool aircraftRadialFogActive = false;
-    float eyeFogPlane=groundFogActive
+    const float eyeFogPlane=groundFogActive
         ?g_aircraftGroundFogBaseline.start
         :(worldFogNeutralActive
             ?(aircraftRadialFogActive
                 ?aircraftFogOuterRadius
                 :eyeFarClip-aircraftFogFarMargin)
             :savedFogPlane);
-    float eyeFogEnd=groundFogActive
+    const float eyeFogEnd=groundFogActive
         ?g_aircraftGroundFogBaseline.end:eyeFarClip;
     // FOG DISTANCE (JETPACK menu): step the fog volume outward while FLYING so
     // the draw-distance headroom that already exists becomes visible. This never
     // touches the far clip, so no extra geometry is drawn or streamed; the fade
     // is clamped to the far clip so the world can never end in a hard unfogged
     // edge. At 100% every value below is identical to the retail path above.
-    // (The in-flight FOG DISTANCE knob was removed: scaling this pair had no
-    // visible effect, because what the player actually sees is driven by the
-    // mobile distance-fog emulator applied further down, not by these values.)
     float renderedNear[2] = {eyeNearClip, eyeNearClip};
     float renderedFar[2] = {eyeFarClip, eyeFarClip};
 
