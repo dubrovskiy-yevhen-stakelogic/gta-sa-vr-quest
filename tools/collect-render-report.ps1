@@ -2,11 +2,16 @@
 param(
     [string]$AdbPath = '',
     [string]$Serial = '',
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [switch]$EnableDiagnostics,
+    [switch]$DisableDiagnostics
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($EnableDiagnostics -and $DisableDiagnostics) {
+    throw '-EnableDiagnostics and -DisableDiagnostics cannot be used together.'
+}
 $PackageName = 'com.rockstargames.gtasa'
 $RemoteRoot = "/sdcard/Android/data/$PackageName/files"
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -139,8 +144,14 @@ function Save-Capture {
     return $result
 }
 
-Write-Host 'SAVR render report collector 1.0' -ForegroundColor Cyan
-Write-Host 'Read-only: leave the game at the black screen, with the headset awake.'
+Write-Host 'SAVR render report tools 1.1' -ForegroundColor Cyan
+if ($EnableDiagnostics) {
+    Write-Host 'Enabling render diagnostics; this will stop SAVR for the next manual launch.'
+} elseif ($DisableDiagnostics) {
+    Write-Host 'Disabling render diagnostics; this will stop SAVR for the next manual launch.'
+} else {
+    Write-Host 'Read-only collection: leave the game at the black screen, with the headset awake.'
+}
 Find-Adb
 $devicesResult = Invoke-Adb -Arguments @('devices', '-l')
 $devices = @(
@@ -161,6 +172,41 @@ if ([string]::IsNullOrWhiteSpace($Serial)) {
     $Serial = $authorized[0].Serial
 } elseif (-not ($authorized | Where-Object { $_.Serial -eq $Serial })) {
     throw "Device '$Serial' is not connected and authorized. Check adb devices and the USB debugging prompt."
+}
+
+# These explicit modes are separate from ordinary read-only report collection.
+# Properties are cached by the game process, so stop only SAVR after verification.
+if ($EnableDiagnostics -or $DisableDiagnostics) {
+    $diagnosticsValue = if ($EnableDiagnostics) { '1' } else { '0' }
+    $settings = @(
+        [pscustomobject]@{ Name = 'debug.savr.render_diag'; Value = $diagnosticsValue },
+        [pscustomobject]@{ Name = 'debug.savr.render_diag_pixels'; Value = '0' }
+    )
+    foreach ($setting in $settings) {
+        $null = Invoke-Adb -Arguments @('-s', $Serial, 'shell', 'setprop', $setting.Name, $setting.Value)
+    }
+    foreach ($setting in $settings) {
+        $actual = Invoke-Adb -Arguments @('-s', $Serial, 'shell', 'getprop', $setting.Name)
+        $actualValue = ($actual.Output -join '').Trim()
+        if ($actualValue -cne $setting.Value) {
+            throw "Could not verify $($setting.Name)=$($setting.Value) (read '$actualValue'). Settings may be partly changed; rerun this mode after checking the connection. SAVR was not stopped."
+        }
+        Write-Host "Verified: $($setting.Name)=$actualValue"
+    }
+    $null = Invoke-Adb -Arguments @('-s', $Serial, 'shell', 'am', 'force-stop', $PackageName)
+    Write-Host ''
+    Write-Host "SAVR stopped: $PackageName" -ForegroundColor Green
+    if ($EnableDiagnostics) {
+        Write-Host 'Basic render diagnostics are enabled; pixel readbacks are OFF.'
+        Write-Host 'Manually launch SAVR, reproduce the problem, keep the headset awake,'
+        Write-Host 'then run COLLECT_RENDER_REPORT.bat immediately.' -ForegroundColor Yellow
+    } else {
+        Write-Host 'Render diagnostics and pixel readbacks are disabled.'
+        Write-Host 'Manually launch SAVR when ready to play.'
+    }
+    Write-Host 'No report was collected and nothing was uploaded.'
+    Write-Host 'After collecting a report, ATTACH THE ZIP MANUALLY to your support reply.'
+    return
 }
 
 $startedUtc = [DateTimeOffset]::UtcNow
@@ -186,8 +232,14 @@ $running = Save-Capture -Name 'game-pid.txt' -Arguments @('shell', 'pidof', $Pac
 $null = Save-Capture -Name 'memory.txt' -Arguments @('shell', 'dumpsys', 'meminfo', $PackageName) -MaxLines 400
 
 $logPattern = '(?i)(\bSAVR\b|savr\.|libsavr|com\.rockstargames\.gtasa|OpenXR|\bxr[A-Z]\w+|VrApi|VrRuntime|Oculus|\bEGL\b|libEGL|GLES|OpenGL|Adreno|kgsl|vulkan|GpuFault|GPU fault|Fatal signal|Abort message|tombstoned|lowmemorykiller|lmkd)'
-$null = Save-Capture -Name 'logcat-render.txt' -Arguments @('logcat', '-d', '-b', 'main', '-b', 'system', '-v', 'threadtime', '-t', '20000') -Pattern $logPattern
+$renderLog = Save-Capture -Name 'logcat-render.txt' -Arguments @('logcat', '-d', '-b', 'main', '-b', 'system', '-v', 'threadtime', '-t', '20000') -Pattern $logPattern
 $null = Save-Capture -Name 'logcat-crash.txt' -Arguments @('logcat', '-d', '-b', 'crash', '-v', 'threadtime', '-t', '4000')
+$diagnosticMarkerCount = @($renderLog.Output | Where-Object { $_ -cmatch '\[render\.diag\]' }).Count
+$diagnosticPropertyMatch = [regex]::Match(($properties.Output -join "`n"), '(?m)^\[debug\.savr\.render_diag\]: \[(.*)\]$')
+$diagnosticProperty = if ($diagnosticPropertyMatch.Success) { $diagnosticPropertyMatch.Groups[1].Value } else { '<unset or unavailable>' }
+if ($diagnosticMarkerCount -eq 0) {
+    $script:Warnings.Add('No detailed [render.diag] lines were retained. Run ENABLE_RENDER_DIAGNOSTICS.bat before the next manual game launch, reproduce, then COLLECT_RENDER_REPORT.bat. Absence alone cannot distinguish inactive diagnostics, a build without this channel, or evicted log history.')
+}
 
 $copied = New-Object 'System.Collections.Generic.List[object]'
 $missing = New-Object 'System.Collections.Generic.List[string]'
@@ -237,6 +289,10 @@ $summary = @(
     "Android package versionName: $(if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { 'unknown' })",
     'The Android package version can differ from the mod version. Check SAVR build/version lines in the logs.',
     "Game process found: $gameRunning", '',
+    "Detailed [render.diag] lines retained: $diagnosticMarkerCount",
+    "debug.savr.render_diag at collection: $diagnosticProperty",
+    'Ordinary SAVR messages, including Java startup messages, do not count as detailed render diagnostics.',
+    'The property is a current snapshot; it does not prove which value the running process latched.', '',
     'Please tell the developer: mod version; Quest model; new game or loaded save;',
     'the exact moment the picture disappeared; whether menus/HUD and CJ movement still work;',
     'and whether Quest Games Optimizer or other graphics tuning was active.', '',
@@ -257,9 +313,14 @@ $summary = @(
 Write-Utf8 -Path (Join-Path $bundleRoot 'README_REPORT.txt') -Text ($summary -join "`r`n")
 Write-Utf8 -Path (Join-Path $bundleRoot 'commands.json') -Text (ConvertTo-Json -InputObject @($script:Commands.ToArray()) -Depth 4)
 $manifest = [ordered]@{
-    format = 'savr-render-report'; format_version = 1; collector_version = '1.0'
+    format = 'savr-render-report'; format_version = 1; collector_version = '1.1'
     collected_started_utc = $startedUtc.ToString('o'); collected_finished_utc = $finishedUtc.ToString('o')
     package = $PackageName; device_model = $model; game_running = [bool]$gameRunning
+    render_diagnostics = [ordered]@{
+        marker_lines_retained = $diagnosticMarkerCount
+        property_at_collection = $diagnosticProperty
+        channel_present_in_retained_log = ($diagnosticMarkerCount -gt 0)
+    }
     files = @($copied.ToArray()); missing_optional_files = @($missing.ToArray())
     warnings = @($script:Warnings.ToArray()); device_actions = 'read-only'; uploads = $false
 }
@@ -276,4 +337,5 @@ Write-Host ''
 Write-Host "Report saved ($($script:Warnings.Count) collection warnings):" -ForegroundColor Green
 Write-Host $zipPath -ForegroundColor Yellow
 Write-Host "Reviewable folder: $bundleRoot"
-Write-Host 'Send the ZIP and a short description of the failure to the mod developer.'
+Write-Host 'ATTACH THE ZIP MANUALLY to your support reply with a short description of the failure.'
+Write-Host 'Nothing was uploaded automatically.'
