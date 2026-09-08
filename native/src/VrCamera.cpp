@@ -12,6 +12,7 @@
 #include "Jetpack.h"
 #include "Locomotion.h"
 #include "Log.h"
+#include "RenderDiagnostics.h"
 #include "PerfTelemetry.h"
 #include "PhysicalWeapon.h"
 #include "ScopeAim.h"
@@ -29364,7 +29365,27 @@ bool RecruitGestureActive() {
 }
 
 void RefreshStereoGate() {
-    g_stereoActive.store(ShouldRunStereo(), std::memory_order_relaxed);
+    const bool stereo = ShouldRunStereo();
+    g_stereoActive.store(stereo, std::memory_order_relaxed);
+    if (render_diag::Enabled()) {
+        // GameThread owns these retail objects. XR reads only the logged values.
+        static double nextReport = 0.0;
+        const double now = perf::MonotonicMs();
+        if (now >= nextReport) {
+            nextReport = now + 1000.0;
+            const int fade = g.CCamera_GetScreenFadeStatus && g.TheCamera
+                ? g.CCamera_GetScreenFadeStatus(g.TheCamera) : -1;
+            const void* pad = g.CPad_GetPad ? g.CPad_GetPad(0) : nullptr;
+            const int controls = pad ? *reinterpret_cast<const std::uint16_t*>(
+                static_cast<const char*>(pad) + 0x110) : -1;
+            render_diag::Log("[render.diag] gate t=%.0f stereo=%d fade=%d "
+                "ped=%d cutscene=%d menu=%d controls=%d cutscene_mode=%d game_cutscene_mode=%d grade=%d",
+                now, stereo, fade, g.FindPlayerPed && g.FindPlayerPed(-1) != nullptr,
+                g.CCutsceneMgr_ms_running ? *g.CCutsceneMgr_ms_running : -1,
+                MobileMenuOpen(), controls, locomotion::CutsceneMode(),
+                locomotion::GameCutsceneMode(), IsColorGradingEnabled());
+        }
+    }
 }
 
 bool IsMobileMenuOpen() {

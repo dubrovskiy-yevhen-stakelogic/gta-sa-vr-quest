@@ -14,6 +14,7 @@
 #include "HudSettings.h"
 #include "Locomotion.h"
 #include "Log.h"
+#include "RenderDiagnosticsGl.h"
 #include "PerfTelemetry.h"
 #include "ScopeAim.h"
 #include "TrafficCensus.h"
@@ -3085,6 +3086,20 @@ bool EnumerateViews() {
 }
 
 bool CreateSwapchains() {
+    if (render_diag::Enabled()) {
+        const auto glText = [](GLenum name) {
+            const auto* value = glGetString(name);
+            return value ? reinterpret_cast<const char*>(value) : "unavailable";
+        };
+        GLint textureLimit = 0, renderbufferLimit = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &textureLimit);
+        glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &renderbufferLimit);
+        render_diag::Log("[render.diag] gpu vendor=%s renderer=%s version=%s glsl=%s "
+            "max_texture=%d max_renderbuffer=%d context=%p",
+            glText(GL_VENDOR), glText(GL_RENDERER), glText(GL_VERSION),
+            glText(GL_SHADING_LANGUAGE_VERSION), textureLimit, renderbufferLimit,
+            eglGetCurrentContext());
+    }
     // Pick an sRGB swapchain format if the runtime offers one AND the driver lets
     // us disable sRGB write conversion (so our blit copies the game's already-
     // encoded pixels raw). Without write control an sRGB target would re-encode on
@@ -6214,6 +6229,23 @@ bool Initialize(JavaVM* vm, jobject activity) {
     LOGI("SAVR version %s", kModVersion);
     LOGI("[savr.build] version=%s origin=%s shared-sync=%s",
          kModVersion, SAVR_BUILD_ORIGIN, SAVR_SHARED_SYNC);
+    if (render_diag::Enabled()) {
+        render_diag::Log("[render.diag] build schema=1 version=%s origin=%s sync=%s "
+            "compiled=%s %s pixels=%d", kModVersion, SAVR_BUILD_ORIGIN,
+            SAVR_SHARED_SYNC, __DATE__, __TIME__, render_diag::PixelsEnabled());
+        constexpr const char* properties[]{"ro.product.model", "ro.product.device",
+            "ro.build.fingerprint", "debug.savr.fxaa", "debug.savr.hidden_area_mask",
+            "debug.savr.eye_depth24", "debug.savr.eye_foveation",
+            "debug.savr.rq_swap46_fence", "debug.savr.rq_eye_set_backing",
+            "debug.oculus.foveation.level", "debug.oculus.textureWidth",
+            "debug.oculus.textureHeight"};
+        for (const char* name : properties) {
+            char value[PROP_VALUE_MAX]{};
+            __system_property_get(name, value);
+            render_diag::Log("[render.diag] property %s=%s", name,
+                value[0] ? value : "<unset: build default>");
+        }
+    }
     SetupHudTextRenderer(vm,activity);
 
     // On Android the loader has to be handed the VM and Activity before any
@@ -11371,6 +11403,17 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
             // OFF and every shader failure remain a trustworthy A/B baseline.
             glBlitFramebuffer(0, 0, ew, eh, 0, 0, chain.width, chain.height,
                               GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        }
+        if (render_diag::Enabled()) {
+            static double nextProbe[2]{};
+            const double now = perf::MonotonicMs();
+            if (now >= nextProbe[e]) {
+                nextProbe[e] = now + 2000.0;
+                render_diag::ProbeEyeCopy(e, expectedGeneration, sourceTexture,
+                    ew, eh, chain.width, chain.height,
+                    usedFxaa ? "fxaa" : usedUnderwaterCopy ? "graded-copy" : "blit",
+                    mobileColor);
+            }
         }
         EndXrGpuStage(copyGpuTimer);
         RecordXrCpuStage(e, XrCpuStage::CopySubmit, copyWallStartMs,

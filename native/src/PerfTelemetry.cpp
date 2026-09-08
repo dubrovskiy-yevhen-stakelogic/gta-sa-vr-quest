@@ -1,6 +1,7 @@
 #include "PerfTelemetry.h"
 
 #include "Log.h"
+#include "RenderDiagnostics.h"
 #include "TrafficCensus.h"
 
 #include <algorithm>
@@ -4025,6 +4026,7 @@ void ResetGameTelemetry() {
 }
 
 void SubmitPresentFrame(const PresentFrameSample& sample) {
+    render_diag::Present(sample);
     if (g_presentWindow.startMs <= 0.0) g_presentWindow.startMs = sample.monoMs;
     if (sample.monoMs - g_presentWindow.startMs >= 1000.0) {
         EmitPresentWindow(sample.monoMs);
