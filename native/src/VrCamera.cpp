@@ -16,6 +16,7 @@
 #include "PerfTelemetry.h"
 #include "PhysicalWeapon.h"
 #include "ScopeAim.h"
+#include "StereoSurfacePolicy.h"
 #include "Symbols.h"
 #include "TrafficCensus.h"
 #include "Xr.h"
@@ -17766,6 +17767,8 @@ int   g_recordCounter = 0;                    // monotonic; set = counter % kEye
 int   g_eyeRasterW = 0, g_eyeRasterH = 0;    // eye raster (render) size — scaled down
 std::atomic<int> g_stereoBaseW{0};
 std::atomic<int> g_stereoBaseH{0};
+// Publish the two dimensions together so a resize cannot expose a mixed pair.
+std::atomic<std::uint64_t> g_gameSurfaceSize{0};
 int   g_mainW = 0, g_mainH = 0;              // the main pass size we sized from
 int   g_pendingEyeRasterW = 0, g_pendingEyeRasterH = 0;
 int   g_pendingMainW = 0, g_pendingMainH = 0;
@@ -20585,12 +20588,30 @@ void OnRenderScene(bool underwater) {
     const int w = *reinterpret_cast<int*>(reinterpret_cast<char*>(origColor) + 0x18);
     const int h = *reinterpret_cast<int*>(reinterpret_cast<char*>(origColor) + 0x1c);
 
-    // RenderScene runs for SEVERAL passes per frame: the big main-world pass AND
-    // small reflection/water cameras (e.g. 512x512). Only redirect the large main
-    // pass — touching the small ones corrupted the render into a blue hang.
-    if (w < 1024 || h < 1024 || w >= 8192 || h >= 8192) {
+    // Reflection/water passes must retain their original targets. Match the
+    // registered retail surface, not an eye-size heuristic: Quest 2's landscape
+    // frontend is 1440x1008 and the old >=1024 height gate rejected its world.
+    const std::uint64_t gameSurfaceSize =
+        g_gameSurfaceSize.load(std::memory_order_acquire);
+    const int gameSurfaceWidth = static_cast<int>(gameSurfaceSize >> 32);
+    const int gameSurfaceHeight =
+        static_cast<int>(gameSurfaceSize & 0xffffffffu);
+    if (!detail::IsStereoMainPassSize(
+            w, h, gameSurfaceWidth, gameSurfaceHeight)) {
         g_origRenderScene(underwater);
         return;
+    }
+    if (render_diag::Enabled()) {
+        static thread_local std::uint64_t loggedSurfaceSize = 0;
+        const std::uint64_t observedSize =
+            (static_cast<std::uint64_t>(w) << 32) |
+            static_cast<std::uint32_t>(h);
+        if (observedSize != loggedSurfaceSize) {
+            loggedSurfaceSize = observedSize;
+            render_diag::Log("[render.diag] main-pass accepted surface=%dx%d "
+                             "registered=%dx%d policy=registered-main-size-v1",
+                             w, h, gameSurfaceWidth, gameSurfaceHeight);
+        }
     }
 
     // This is the verified large main scene. Keep the same coarse-aircraft
@@ -29401,6 +29422,19 @@ void SetStereoBaseSize(int width,int height) {
     g_stereoBaseW.store(width,std::memory_order_release);
     g_stereoBaseH.store(height,std::memory_order_release);
     LOGI("[surface] flat frontend separated from stereo base %dx%d",width,height);
+}
+
+void SetGameSurfaceSize(int width, int height) {
+    if (width < 64 || height < 64 || width >= 8192 || height >= 8192) return;
+    const std::uint64_t size =
+        (static_cast<std::uint64_t>(width) << 32) |
+        static_cast<std::uint32_t>(height);
+    g_gameSurfaceSize.store(size, std::memory_order_release);
+    render_diag::Log("[render.diag] surface-policy=registered-main-size-v1 "
+                     "flat=%dx%d eye_base=%dx%d",
+                     width, height,
+                     g_stereoBaseW.load(std::memory_order_acquire),
+                     g_stereoBaseH.load(std::memory_order_acquire));
 }
 
 bool IsTrafficShellActive() {

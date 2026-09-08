@@ -1,13 +1,16 @@
 # Quest 2 black world: investigation and diagnostic build
 
-Updated: 2026-09-09. Native diagnostic source: local public commit `0ca8766` (0.2.0).
+Updated: 2026-09-09. Native diagnostic baseline: `0ca8766` (0.2.0);
+the surface-registration correction is a subsequent local source change.
 
-**Status: regression candidates identified; cause not confirmed on an affected Quest 2.**
+**Status: a deterministic surface-size regression is identified and corrected in source; Quest 2 acceptance is pending.**
 The developer corrected the release boundary: **0.1.1 works; 0.1.2 is the first
 broken release**, with the issue continuing in 0.2.0. CJ/bike appear briefly after
 the cutscene, the world becomes black, menus and movement continue. The earlier
-0.1.1-failure premise is superseded. An actual Quest 2 report is now available
-(see below), but native diagnostics were disabled during that run.
+0.1.1-failure premise is superseded. The latest Quest 2 report contains native
+diagnostics and confirms repeated `no-safe-pair` rejection after the cutscene,
+even with the swap-fence path disabled. Its `1440x1008` game surface exposes the
+remaining main-pass filter: the old code rejected any height below 1024.
 
 ## What the release history establishes
 
@@ -20,6 +23,7 @@ the cutscene, the world becomes black, menus and movement continue. The earlier
 | First source labelled 0.1.1 | `bab8be7` | Exact player APK still needs identification; later 0.1.1 commits exist. |
 | Effects default enabled | `2521c2f` | Initial 0.1.1 already had effects OFF, so effects are not a sufficient explanation. |
 | New liveness, eye backing/fence, hidden-area mask and foveation paths | `0edfcce`, 0.1.2 | Primary regression interval. Mask, backing and fence paths are default ON; native QCOM foveation is default OFF. |
+| Flat game surface changes from XR eye dimensions to the 640:448 aspect | `0edfcce`, 0.1.2 | A 1440-wide Quest 2 surface becomes 1008 high; the unchanged `OnRenderScene` height filter rejects it before stereo production. |
 
 FXAA itself and the D24 eye-depth change existed in 0.1.0. Do not infer a
 Quest 2 driver defect or insufficient GPU performance solely from these reports.
@@ -59,37 +63,113 @@ to 17:27:02.328 and also contains older unrelated process history.
 - Android package version 2.11.311 is the retail game version. This report has no
   native build stamp, so the exact mod commit cannot be established from it.
 
-## First tests for the corrected 0.1.1 to 0.1.2 boundary
+## Diagnostic report: 2026-09-08 22:53 UTC
 
-Collect basic native diagnostics with current settings first. Keep Color Grading
-at the same value throughout these tests and use the same save/transition.
+Archive: `SAVR_Render_20260908-225307292_72450aed.zip`, SHA256
+`511c8fb7a612c06672196a6cc46d3f5573ea4c910684d36b0bc48a2a9b21c196`.
+The player has now installed the diagnostic build: package update at 18:47:27
+device time, native compile stamp Sep 8 2026 18:44:53. PID 13356 contains 81 native
+diagnostic lines. Basic logging is ON; pixel reads are OFF.
 
-1. Disable only the new replacement of retail swap with a GL fence:
+At 18:53:04.202, the first transition window contains 27 `no-safe-pair` /
+`fallback=black` frames. The following two windows each contain 144/144 of the
+same rejection: 315 classified black frames in total. The GameThread reports
+`stereo=1 fade=0 ped=1 cutscene=0 menu=0 controls=0 grade=0`.
+Frame submission succeeds; no eye-copy diagnostic or submitted-stereo outcome
+is present. This localizes the observed black fallback before eye copy, colour
+resolve and FXAA, with the cutscene/fade gate already cleared.
 
-   ```text
-   adb shell setprop debug.savr.rq_swap46_fence 0
-   adb shell am force-stop com.rockstargames.gtasa
-   ```
+`seq=-1` is the submitted sequence, not the newest producer sequence.
+`no-safe-pair` conflates too few published pairs with a producer generation
+that is not ready. The zero `fence_failures` count concerns source-read
+retirement fences, not the producer-readiness check. Do not conclude that
+the producer has stopped or that all synchronization is healthy from these
+fields. Pixel probes cannot help until a candidate reaches the copy stage.
 
-   Open manually, reproduce and collect a separately labelled report. This new
-   default-ON path only activates after a healthy stereo projection, so its
-   timing is a plausible match for a brief visible world followed by black.
-   That is a source-based hypothesis, not a cause proven by this archive.
-2. Restore `debug.savr.rq_swap46_fence` to its prior value (default 1). In a
-   separate run disable only `debug.savr.hidden_area_mask` with value 0 and
-   restart. The default-ON depth mask was also added in 0.1.2.
-3. If needed, test `debug.savr.rq_eye_set_backing=0` and then
-   `debug.savr.rq_state_coalesce=0`, one at a time, with other overrides restored.
-   Both new paths default ON and both properties existed in 0.1.2.
+Static audit also found incomplete producer-ready notification coverage.
+Retail `RenderQueue::RunThread` dispatches directly during Flush at 0x78d044,
+and `ProcessAll_Locked` dispatches directly at 0x78cf20. Both can bypass our
+two custom loops, the only current callers of `TryPublishStereoProducerFence`
+and `NotifyStereoRetailSwapCompleted`. A swap consumed on a bypass path can
+leave a published generation Pending. This is a concrete source-coverage defect;
+the report does not establish that this player used that path. A fix must
+cover every swap dispatch and preserve exact-generation completion ordering,
+not simply mark the newest sequence ready after an unrelated queue service.
+The later fence-OFF capture below bypasses that readiness requirement and still
+fails. The dispatch-coverage gap remains a separate finding; it does not explain
+the deterministic surface rejection now identified for this player.
 
-All these properties latch at process start. Restore the recorded original
-values after testing; defaults are 1 for these four controls. Avoid changing
-several at once, which loses attribution. No renderer behavior is changed by
-the support-script update itself.
+## Fence-OFF report: 2026-09-08 23:14 UTC
 
-Colour grading, FXAA and D24 existed in working 0.1.1, so they are lower-priority
-compatibility tests. The plain shader-bypass comparison on dry ground remains
-Color Grading OFF plus `debug.savr.fxaa=0`, followed by a process restart.
+Extracted report: `build/diagnostics/quest2-player-20260908-231427287/`.
+Collector 1.1 reports no collection warnings. All 114 native `[render.diag]`
+lines belong to the current game process, PID 15399; older unrelated log
+history is also retained. Its build stamp is Sep 8 2026 18:44:53, with pixel
+readbacks OFF (`logcat-render.txt:1954`).
+
+- At startup, `debug.savr.rq_swap46_fence=0` is recorded at line 1962.
+  The A/B override was active in this process, not merely set after launch.
+- The game records `game surface 1440x1008` at line 2301.
+- At 19:13:57.634, the gameplay gate is `stereo=1 fade=0 ped=1 cutscene=0
+  menu=0 controls=0 grade=0` (line 2799).
+- At 19:13:57.926, the transition window records 69 `no-safe-pair` black
+  frames (lines 2800/2802). Subsequent windows repeatedly record 144/144
+  `no-safe-pair` frames with `fallback=black`, `live=0`, `seq=-1`, and
+  successful frame submission, beginning at lines 2810/2811.
+
+The player reports that the world remains black. Disabling the fence/readiness
+path did not recover the picture. `seq=-1` still describes the submitted
+sequence; the source analysis below, rather than that field alone, identifies
+why this surface never reaches the stereo producer.
+
+## Identified source cause and correction
+
+In 0.1.1, `main.cpp::OnSurfaceChanged` created the Android game surface with
+the XR eye width and height. Commit `0edfcce` changed the flat surface height
+to `max(64, round(flatWidth * 448 / 640))`, rounded down to an even number.
+For this player's width, `1440 * 448 / 640 = 1008`, matching the runtime log.
+
+`VrCamera.cpp::OnRenderScene` still required both main-pass dimensions to be
+at least 1024. Its `h < 1024` early return sent this valid main world pass
+through the ordinary mono renderer before stereo raster rendering/publication.
+The transition gate could therefore request stereo while the compositor had
+no usable stereo pair and deliberately presented black. This is a deterministic
+size-policy mismatch, independent of whether the producer fence is enabled.
+It does not establish a GPU-performance or Quest 2 driver failure.
+
+The local correction registers the actual flat dimensions through
+`vrcam::SetGameSurfaceSize` before the game surface callback. `OnRenderScene`
+uses `StereoSurfacePolicy.h::IsStereoMainPassSize` to match those registered
+dimensions. The original minimum/maximum validity bounds remain, and the old
+1024 heuristic is retained only when dimensions have not yet been registered.
+Mismatched reflection/offscreen passes remain outside the stereo path; XR eye
+dimensions remain independent of the flat surface.
+
+The diagnostic build now emits `surface-policy=registered-main-size-v1` at
+registration and `main-pass accepted ... policy=registered-main-size-v1`
+when it accepts the main pass. These markers identify the corrected path in
+the running process. Source correction and host checks do not yet establish
+that the affected headset displays the world correctly.
+
+## Next player check
+
+1. Publish/push the current public source-kit changes containing the native
+   surface correction. Before updating, the player runs `RESTORE_STEREO_SYNC.bat`
+   from the original test folder containing that device's property backup.
+   This restores the earlier A/B overrides and stops SAVR while the original
+   backup folder is still available.
+2. The player runs UPDATE and completes the native rebuild/install, then runs
+   `ENABLE_RENDER_DIAGNOSTICS.bat` for basic logs, with pixel readbacks OFF.
+   Copying support BAT/PowerShell files alone cannot apply this renderer change.
+   Keep the same game graphics settings; no additional rendering switches are
+   required for this check.
+3. Manually launch SAVR and reproduce the same cutscene transition. Wait ten
+   seconds after it ends, keep the headset awake, and run
+   `COLLECT_RENDER_REPORT.bat` while the game remains open.
+4. Attach the complete ZIP manually and report `World visible: YES` or `NO`.
+   Check the current PID for the new surface-policy/accepted-main-pass markers,
+   stereo submission, and the reported visible result. Old retained markers
+   alone cannot verify the newly installed build. Disable diagnostics afterwards.
 
 ## New diagnostic channel (requires the modified build)
 
@@ -179,5 +259,15 @@ The report collector was functionally checked with a fake adb under Windows
 PowerShell 5.1 and PowerShell 7, including partial failures, multiple/no-device
 refusals, paths with spaces, ZIP contents and a read-only command allowlist.
 No real device was contacted by the tools. Compilation and collector checks
-do not establish a Quest 2 fix; the supplied report establishes only the
-observations above. A capture with native diagnostics enabled is still required.
+do not establish a Quest 2 fix; the supplied reports establish the observations
+above. The fence-OFF A/B has now completed without recovery. The separate
+surface-policy host suite passed 23 cases, including acceptance of 1440x1008,
+rejection of reflection/mismatched dimensions, and the unregistered fallback.
+Both shared and public ARM64 production builds passed with `SAVR_DEV=OFF`.
+The patch also passed an apply check against the backed-up original public
+source. Evidence and binaries are under
+`build/diagnostics/quest2-main-surface-fix/` (`validation.json`,
+`quest2-main-surface-fix.patch`, `libsavr-public.so`, `libsavr-shared.so`).
+No APK was installed and the device was untouched. Runtime acceptance requires
+the affected player to test the rebuilt correction and return a report; no
+corrected-build Quest 2 capture has yet been received.

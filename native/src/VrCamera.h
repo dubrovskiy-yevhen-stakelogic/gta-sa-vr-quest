@@ -46,6 +46,10 @@ bool ParachuteWeaponInteractionBlocked();
 // SurfaceTexture uses a separate landscape size for Android menus/cutscenes.
 void SetStereoBaseSize(int width, int height);
 
+// Actual flat surface passed to the retail renderer. Identify its world pass
+// independently of the OpenXR eye size and small reflection render targets.
+void SetGameSurfaceSize(int width, int height);
+
 // Current HMD yaw relative to the recentered LOCAL origin. Bicycle MOTION mode
 // uses it as the steering input, matching the PC GTA SA VR implementation.
 bool GetLocalHeadYaw(float* yawOut);

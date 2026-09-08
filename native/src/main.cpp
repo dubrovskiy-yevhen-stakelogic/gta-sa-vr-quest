@@ -758,6 +758,7 @@ void OnSurfaceChanged(JNIEnv* env, jclass clazz, jobject surface, jint width, ji
         static_cast<int>(std::lround(flatWidth*(448.0/640.0)))) & ~1;
     g_gameWidth = flatWidth;
     g_gameHeight = flatHeight;
+    vrcam::SetGameSurfaceSize(flatWidth, flatHeight);
     xr::SetTheaterCrop(flatWidth,flatHeight); // source aspect only; no pixel crop
     jobject offscreen = GameSurface(env, flatWidth, flatHeight);
     if (offscreen == nullptr) {
