@@ -2723,6 +2723,82 @@ bool WaitSwapchainImageReady(Swapchain& chain, const char* name,
     }
 }
 
+int32_t EvenSwapchainDim(int32_t v) {
+    return std::max(64, v) & ~1;
+}
+
+void ScaledSwapchainSize(int eyeIndex, int percent, int32_t& outW, int32_t& outH) {
+    const XrViewConfigurationView& cv = s.configViews[eyeIndex];
+    const int64_t w = (static_cast<int64_t>(cv.recommendedImageRectWidth) * percent + 50) / 100;
+    const int64_t h = (static_cast<int64_t>(cv.recommendedImageRectHeight) * percent + 50) / 100;
+    outW = EvenSwapchainDim(static_cast<int32_t>(w));
+    outH = EvenSwapchainDim(static_cast<int32_t>(h));
+    if (cv.maxImageRectWidth > 0)
+        outW = std::min(outW, EvenSwapchainDim(static_cast<int32_t>(cv.maxImageRectWidth)));
+    if (cv.maxImageRectHeight > 0)
+        outH = std::min(outH, EvenSwapchainDim(static_cast<int32_t>(cv.maxImageRectHeight)));
+}
+
+bool RecreateEyeSwapchain(int eyeIndex, int32_t width, int32_t height) {
+    Swapchain& chain = s.swapchains[eyeIndex];
+    if (chain.width == width && chain.height == height) return true;
+
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    info.format      = g_swapchainFormat;
+    info.sampleCount = 1;
+    info.width       = width;
+    info.height      = height;
+    info.faceCount   = 1;
+    info.arraySize   = 1;
+    info.mipCount    = 1;
+
+    XrSwapchain newHandle = XR_NULL_HANDLE;
+    if (!Check(xrCreateSwapchain(s.session, &info, &newHandle),
+               "xrCreateSwapchain(eye-resize)")) {
+        return false;
+    }
+
+    uint32_t imageCount = 0;
+    if (!Check(xrEnumerateSwapchainImages(newHandle, 0, &imageCount, nullptr),
+               "xrEnumerateSwapchainImages(eye-resize)")) {
+        xrDestroySwapchain(newHandle);
+        return false;
+    }
+    std::vector<XrSwapchainImageOpenGLESKHR> newImages(
+        imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+    if (!Check(xrEnumerateSwapchainImages(
+                   newHandle, imageCount, &imageCount,
+                   reinterpret_cast<XrSwapchainImageBaseHeader*>(newImages.data())),
+               "xrEnumerateSwapchainImages(eye-resize,2)")) {
+        xrDestroySwapchain(newHandle);
+        return false;
+    }
+
+    if (chain.handle != XR_NULL_HANDLE) xrDestroySwapchain(chain.handle);
+    chain.handle   = newHandle;
+    chain.images   = std::move(newImages);
+    chain.width    = width;
+    chain.height   = height;
+    chain.poisoned = false;
+    LOGI("[stereo] eye %d swapchain resized to %dx%d, %u images",
+         eyeIndex, width, height, imageCount);
+    return true;
+}
+
+void ApplyEyeSwapchainRenderScale() {
+    if (s.swapchains.size() < 2 || s.configViews.size() < 2) return;
+    const int percent = vrcam::GetRenderScalePercent();
+    for (int e = 0; e < 2; ++e) {
+        if (s.swapchains[e].poisoned) continue;
+        int32_t w = 0, h = 0;
+        ScaledSwapchainSize(e, percent, w, h);
+        if (w != s.swapchains[e].width || h != s.swapchains[e].height) {
+            RecreateEyeSwapchain(e, w, h);
+        }
+    }
+}
+
 template <typename Fn>
 bool GetProc(const char* name, Fn& out) {
     auto result = xrGetInstanceProcAddr(s.instance, name, reinterpret_cast<PFN_xrVoidFunction*>(&out));
@@ -3134,15 +3210,23 @@ bool CreateSwapchains() {
 
     const auto viewCount = static_cast<uint32_t>(s.configViews.size());
     s.swapchains.resize(viewCount);
+    const int initialScalePercent = vrcam::GetRenderScalePercent();
     for (uint32_t i = 0; i < viewCount; ++i) {
-        const XrViewConfigurationView& view = s.configViews[i];
+        int32_t scaledWidth = 0, scaledHeight = 0;
+        if (i < 2) {
+            ScaledSwapchainSize(static_cast<int>(i), initialScalePercent,
+                               scaledWidth, scaledHeight);
+        } else {
+            scaledWidth  = static_cast<int32_t>(s.configViews[i].recommendedImageRectWidth);
+            scaledHeight = static_cast<int32_t>(s.configViews[i].recommendedImageRectHeight);
+        }
 
         XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         info.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
         info.format      = g_swapchainFormat;
         info.sampleCount = 1;
-        info.width       = static_cast<int32_t>(view.recommendedImageRectWidth);
-        info.height      = static_cast<int32_t>(view.recommendedImageRectHeight);
+        info.width       = scaledWidth;
+        info.height      = scaledHeight;
         info.faceCount   = 1;
         info.arraySize   = 1;
         info.mipCount    = 1;
@@ -7284,8 +7368,14 @@ void BuildGraphicsMenu() {
         activeWidth = g_stereoEyeW[set].load(std::memory_order_acquire);
         activeHeight = g_stereoEyeH[set].load(std::memory_order_acquire);
     }
-    const int baseWidth = !s.swapchains.empty() ? s.swapchains[0].width : 0;
-    const int baseHeight = !s.swapchains.empty() ? s.swapchains[0].height : 0;
+
+    const int baseWidth = !s.configViews.empty()
+        ? static_cast<int>(s.configViews[0].recommendedImageRectWidth) : 0;
+    const int baseHeight = !s.configViews.empty()
+        ? static_cast<int>(s.configViews[0].recommendedImageRectHeight) : 0;
+
+    const int headsetWidth = !s.swapchains.empty() ? s.swapchains[0].width : 0;
+    const int headsetHeight = !s.swapchains.empty() ? s.swapchains[0].height : 0;
     // Before the first stereo pair is published, still show the exact size the
     // current scale will allocate from the runtime's OpenXR recommendation.
     if ((activeWidth <= 0 || activeHeight <= 0) &&
@@ -7355,10 +7445,11 @@ void BuildGraphicsMenu() {
                           "ACTIVE %d%%   PREPARING NEW BUFFER",
                           activeRenderScalePercent);
         }
-    } else if (sel == 0 && baseWidth > 0 && baseHeight > 0) {
+    } else if (sel == 0 && baseWidth > 0 && baseHeight > 0 &&
+               headsetWidth > 0 && headsetHeight > 0) {
         std::snprintf(hint, sizeof(hint),
-                      "OPENXR BASE %d X %d PER EYE   L2/R2 ADJUST",
-                      baseWidth, baseHeight);
+                      "BASE %d X %d  HEADSET %d X %d   L2/R2 ADJUST",
+                      baseWidth, baseHeight, headsetWidth, headsetHeight);
     } else {
         std::snprintf(hint, sizeof(hint),
                       "STICK SEL   L2/R2 ADJUST   B BACK");
@@ -11217,6 +11308,8 @@ bool RenderStereoEyeProjection(XrCompositionLayerProjection& layer,
         outcome = perf::StereoProjectionOutcome::NoSwapchains;
         return false;
     }
+
+    ApplyEyeSwapchainRenderScale();
 
     // Use the sequence selected by the liveness gate for both eyes and pin its
     // ring slot until both swapchain copies have completed. A wrapping producer
